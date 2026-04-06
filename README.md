@@ -22,6 +22,8 @@ This repository documents **Camren J. Khoury’s contributions**, focusing on im
 
 ---
 
+The current code being worked on: Flame-Data-Pipline-Main -> Raw File Sorting Tool GUI (other tools are currently unchanged)
+
 ## Overview
 
 FlameVQA Dataset Builder is a **GUI-based system** for transforming raw wildfire imagery into structured multimodal datasets.
