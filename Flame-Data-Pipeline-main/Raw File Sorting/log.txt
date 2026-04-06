@@ -1,0 +1,2 @@
+pair 0: (('MAX_0002_W.JPG', 'IRX_0002_T.JPG')) -> (00001.JPG)
+pair 0: (('MAX_0002_W.JPG', 'IRX_0002_T.JPG')) -> (00001.JPG)
