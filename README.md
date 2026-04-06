@@ -22,7 +22,53 @@ This repository documents **Camren J. Khoury’s contributions**, focusing on im
 
 ---
 
-The current code being worked on: Flame-Data-Pipline-Main -> Raw File Sorting Tool GUI (other tools are currently unchanged)
+## Current Development
+
+The primary code currently under active development is:
+
+**Flame-Data-Pipeline-main → Raw File Sorting Tool (GUI)**  
+
+Other tools in the pipeline remain unchanged at this stage.
+
+### How to Run
+
+From within the **Raw File Sorting Tool** directory:
+
+```
+python "Raw File Sorting Tool GUI.py"
+```
+
+### What It Does
+
+The GUI performs automated preprocessing by:
+
+- Reading files from the **Input Folder**
+- Pairing:
+  - RGB images  
+  - Thermal images  
+  - Thermal TIFF data  
+- Generating structured outputs in the **Output Folder**
+
+Each dataset is processed and reorganized into a consistent format for downstream use.
+
+### Output Structure
+
+```
+Output Folder/
+└── <Dataset_Name>/
+    ├── Images/
+    │   ├── RGB/
+    │   │   ├── Corrected FOV/
+    │   │   └── Raw/
+    │   └── Thermal/
+    │       ├── Celsius TIFF/
+    │       └── JPG/
+    └── Videos/
+        ├── RGB/
+        └── Thermal/
+```
+
+---
 
 ## Overview
 
@@ -83,10 +129,10 @@ These established the baseline for pairing imagery and extracting metadata.
 - psutil  
 - exif  
 
-Optional (depending on usage):
-- PySimpleGUI (GUI components)  
-- videoprops (video metadata handling)  
-- Jupyter Notebook (GPS tracing tool)  
+Optional:
+- PySimpleGUI  
+- videoprops  
+- Jupyter Notebook  
 
 ---
 
@@ -94,10 +140,10 @@ Optional (depending on usage):
 
 Typical workflow:
 
-1. Load raw or semi-structured dataset  
-2. Pair RGB and thermal imagery  
-3. Process and organize into structured format  
-4. Generate outputs for labeling or downstream tasks  
+1. Load dataset into Input Folder  
+2. Run GUI tool  
+3. Automatically pair and structure data  
+4. Use output for labeling or downstream processing  
 
 ---
 
@@ -110,7 +156,7 @@ Typical workflow:
 
 ## Scope
 
-This repository focuses only on:
+This repository focuses on:
 - Dataset preparation tooling  
 - Workflow improvements  
 
