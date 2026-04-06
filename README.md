@@ -4,7 +4,7 @@
 
 ## Project Credits
 
-FlameVQA Dataset Builder is part of a broader wildfire research effort at Clemson University within the IS-WiN Lab.
+FlameVQA Dataset Builder is part of a wildfire research effort at Clemson University within the IS-WiN Lab.
 
 **Project Leadership**  
 Mobin Habibpour, Niloufar Alipour Talemi  
@@ -18,104 +18,113 @@ Dr. Fatemeh Afghah
 **Foundational Work**  
 Bryce Hopkins, Michael Marinaccio (Flame-Data-Pipeline)
 
----
-
-This repository specifically documents **Camren J. Khoury’s contributions**, focusing on:
-
-- GUI-based tooling  
-- Workflow integration  
-- Structured dataset preparation  
-- Improved usability for wildfire imagery pipelines  
-
-While the overall research effort is collaborative, this repository isolates and presents the dataset-building and tooling improvements.
+This repository documents **Camren J. Khoury’s contributions**, focusing on improving dataset workflows, GUI tooling, and usability.
 
 ---
 
 ## Overview
 
-FlameVQA Dataset Builder is a **GUI-based system** designed to transform raw wildfire imagery into structured, usable multimodal datasets.
+FlameVQA Dataset Builder is a **GUI-based system** for transforming raw wildfire imagery into structured multimodal datasets.
 
-### Improvements include:
-- Improved imagery organization  
-- Metadata preservation  
-- Better handling of intermediate outputs  
-- Structured dataset preparation for downstream workflows  
-- Removal of DJI dependency for non-RJPEG data  
-- Attempted mitigation of memory leak issues  
-- New GUI for comparison and user input  
+### Key Improvements
+- Improved dataset organization and structure  
+- Metadata preservation and traceability  
+- Improved intermediate processing pipeline  
+- Removal of strict DJI/RJPEG dependency  
+- Partial mitigation of known memory issues  
+- New GUI for comparison and user-driven workflow control  
 
-This project builds on the **Flame-Data-Pipeline**, extending it from separate preprocessing tools into a more unified dataset construction workflow.
+This extends the original Flame-Data-Pipeline into a **more unified dataset construction workflow**.
 
 ---
 
 ## Purpose
 
 Wildfire datasets are often:
-
 - Large-scale  
-- Multi-modal (RGB + thermal)  
+- Multimodal (RGB + thermal)  
 - Inconsistently structured  
-- Difficult to preprocess reliably  
 
-### This tool addresses those issues by:
+This tool addresses those issues by:
+- Centralizing preprocessing  
+- Reducing manual steps  
+- Standardizing outputs  
 
-- Centralizing dataset preparation  
-- Reducing manual preprocessing  
-- Improving consistency and traceability  
-
-**Goal:**  
-Convert raw or semi-structured data into clean, standardized, research-ready datasets.
+**Goal:** Convert raw or semi-structured data into clean, research-ready datasets.
 
 ---
 
 ## Foundation
 
-This repository builds on the original:
-
-### Flame-Data-Pipeline
-
-Core tools from that work include:
+Built on the original **Flame-Data-Pipeline**, which includes:
 
 - Raw File Sorting Tool  
 - FLAME Image Labeling Tool  
 - Image GPS Tracing Tool  
 
-These tools established the initial pipeline for:
-
-- Organizing wildfire imagery  
-- Pairing RGB and thermal data  
-- Extracting metadata  
-
-FlameVQA Dataset Builder extends this into a more integrated workflow.
+These established the baseline for pairing imagery and extracting metadata.
 
 ---
 
-## What This Repository Covers
+## Dependencies
 
-This repository focuses on dataset workflow improvements:
+### Core Environment
+- Python 3.9+  
+- pip 24.0+  
 
-- GUI development  
-- Workflow integration  
-- Improved dataset organization  
-- Handling real-world (non-ideal) data structures  
-- Reusable and standardized output formats  
-- Support for multimodal dataset construction  
+### Libraries
+- opencv-python  
+- pillow  
+- numpy  
+- matplotlib  
+- seaborn  
+- psutil  
+- exif  
+
+Optional (depending on usage):
+- PySimpleGUI (GUI components)  
+- videoprops (video metadata handling)  
+- Jupyter Notebook (GPS tracing tool)  
+
+---
+
+## Usage (High-Level)
+
+Typical workflow:
+
+1. Load raw or semi-structured dataset  
+2. Pair RGB and thermal imagery  
+3. Process and organize into structured format  
+4. Generate outputs for labeling or downstream tasks  
+
+---
+
+## Known Issues
+
+- Original pipeline memory leak (seaborn-related) still partially present  
+- Large batches (>3000 image pairs) may cause high memory usage  
+
+---
+
+## Scope
+
+This repository focuses only on:
+- Dataset preparation tooling  
+- Workflow improvements  
+
+It does **not include** internal research methods or restricted project details.
 
 ---
 
 ## Acknowledgment
 
-This work is associated with:
+Developed at Clemson University – IS-WiN Lab.
 
-- Clemson University  
-- IS-WiN Lab  
-
-### Contributors
-
-- Mobin Habibpour (Project Lead)  
-- Niloufar Alipour Talemi (Project Lead)  
-- John Spodnik (Undergraduate Researcher)  
-- Camren J. Khoury (Undergraduate Researcher, Tooling Development)  
-- Dr. Fatemeh Afghah (Project Oversight)  
-- Bryce Hopkins (Original Pipeline Development)  
-- Michael Marinaccio (Original Contributions & Support)  
+**Contributors**
+- Mobin Habibpour  
+- Niloufar Alipour Talemi  
+- John Spodnik  
+- Camren J. Khoury  
+- Dr. Fatemeh Afghah  
+- Bryce Hopkins  
+- Michael Marinaccio  
