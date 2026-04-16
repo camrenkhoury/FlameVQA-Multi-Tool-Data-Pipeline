@@ -42,6 +42,1202 @@ class QueueWriter(io.TextIOBase):
         return None
 
 
+class AlignmentValidationWindow:
+    def __init__(self, parent, sorter_module, pair):
+        self.sorter = sorter_module
+        self.pair = pair
+        self.overlay_dx = 0.0
+        self.overlay_dy = 0.0
+        self.drag_last = None
+        self.click_start = None
+        self.dragging = False
+        self.last_probe_canvas_point = None
+        self.last_render_state = {}
+        self.current_canvas_image = None
+        self.current_composite = None
+        self.cached_images = {}
+
+        self.base_mode_var = tk.StringVar(value="Corrected FOV")
+        self.thermal_source_var = tk.StringVar()
+        self.opacity_var = tk.DoubleVar(value=55.0)
+        self.thermal_scale_var = tk.DoubleVar(value=100.0)
+        self.rgb_grayscale_var = tk.BooleanVar(value=False)
+        self.thermal_grayscale_var = tk.BooleanVar(value=False)
+        self.show_crop_box_var = tk.BooleanVar(value=True)
+        self.transform_var = tk.StringVar(value="")
+        self.probe_var = tk.StringVar(value="Click a point to inspect coordinates and values.")
+
+        self.window = tk.Toplevel(parent)
+        self.window.title("Alignment Validation Tool")
+        self.window.geometry("1680x980")
+        self.window.minsize(1200, 760)
+
+        self._load_images()
+        self._build_ui()
+        self._bind_events()
+        self._reset_overlay()
+
+    def _build_ui(self):
+        outer = ttk.Frame(self.window, padding=12)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=0)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            outer,
+            text="Alignment Validation Tool",
+            font=("Segoe UI", 13, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            outer,
+            text=(
+                "Drag the thermal layer to move it. Use the mouse wheel or the scale slider to resize it. "
+                "This is for visual validation only; it does not change the sorted files."
+            ),
+            wraplength=1400,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 10))
+
+        controls = ttk.LabelFrame(outer, text="Overlay Controls", padding=10)
+        controls.grid(row=2, column=0, sticky="nsw", padx=(0, 12))
+        controls.columnconfigure(0, weight=1)
+
+        ttk.Label(controls, text="Base Image").grid(row=0, column=0, sticky="w")
+        base_combo = ttk.Combobox(
+            controls,
+            textvariable=self.base_mode_var,
+            values=["Corrected FOV", "Raw RGB"],
+            state="readonly",
+            width=24,
+        )
+        base_combo.grid(row=1, column=0, sticky="ew", pady=(4, 10))
+        base_combo.bind("<<ComboboxSelected>>", lambda event: self._refresh_canvas())
+
+        ttk.Label(controls, text="Thermal Source").grid(row=2, column=0, sticky="w")
+        thermal_combo = ttk.Combobox(
+            controls,
+            textvariable=self.thermal_source_var,
+            values=list(self.thermal_sources.keys()),
+            state="readonly",
+            width=24,
+        )
+        thermal_combo.grid(row=3, column=0, sticky="ew", pady=(4, 10))
+        thermal_combo.bind("<<ComboboxSelected>>", lambda event: self._refresh_canvas())
+
+        ttk.Label(controls, text="Thermal Opacity").grid(row=4, column=0, sticky="w")
+        ttk.Scale(
+            controls,
+            variable=self.opacity_var,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            command=lambda value: self._refresh_canvas(),
+        ).grid(row=5, column=0, sticky="ew", pady=(4, 10))
+
+        ttk.Label(controls, text="Thermal Scale").grid(row=6, column=0, sticky="w")
+        ttk.Scale(
+            controls,
+            variable=self.thermal_scale_var,
+            from_=20,
+            to=220,
+            orient="horizontal",
+            command=lambda value: self._refresh_canvas(),
+        ).grid(row=7, column=0, sticky="ew", pady=(4, 10))
+
+        ttk.Checkbutton(
+            controls,
+            text="RGB to Grayscale",
+            variable=self.rgb_grayscale_var,
+            command=self._refresh_canvas,
+        ).grid(row=8, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Thermal to Grayscale",
+            variable=self.thermal_grayscale_var,
+            command=self._refresh_canvas,
+        ).grid(row=9, column=0, sticky="w", pady=(2, 0))
+        ttk.Checkbutton(
+            controls,
+            text="Show Fixed Crop Box on Raw RGB",
+            variable=self.show_crop_box_var,
+            command=self._refresh_canvas,
+        ).grid(row=10, column=0, sticky="w", pady=(2, 10))
+
+        nudge_frame = ttk.LabelFrame(controls, text="Fine Nudge", padding=8)
+        nudge_frame.grid(row=11, column=0, sticky="ew", pady=(8, 10))
+        for column in range(3):
+            nudge_frame.columnconfigure(column, weight=1)
+        ttk.Button(nudge_frame, text="Up", command=lambda: self._nudge_overlay(0, -2)).grid(row=0, column=1, sticky="ew")
+        ttk.Button(nudge_frame, text="Left", command=lambda: self._nudge_overlay(-2, 0)).grid(row=1, column=0, sticky="ew", padx=(0, 4), pady=(4, 0))
+        ttk.Button(nudge_frame, text="Right", command=lambda: self._nudge_overlay(2, 0)).grid(row=1, column=2, sticky="ew", padx=(4, 0), pady=(4, 0))
+        ttk.Button(nudge_frame, text="Down", command=lambda: self._nudge_overlay(0, 2)).grid(row=2, column=1, sticky="ew", pady=(4, 0))
+
+        ttk.Button(controls, text="Reset Overlay", command=self._reset_overlay).grid(row=12, column=0, sticky="ew", pady=(4, 0))
+        ttk.Button(controls, text="Copy Transform", command=self._copy_transform).grid(row=13, column=0, sticky="ew", pady=(8, 0))
+        ttk.Button(controls, text="Save Snapshot", command=self._save_snapshot).grid(row=14, column=0, sticky="ew", pady=(8, 0))
+
+        ttk.Label(
+            controls,
+            textvariable=self.transform_var,
+            wraplength=260,
+            justify="left",
+        ).grid(row=15, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(
+            controls,
+            textvariable=self.probe_var,
+            wraplength=260,
+            justify="left",
+        ).grid(row=16, column=0, sticky="w", pady=(12, 0))
+
+        self.canvas = tk.Canvas(outer, background="#1f1f1f", highlightthickness=0)
+        self.canvas.grid(row=2, column=1, sticky="nsew")
+
+    def _bind_events(self):
+        self.canvas.bind("<Configure>", lambda event: self._refresh_canvas())
+        self.canvas.bind("<ButtonPress-1>", self._start_drag)
+        self.canvas.bind("<B1-Motion>", self._drag_overlay)
+        self.canvas.bind("<ButtonRelease-1>", self._stop_drag)
+        self.window.bind("<MouseWheel>", self._handle_mouse_wheel)
+        self.window.bind("<Left>", lambda event: self._nudge_overlay(-2, 0))
+        self.window.bind("<Right>", lambda event: self._nudge_overlay(2, 0))
+        self.window.bind("<Up>", lambda event: self._nudge_overlay(0, -2))
+        self.window.bind("<Down>", lambda event: self._nudge_overlay(0, 2))
+        self.window.bind("r", lambda event: self._reset_overlay())
+
+    def _load_standard_image(self, path):
+        image = Image.open(path)
+        if image.mode not in ("RGB", "RGBA"):
+            image = ImageOps.autocontrast(image.convert("L")).convert("RGB")
+        else:
+            image = image.convert("RGB")
+        return image
+
+    def _load_value_image(self, path):
+        with Image.open(path) as image:
+            return image.copy()
+
+    def _load_images(self):
+        dataset_name = self.pair.get("dataset_name")
+        burn_set_name = self.pair.get("burn_set_name")
+        detected_camera = self.pair.get("detected_camera")
+        self.raw_rgb = self._load_standard_image(self.pair["rgb"]["filepath"])
+        self.raw_rgb_value_image = self._load_value_image(self.pair["rgb"]["filepath"])
+        self.thermal_alignment_source = (
+            self.pair["cal_tiff"]["filepath"]
+            if self.pair["cal_tiff"] is not None
+            else self.pair["thermal_tiff"]["filepath"]
+        )
+        self.fixed_crop_debug = self.sorter._get_crop_debug_info(
+            self.pair["rgb"]["filepath"],
+            thermal_source_path=self.thermal_alignment_source,
+            use_experimental_shift=False,
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            camera_used=detected_camera,
+        )
+        self.corrected_fixed = self.sorter._apply_rgb_fov_correction(
+            self.pair["rgb"]["filepath"],
+            thermal_source_path=self.thermal_alignment_source,
+            use_experimental_shift=False,
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            camera_used=detected_camera,
+        ).convert("RGB")
+        self.corrected_fixed_value_image = self.corrected_fixed.copy()
+
+        self.thermal_sources = {}
+        if self.pair["thermal_jpg"] is not None:
+            self.thermal_sources["Thermal JPG"] = {
+                "path": self.pair["thermal_jpg"]["filepath"],
+                "image": self._load_standard_image(self.pair["thermal_jpg"]["filepath"]),
+                "value_image": self._load_value_image(self.pair["thermal_jpg"]["filepath"]),
+            }
+        if self.pair["cal_tiff"] is not None:
+            self.thermal_sources["Cal TIFF"] = {
+                "path": self.pair["cal_tiff"]["filepath"],
+                "image": self._load_standard_image(self.pair["cal_tiff"]["filepath"]),
+                "value_image": self._load_value_image(self.pair["cal_tiff"]["filepath"]),
+            }
+        if self.pair["thermal_tiff"] is not None:
+            self.thermal_sources["Thermal TIFF"] = {
+                "path": self.pair["thermal_tiff"]["filepath"],
+                "image": self._load_standard_image(self.pair["thermal_tiff"]["filepath"]),
+                "value_image": self._load_value_image(self.pair["thermal_tiff"]["filepath"]),
+            }
+
+        self.thermal_source_var.set(next(iter(self.thermal_sources.keys())))
+
+    def _start_drag(self, event):
+        self.click_start = (event.x, event.y)
+        self.drag_last = (event.x, event.y)
+        self.dragging = False
+        self.canvas.focus_set()
+
+    def _drag_overlay(self, event):
+        if self.drag_last is None:
+            return
+        if self.click_start is not None:
+            travel = abs(event.x - self.click_start[0]) + abs(event.y - self.click_start[1])
+            if travel < 4:
+                return
+            self.dragging = True
+        last_x, last_y = self.drag_last
+        self.overlay_dx += event.x - last_x
+        self.overlay_dy += event.y - last_y
+        self.drag_last = (event.x, event.y)
+        self._refresh_canvas()
+
+    def _stop_drag(self, event=None):
+        if not self.dragging and event is not None:
+            self._set_probe_point(event.x, event.y)
+        self.drag_last = None
+        self.click_start = None
+        self.dragging = False
+
+    def _handle_mouse_wheel(self, event):
+        direction = 1 if event.delta > 0 else -1
+        next_value = min(220, max(20, self.thermal_scale_var.get() + (direction * 2)))
+        self.thermal_scale_var.set(next_value)
+        self._refresh_canvas()
+
+    def _nudge_overlay(self, delta_x, delta_y):
+        self.overlay_dx += delta_x
+        self.overlay_dy += delta_y
+        self._refresh_canvas()
+
+    def _reset_overlay(self):
+        self.overlay_dx = 0.0
+        self.overlay_dy = 0.0
+        self.thermal_scale_var.set(100.0)
+        self.opacity_var.set(55.0)
+        self._refresh_canvas()
+
+    def _set_probe_point(self, x, y):
+        self.last_probe_canvas_point = (x, y)
+        self._refresh_canvas()
+
+    def _copy_transform(self):
+        payload = self.transform_var.get()
+        self.window.clipboard_clear()
+        self.window.clipboard_append(payload)
+
+    def _save_snapshot(self):
+        if self.current_composite is None:
+            return
+        default_name = f"{Path(self.pair['rgb']['filename']).stem}_alignment_overlay.png"
+        destination = filedialog.asksaveasfilename(
+            parent=self.window,
+            defaultextension=".png",
+            initialfile=default_name,
+            filetypes=[("PNG Image", "*.png")],
+        )
+        if not destination:
+            return
+        self.current_composite.save(destination)
+
+    def _fit_rect(self, image_size, available_width, available_height, margin=16):
+        width, height = image_size
+        usable_width = max(available_width - margin * 2, 1)
+        usable_height = max(available_height - margin * 2, 1)
+        scale = min(usable_width / width, usable_height / height)
+        scaled_width = max(1, int(width * scale))
+        scaled_height = max(1, int(height * scale))
+        left = (available_width - scaled_width) // 2
+        top = (available_height - scaled_height) // 2
+        return left, top, scaled_width, scaled_height, scale
+
+    def _map_canvas_point_to_image(self, point, rect, image_size):
+        x, y = point
+        left, top, width, height = rect
+        if width <= 0 or height <= 0:
+            return None
+        if x < left or y < top or x >= left + width or y >= top + height:
+            return None
+
+        normalized_x = (x - left) / float(width)
+        normalized_y = (y - top) / float(height)
+        image_x = min(image_size[0] - 1, max(0, int(normalized_x * image_size[0])))
+        image_y = min(image_size[1] - 1, max(0, int(normalized_y * image_size[1])))
+        return image_x, image_y
+
+    def _format_pixel_value(self, value):
+        if hasattr(value, "item"):
+            value = value.item()
+        if isinstance(value, tuple):
+            return "(" + ", ".join(str(int(channel)) if isinstance(channel, (int, float)) else str(channel) for channel in value) + ")"
+        if isinstance(value, float):
+            return f"{value:.3f}"
+        return str(value)
+
+    def _get_pixel_value(self, image, coords):
+        if coords is None:
+            return None
+        return image.getpixel(coords)
+
+    def _probe_text(self):
+        if self.last_probe_canvas_point is None or not self.last_render_state:
+            return "Click a point to inspect coordinates and values."
+
+        point = self.last_probe_canvas_point
+        state = self.last_render_state
+
+        base_image = self.raw_rgb_value_image if self.base_mode_var.get() == "Raw RGB" else self.corrected_fixed_value_image
+        base_coords = self._map_canvas_point_to_image(
+            point,
+            state["base_rect"],
+            base_image.size,
+        )
+        thermal_value_image = self.thermal_sources[self.thermal_source_var.get()]["value_image"]
+        thermal_coords = self._map_canvas_point_to_image(
+            point,
+            state["overlay_rect"],
+            thermal_value_image.size,
+        )
+
+        lines = [f"Canvas: ({int(point[0])}, {int(point[1])})"]
+        if base_coords is None:
+            lines.append(f"{self.base_mode_var.get()}: outside image")
+        else:
+            base_value = self._format_pixel_value(self._get_pixel_value(base_image, base_coords))
+            lines.append(
+                f"{self.base_mode_var.get()}: ({base_coords[0]}, {base_coords[1]}) value={base_value}"
+            )
+            if self.base_mode_var.get() == "Raw RGB":
+                crop_box = self.fixed_crop_debug["final_crop_box"]
+                if (
+                    crop_box[0] <= base_coords[0] < crop_box[2]
+                    and crop_box[1] <= base_coords[1] < crop_box[3]
+                ):
+                    corrected_coords = (base_coords[0] - crop_box[0], base_coords[1] - crop_box[1])
+                    lines.append(
+                        f"Fixed crop-relative: ({corrected_coords[0]}, {corrected_coords[1]})"
+                    )
+                else:
+                    lines.append("Fixed crop-relative: outside crop box")
+
+        if thermal_coords is None:
+            lines.append(f"{self.thermal_source_var.get()}: outside overlay")
+        else:
+            thermal_value = self._format_pixel_value(self._get_pixel_value(thermal_value_image, thermal_coords))
+            lines.append(
+                f"{self.thermal_source_var.get()}: ({thermal_coords[0]}, {thermal_coords[1]}) value={thermal_value}"
+            )
+
+        return "\n".join(lines)
+
+    def _draw_probe_marker(self, draw):
+        if self.last_probe_canvas_point is None:
+            return
+        x, y = self.last_probe_canvas_point
+        radius = 8
+        draw.ellipse((x - radius, y - radius, x + radius, y + radius), outline=(255, 255, 0), width=2)
+        draw.line((x - 16, y, x + 16, y), fill=(255, 255, 0), width=2)
+        draw.line((x, y - 16, x, y + 16), fill=(255, 255, 0), width=2)
+
+    def _draw_dashed_rectangle(self, draw, rectangle, color=(0, 0, 0), width=3, dash=14, gap=8):
+        x1, y1, x2, y2 = rectangle
+        x = x1
+        while x < x2:
+            draw.line((x, y1, min(x + dash, x2), y1), fill=color, width=width)
+            draw.line((x, y2, min(x + dash, x2), y2), fill=color, width=width)
+            x += dash + gap
+        y = y1
+        while y < y2:
+            draw.line((x1, y, x1, min(y + dash, y2)), fill=color, width=width)
+            draw.line((x2, y, x2, min(y + dash, y2)), fill=color, width=width)
+            y += dash + gap
+
+    def _prepare_base_image(self):
+        if self.base_mode_var.get() == "Raw RGB":
+            image = self.raw_rgb.copy()
+        else:
+            image = self.corrected_fixed.copy()
+        if self.rgb_grayscale_var.get():
+            image = ImageOps.grayscale(image).convert("RGB")
+        return image
+
+    def _prepare_thermal_image(self):
+        selected = self.thermal_sources[self.thermal_source_var.get()]["image"].copy()
+        if self.thermal_grayscale_var.get():
+            selected = ImageOps.grayscale(selected).convert("RGB")
+        return selected
+
+    def _compose_overlay(self, width, height):
+        base_image = self._prepare_base_image()
+        thermal_image = self._prepare_thermal_image()
+        composite = Image.new("RGB", (width, height), color=(31, 31, 31))
+
+        base_left, base_top, base_width, base_height, base_scale = self._fit_rect(
+            base_image.size,
+            width,
+            height,
+        )
+        base_display = base_image.resize((base_width, base_height), Image.LANCZOS)
+        composite.paste(base_display, (base_left, base_top))
+        draw = ImageDraw.Draw(composite)
+
+        if self.base_mode_var.get() == "Raw RGB":
+            crop_box = self.fixed_crop_debug["final_crop_box"]
+            anchor_left = int(base_left + crop_box[0] * base_scale)
+            anchor_top = int(base_top + crop_box[1] * base_scale)
+            anchor_width = max(1, int((crop_box[2] - crop_box[0]) * base_scale))
+            anchor_height = max(1, int((crop_box[3] - crop_box[1]) * base_scale))
+            if self.show_crop_box_var.get():
+                self._draw_dashed_rectangle(
+                    draw,
+                    (
+                        anchor_left,
+                        anchor_top,
+                        anchor_left + anchor_width,
+                        anchor_top + anchor_height,
+                    ),
+                )
+        else:
+            anchor_left = base_left
+            anchor_top = base_top
+            anchor_width = base_width
+            anchor_height = base_height
+
+        overlay_scale = self.thermal_scale_var.get() / 100.0
+        thermal_width = max(1, int(anchor_width * overlay_scale))
+        thermal_height = max(1, int(anchor_height * overlay_scale))
+        thermal_display = thermal_image.resize((thermal_width, thermal_height), Image.LANCZOS).convert("RGBA")
+        alpha_value = int((self.opacity_var.get() / 100.0) * 255)
+        thermal_display.putalpha(alpha_value)
+
+        overlay_left = int(anchor_left + ((anchor_width - thermal_width) / 2.0) + self.overlay_dx)
+        overlay_top = int(anchor_top + ((anchor_height - thermal_height) / 2.0) + self.overlay_dy)
+
+        composite_rgba = composite.convert("RGBA")
+        overlay_layer = Image.new("RGBA", composite_rgba.size, (0, 0, 0, 0))
+        overlay_layer.paste(thermal_display, (overlay_left, overlay_top), thermal_display)
+        composite_rgba = Image.alpha_composite(composite_rgba, overlay_layer)
+        composite = composite_rgba.convert("RGB")
+        self.last_render_state = {
+            "base_rect": (base_left, base_top, base_width, base_height),
+            "overlay_rect": (overlay_left, overlay_top, thermal_width, thermal_height),
+            "anchor_rect": (anchor_left, anchor_top, anchor_width, anchor_height),
+        }
+        draw = ImageDraw.Draw(composite)
+        self._draw_probe_marker(draw)
+
+        self.transform_var.set(
+            "Base: {base} | Thermal: {thermal} | Offset x={x:+.0f}, y={y:+.0f} | Scale={scale:.1f}% | Opacity={opacity:.0f}%".format(
+                base=self.base_mode_var.get(),
+                thermal=self.thermal_source_var.get(),
+                x=self.overlay_dx,
+                y=self.overlay_dy,
+                scale=self.thermal_scale_var.get(),
+                opacity=self.opacity_var.get(),
+            )
+        )
+        self.probe_var.set(self._probe_text())
+        return composite
+
+    def _refresh_canvas(self):
+        width = max(self.canvas.winfo_width(), 400)
+        height = max(self.canvas.winfo_height(), 300)
+        self.current_composite = self._compose_overlay(width, height)
+        self.current_canvas_image = ImageTk.PhotoImage(self.current_composite)
+        self.canvas.delete("all")
+        self.canvas.create_image(width // 2, height // 2, image=self.current_canvas_image, anchor="center")
+
+
+class CalibrationProfileWindow:
+    def __init__(self, parent, sorter_module, burn_set, initial_index=0):
+        self.sorter = sorter_module
+        self.burn_set = burn_set
+        self.pairs = burn_set["pairs"]
+        self.dataset_name = burn_set.get("dataset_name") or Path(burn_set["source_root"]).parent.name
+        self.burn_set_name = burn_set.get("name", "burn_set_001")
+        self.detected_camera = burn_set.get("detected_camera", self.sorter.CAMERA_USED)
+        self.current_pair_index = max(0, min(initial_index, len(self.pairs) - 1)) if self.pairs else 0
+        self.control_points = []
+        self.pending_source = None
+        self.pending_target = None
+        self.current_profile = None
+        self.estimated_profile = None
+        self.current_source_photo = None
+        self.current_thermal_photo = None
+        self.large_source_photo = None
+        self.large_thermal_photo = None
+        self.current_source_state = {}
+        self.current_thermal_state = {}
+        self.large_source_state = {}
+        self.large_thermal_state = {}
+        self.current_pair = None
+        self.current_crop_debug = None
+        self.current_raw_rgb = None
+        self.current_crop_only = None
+        self.current_thermal = None
+        self.large_click_window = None
+        self.large_source_canvas = None
+        self.large_thermal_canvas = None
+
+        self.base_mode_var = tk.StringVar(value="Crop Baseline")
+        self.scope_var = tk.StringVar(value="dataset")
+        self.pair_label_var = tk.StringVar(value="")
+        self.pending_var = tk.StringVar(value="Click a source point, then the matching thermal point.")
+        self.profile_summary_var = tk.StringVar(value="No calibration estimated yet.")
+        self.profile_path_var = tk.StringVar(value="No saved calibration profile loaded.")
+
+        self.window = tk.Toplevel(parent)
+        self.window.title(f"Developer Calibration - {self.dataset_name} / {self.burn_set_name}")
+        self.window.geometry("2140x1240")
+        self.window.minsize(1500, 920)
+
+        self._build_ui()
+        self._load_existing_profile()
+        self._load_pair()
+
+    def _build_ui(self):
+        outer = ttk.Frame(self.window, padding=12)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=0)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(1, weight=0)
+        outer.rowconfigure(2, weight=1)
+
+        ttk.Label(
+            outer,
+            text=f"Developer Calibration: {self.dataset_name} / {self.burn_set_name}",
+            font=("Segoe UI", 13, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            outer,
+            text=(
+                "Collect source-to-thermal correspondences, estimate the geometric correction model, "
+                "then save the profile for automatic reuse during sorting/export."
+            ),
+            wraplength=1500,
+        ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 10))
+
+        controls = ttk.LabelFrame(outer, text="Calibration Controls", padding=10)
+        controls.grid(row=2, column=0, sticky="nsw", padx=(0, 12))
+        controls.columnconfigure(0, weight=1)
+
+        ttk.Label(controls, textvariable=self.pair_label_var, font=("Segoe UI", 10, "bold")).grid(
+            row=0, column=0, sticky="w"
+        )
+        pair_nav = ttk.Frame(controls)
+        pair_nav.grid(row=1, column=0, sticky="ew", pady=(8, 10))
+        pair_nav.columnconfigure(0, weight=1)
+        pair_nav.columnconfigure(1, weight=1)
+        ttk.Button(pair_nav, text="Previous Pair", command=self._show_previous_pair).grid(
+            row=0, column=0, sticky="ew", padx=(0, 6)
+        )
+        ttk.Button(pair_nav, text="Next Pair", command=self._show_next_pair).grid(
+            row=0, column=1, sticky="ew", padx=(6, 0)
+        )
+
+        ttk.Label(controls, text="Source View").grid(row=2, column=0, sticky="w")
+        source_combo = ttk.Combobox(
+            controls,
+            textvariable=self.base_mode_var,
+            values=["Crop Baseline", "Raw RGB"],
+            state="readonly",
+            width=24,
+        )
+        source_combo.grid(row=3, column=0, sticky="ew", pady=(4, 10))
+        source_combo.bind("<<ComboboxSelected>>", lambda event: self._refresh_canvases())
+
+        ttk.Label(controls, text="Save Scope").grid(row=4, column=0, sticky="w")
+        scope_combo = ttk.Combobox(
+            controls,
+            textvariable=self.scope_var,
+            values=["dataset", "burn_set", "camera_default"],
+            state="readonly",
+            width=24,
+        )
+        scope_combo.grid(row=5, column=0, sticky="ew", pady=(4, 10))
+
+        ttk.Button(controls, text="Estimate Models", command=self._estimate_models).grid(
+            row=6, column=0, sticky="ew", pady=(4, 0)
+        )
+        ttk.Button(controls, text="Save Calibration Profile", command=self._save_profile).grid(
+            row=7, column=0, sticky="ew", pady=(8, 0)
+        )
+        ttk.Button(controls, text="Export Validation Samples", command=self._export_validation).grid(
+            row=8, column=0, sticky="ew", pady=(8, 0)
+        )
+        ttk.Button(controls, text="Open Large Click View", command=self._open_large_click_view).grid(
+            row=9, column=0, sticky="ew", pady=(12, 0)
+        )
+        ttk.Button(controls, text="Remove Last Point", command=self._remove_last_point).grid(
+            row=10, column=0, sticky="ew", pady=(12, 0)
+        )
+        ttk.Button(controls, text="Clear All Points", command=self._clear_points).grid(
+            row=11, column=0, sticky="ew", pady=(8, 0)
+        )
+
+        ttk.Label(
+            controls,
+            textvariable=self.pending_var,
+            wraplength=280,
+            justify="left",
+        ).grid(row=12, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(
+            controls,
+            textvariable=self.profile_summary_var,
+            wraplength=280,
+            justify="left",
+        ).grid(row=13, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(
+            controls,
+            textvariable=self.profile_path_var,
+            wraplength=280,
+            justify="left",
+        ).grid(row=14, column=0, sticky="w", pady=(12, 0))
+
+        right = ttk.Frame(outer)
+        right.grid(row=2, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.columnconfigure(1, weight=1)
+        right.rowconfigure(1, weight=8)
+        right.rowconfigure(3, weight=2)
+
+        ttk.Label(right, text="Source Image", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        ttk.Label(right, text="Thermal Image", font=("Segoe UI", 10, "bold")).grid(row=0, column=1, sticky="w")
+
+        self.source_canvas = tk.Canvas(right, background="#1f1f1f", highlightthickness=0)
+        self.source_canvas.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(8, 12))
+        self.thermal_canvas = tk.Canvas(right, background="#1f1f1f", highlightthickness=0)
+        self.thermal_canvas.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(8, 12))
+        self.source_canvas.bind("<Button-1>", self._handle_source_click)
+        self.thermal_canvas.bind("<Button-1>", self._handle_thermal_click)
+        self.source_canvas.bind("<Configure>", lambda event: self._refresh_canvases())
+        self.thermal_canvas.bind("<Configure>", lambda event: self._refresh_canvases())
+
+        ttk.Label(right, text="Estimated Models", font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky="w")
+        ttk.Label(right, text="Control Points", font=("Segoe UI", 10, "bold")).grid(row=2, column=1, sticky="w")
+
+        self.model_tree = ttk.Treeview(
+            right,
+            columns=("model", "rmse", "mean", "max", "points", "chosen"),
+            show="headings",
+            height=8,
+        )
+        for key, label, width in [
+            ("model", "Model", 110),
+            ("rmse", "RMSE", 70),
+            ("mean", "Mean", 70),
+            ("max", "Max", 70),
+            ("points", "Points", 65),
+            ("chosen", "Chosen", 70),
+        ]:
+            self.model_tree.heading(key, text=label)
+            self.model_tree.column(key, width=width, anchor="center")
+        self.model_tree.grid(row=3, column=0, sticky="nsew", padx=(0, 8))
+
+        self.point_tree = ttk.Treeview(
+            right,
+            columns=("point", "pair", "source", "target", "error"),
+            show="headings",
+            height=8,
+        )
+        for key, label, width in [
+            ("point", "Point", 70),
+            ("pair", "Pair", 70),
+            ("source", "Source", 130),
+            ("target", "Thermal", 130),
+            ("error", "Error", 80),
+        ]:
+            self.point_tree.heading(key, text=label)
+            self.point_tree.column(key, width=width, anchor="center")
+        self.point_tree.grid(row=3, column=1, sticky="nsew", padx=(8, 0))
+
+    def _load_existing_profile(self):
+        self.current_profile = self.sorter.load_calibration_profile(
+            camera_used=self.detected_camera,
+            dataset_name=self.dataset_name,
+            burn_set_name=self.burn_set_name,
+        )
+        if self.current_profile is None:
+            self.profile_path_var.set("No saved calibration profile loaded.")
+            return
+
+        selected_model = self.current_profile.get("selected_model", "crop_only")
+        selected_summary = self.current_profile.get("selected_model_summary", {})
+        rmse = selected_summary.get("rmse")
+        rmse_text = "n/a" if rmse is None else f"{rmse:.4f}px"
+        self.profile_summary_var.set(
+            f"Loaded saved profile. Model={selected_model}, RMSE={rmse_text}"
+        )
+        self.profile_path_var.set(
+            f"Loaded profile:\n{self.current_profile.get('profile_path', '')}"
+        )
+        self._populate_model_tree(self.current_profile)
+
+    def _load_standard_image(self, path):
+        with Image.open(path) as image:
+            if image.mode not in ("RGB", "RGBA"):
+                return ImageOps.autocontrast(image.convert("L")).convert("RGB")
+            return image.convert("RGB")
+
+    def _fit_rect(self, image_size, available_width, available_height, margin=16):
+        width, height = image_size
+        usable_width = max(available_width - margin * 2, 1)
+        usable_height = max(available_height - margin * 2, 1)
+        scale = min(usable_width / width, usable_height / height)
+        scaled_width = max(1, int(width * scale))
+        scaled_height = max(1, int(height * scale))
+        left = (available_width - scaled_width) // 2
+        top = (available_height - scaled_height) // 2
+        return left, top, scaled_width, scaled_height, scale
+
+    def _map_canvas_point_to_image(self, point, rect, image_size):
+        x, y = point
+        left, top, width, height = rect
+        if width <= 0 or height <= 0:
+            return None
+        if x < left or y < top or x >= left + width or y >= top + height:
+            return None
+        normalized_x = (x - left) / float(width)
+        normalized_y = (y - top) / float(height)
+        image_x = min(image_size[0] - 1, max(0, int(normalized_x * image_size[0])))
+        image_y = min(image_size[1] - 1, max(0, int(normalized_y * image_size[1])))
+        return image_x, image_y
+
+    def _draw_dashed_rectangle(self, draw, rectangle, color=(0, 0, 0), width=3, dash=14, gap=8):
+        x1, y1, x2, y2 = rectangle
+        x = x1
+        while x < x2:
+            draw.line((x, y1, min(x + dash, x2), y1), fill=color, width=width)
+            draw.line((x, y2, min(x + dash, x2), y2), fill=color, width=width)
+            x += dash + gap
+        y = y1
+        while y < y2:
+            draw.line((x1, y, x1, min(y + dash, y2)), fill=color, width=width)
+            draw.line((x2, y, x2, min(y + dash, y2)), fill=color, width=width)
+            y += dash + gap
+
+    def _corrected_to_raw_coords(self, corrected_coords):
+        crop_box = self.current_crop_debug["final_crop_box"]
+        output_width, output_height = self.sorter._get_output_size()
+        crop_width = max(crop_box[2] - crop_box[0], 1)
+        crop_height = max(crop_box[3] - crop_box[1], 1)
+        return (
+            crop_box[0] + (corrected_coords[0] / float(output_width)) * crop_width,
+            crop_box[1] + (corrected_coords[1] / float(output_height)) * crop_height,
+        )
+
+    def _refresh_canvases(self):
+        if self.current_pair is None:
+            return
+
+        source_image = self.current_crop_only if self.base_mode_var.get() == "Crop Baseline" else self.current_raw_rgb
+        thermal_image = self.current_thermal
+
+        self.current_source_state = self._draw_image_canvas(
+            self.source_canvas,
+            source_image,
+            draw_crop_box=self.base_mode_var.get() == "Raw RGB",
+            point_mode="source",
+        )
+        self.current_thermal_state = self._draw_image_canvas(
+            self.thermal_canvas,
+            thermal_image,
+            draw_crop_box=False,
+            point_mode="thermal",
+        )
+        self._refresh_large_click_view()
+
+    def _draw_image_canvas(self, canvas, image, draw_crop_box=False, point_mode="source", state_attr=None, photo_attr=None):
+        width = max(canvas.winfo_width(), 240)
+        height = max(canvas.winfo_height(), 200)
+        rect = self._fit_rect(image.size, width, height)
+        display = image.resize((rect[2], rect[3]), Image.LANCZOS)
+        composite = Image.new("RGB", (width, height), color=(31, 31, 31))
+        composite.paste(display, (rect[0], rect[1]))
+        draw = ImageDraw.Draw(composite)
+
+        if draw_crop_box:
+            crop_box = self.current_crop_debug["final_crop_box"]
+            crop_left = int(rect[0] + crop_box[0] * rect[4])
+            crop_top = int(rect[1] + crop_box[1] * rect[4])
+            crop_right = int(rect[0] + crop_box[2] * rect[4])
+            crop_bottom = int(rect[1] + crop_box[3] * rect[4])
+            self._draw_dashed_rectangle(draw, (crop_left, crop_top, crop_right, crop_bottom))
+
+        current_pair_label = f"{self.current_pair_index + 1:05d}"
+        for point in self.control_points:
+            if point["pair_label"] != current_pair_label:
+                continue
+            coords = point["target"] if point_mode == "thermal" else point["source"]
+            if point_mode == "source" and self.base_mode_var.get() == "Raw RGB":
+                coords = self._corrected_to_raw_coords(point["source"])
+            canvas_x = int(rect[0] + (coords[0] / float(image.size[0])) * rect[2])
+            canvas_y = int(rect[1] + (coords[1] / float(image.size[1])) * rect[3])
+            draw.ellipse((canvas_x - 8, canvas_y - 8, canvas_x + 8, canvas_y + 8), outline=(255, 255, 0), width=2)
+            draw.text((canvas_x + 10, canvas_y - 12), point["point_id"], fill=(255, 255, 0))
+
+        pending = self.pending_source if point_mode == "source" else self.pending_target
+        if pending is not None:
+            pending_coords = pending["display_coords"] if point_mode == "source" else pending["coords"]
+            canvas_x = int(rect[0] + (pending_coords[0] / float(image.size[0])) * rect[2])
+            canvas_y = int(rect[1] + (pending_coords[1] / float(image.size[1])) * rect[3])
+            draw.ellipse((canvas_x - 8, canvas_y - 8, canvas_x + 8, canvas_y + 8), outline=(0, 255, 255), width=2)
+
+        photo = ImageTk.PhotoImage(composite)
+        if photo_attr is not None:
+            setattr(self, photo_attr, photo)
+        elif point_mode == "source":
+            self.current_source_photo = photo
+        else:
+            self.current_thermal_photo = photo
+        canvas.delete("all")
+        canvas.create_image(width // 2, height // 2, image=photo, anchor="center")
+        state = {"rect": (rect[0], rect[1], rect[2], rect[3]), "image_size": image.size}
+        if state_attr is not None:
+            setattr(self, state_attr, state)
+        return state
+
+    def _refresh_large_click_view(self):
+        if self.large_click_window is None or not self.large_click_window.winfo_exists():
+            self.large_click_window = None
+            self.large_source_canvas = None
+            self.large_thermal_canvas = None
+            return
+        if self.current_pair is None:
+            return
+
+        source_image = self.current_crop_only if self.base_mode_var.get() == "Crop Baseline" else self.current_raw_rgb
+        thermal_image = self.current_thermal
+        self._draw_image_canvas(
+            self.large_source_canvas,
+            source_image,
+            draw_crop_box=self.base_mode_var.get() == "Raw RGB",
+            point_mode="source",
+            state_attr="large_source_state",
+            photo_attr="large_source_photo",
+        )
+        self._draw_image_canvas(
+            self.large_thermal_canvas,
+            thermal_image,
+            draw_crop_box=False,
+            point_mode="thermal",
+            state_attr="large_thermal_state",
+            photo_attr="large_thermal_photo",
+        )
+
+    def _load_pair(self):
+        if not self.pairs:
+            return
+
+        self.current_pair = self.pairs[self.current_pair_index]
+        self.current_pair["dataset_name"] = self.dataset_name
+        self.current_pair["burn_set_name"] = self.burn_set_name
+        self.current_pair["detected_camera"] = self.detected_camera
+        thermal_source = (
+            self.current_pair["thermal_jpg"]["filepath"]
+            if self.current_pair["thermal_jpg"] is not None
+            else self.current_pair["cal_tiff"]["filepath"] if self.current_pair["cal_tiff"] is not None else self.current_pair["thermal_tiff"]["filepath"]
+        )
+        self.current_raw_rgb = self._load_standard_image(self.current_pair["rgb"]["filepath"])
+        self.current_crop_only, self.current_crop_debug = self.sorter._apply_rgb_fov_correction(
+            self.current_pair["rgb"]["filepath"],
+            thermal_source_path=thermal_source,
+            use_experimental_shift=False,
+            dataset_name=self.dataset_name,
+            burn_set_name=self.burn_set_name,
+            calibration_profile=None,
+            camera_used=self.detected_camera,
+            return_debug_info=True,
+        )
+        self.current_crop_only = self.current_crop_only.convert("RGB")
+        self.current_thermal = self._load_standard_image(thermal_source)
+        self.pair_label_var.set(
+            f"Pair {self.current_pair_index + 1} of {len(self.pairs)} | {Path(self.current_pair['rgb']['filename']).name}"
+        )
+        self.pending_source = None
+        self.pending_target = None
+        self.pending_var.set("Click a source point, then the matching thermal point.")
+        self._refresh_canvases()
+        self._populate_point_tree()
+
+    def _handle_source_click(self, event):
+        self._handle_source_click_for_state(event, self.current_source_state)
+
+    def _handle_thermal_click(self, event):
+        self._handle_thermal_click_for_state(event, self.current_thermal_state)
+
+    def _handle_source_click_for_state(self, event, state):
+        if not state:
+            return
+
+        point = self._map_canvas_point_to_image(
+            (event.x, event.y),
+            state["rect"],
+            state["image_size"],
+        )
+        if point is None:
+            return
+
+        if self.base_mode_var.get() == "Raw RGB":
+            crop_box = self.current_crop_debug["final_crop_box"]
+            if not (crop_box[0] <= point[0] < crop_box[2] and crop_box[1] <= point[1] < crop_box[3]):
+                self.pending_var.set("Raw RGB click is outside the baseline crop box. Pick a point inside the dashed rectangle.")
+                return
+            corrected_coords = self.sorter._project_raw_point_to_corrected_coords(point, crop_box)
+            self.pending_source = {
+                "corrected_coords": corrected_coords,
+                "display_coords": point,
+                "basis": "raw_rgb",
+            }
+        else:
+            self.pending_source = {
+                "corrected_coords": (float(point[0]), float(point[1])),
+                "display_coords": point,
+                "basis": "crop_baseline",
+            }
+
+        self.pending_var.set("Source point recorded. Now click the matching point in the thermal image.")
+        self._refresh_canvases()
+
+    def _handle_thermal_click_for_state(self, event, state):
+        if not state:
+            return
+
+        point = self._map_canvas_point_to_image(
+            (event.x, event.y),
+            state["rect"],
+            state["image_size"],
+        )
+        if point is None:
+            return
+
+        self.pending_target = {"coords": (float(point[0]), float(point[1]))}
+        if self.pending_source is None:
+            self.pending_var.set("Thermal point recorded. Click a source point next.")
+            self._refresh_canvases()
+            return
+
+        point_id = f"P{len(self.control_points) + 1:03d}"
+        self.control_points.append(
+            {
+                "point_id": point_id,
+                "pair_label": f"{self.current_pair_index + 1:05d}",
+                "source": list(self.pending_source["corrected_coords"]),
+                "target": list(self.pending_target["coords"]),
+                "source_basis": self.pending_source["basis"],
+            }
+        )
+        self.pending_source = None
+        self.pending_target = None
+        self.estimated_profile = None
+        self.pending_var.set(f"Added {point_id}. Click the next source point, then the matching thermal point.")
+        self._populate_point_tree()
+        self._refresh_canvases()
+
+    def _estimate_models(self):
+        if not self.control_points:
+            messagebox.showinfo("No points", "Add at least one source/thermal correspondence before estimating a calibration model.")
+            return
+
+        self.estimated_profile = self.sorter.build_calibration_profile(
+            self.control_points,
+            camera_used=self.detected_camera,
+            dataset_name=self.dataset_name,
+            burn_set_name=self.burn_set_name,
+            profile_scope=self.scope_var.get(),
+            baseline_crop_box=self.current_crop_debug["base_crop_box"],
+            source_rgb_size=self.current_raw_rgb.size,
+            notes="Created with the Raw File Sorting GUI developer calibration tool.",
+        )
+        self._populate_model_tree(self.estimated_profile)
+        self._populate_point_tree()
+
+        selected_model = self.estimated_profile["selected_model"]
+        selected_summary = self.estimated_profile["selected_model_summary"]
+        crop_only_rmse = self.estimated_profile["models"]["crop_only"]["rmse"]
+        final_rmse = selected_summary.get("rmse")
+        if crop_only_rmse is None or final_rmse is None:
+            improvement_text = "Improvement unavailable"
+        else:
+            improvement_text = f"RMSE change: {crop_only_rmse - final_rmse:+.4f}px"
+        self.profile_summary_var.set(
+            f"Estimated model={selected_model}, RMSE={final_rmse:.4f}px. {improvement_text}"
+        )
+
+    def _open_large_click_view(self):
+        if self.large_click_window is not None and self.large_click_window.winfo_exists():
+            self.large_click_window.lift()
+            self.large_click_window.focus_force()
+            self._refresh_large_click_view()
+            return
+
+        self.large_click_window = tk.Toplevel(self.window)
+        self.large_click_window.title(f"Large Click View - {self.dataset_name} / {self.burn_set_name}")
+        self.large_click_window.geometry("2460x1380")
+        self.large_click_window.minsize(1600, 900)
+        self.large_click_window.protocol("WM_DELETE_WINDOW", self._close_large_click_view)
+
+        outer = ttk.Frame(self.large_click_window, padding=12)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.columnconfigure(1, weight=1)
+        outer.rowconfigure(1, weight=1)
+
+        ttk.Label(
+            outer,
+            text="Large Click View",
+            font=("Segoe UI", 13, "bold"),
+        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(
+            outer,
+            text=(
+                "Use this window for precise point picking. Click the source image first, then click the matching point "
+                "in the thermal image. The control-point list and model estimates stay synced with the developer calibration window."
+            ),
+            wraplength=1800,
+        ).grid(row=0, column=1, sticky="e")
+
+        left_frame = ttk.Frame(outer)
+        left_frame.grid(row=1, column=0, sticky="nsew", padx=(0, 8), pady=(10, 0))
+        left_frame.columnconfigure(0, weight=1)
+        left_frame.rowconfigure(1, weight=1)
+        ttk.Label(left_frame, text="Source Image", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.large_source_canvas = tk.Canvas(left_frame, background="#1f1f1f", highlightthickness=0)
+        self.large_source_canvas.grid(row=1, column=0, sticky="nsew")
+
+        right_frame = ttk.Frame(outer)
+        right_frame.grid(row=1, column=1, sticky="nsew", padx=(8, 0), pady=(10, 0))
+        right_frame.columnconfigure(0, weight=1)
+        right_frame.rowconfigure(1, weight=1)
+        ttk.Label(right_frame, text="Thermal Image", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.large_thermal_canvas = tk.Canvas(right_frame, background="#1f1f1f", highlightthickness=0)
+        self.large_thermal_canvas.grid(row=1, column=0, sticky="nsew")
+
+        self.large_source_canvas.bind("<Button-1>", lambda event: self._handle_source_click_for_state(event, self.large_source_state))
+        self.large_thermal_canvas.bind("<Button-1>", lambda event: self._handle_thermal_click_for_state(event, self.large_thermal_state))
+        self.large_source_canvas.bind("<Configure>", lambda event: self._refresh_large_click_view())
+        self.large_thermal_canvas.bind("<Configure>", lambda event: self._refresh_large_click_view())
+
+        self._refresh_large_click_view()
+
+    def _close_large_click_view(self):
+        if self.large_click_window is not None and self.large_click_window.winfo_exists():
+            self.large_click_window.destroy()
+        self.large_click_window = None
+        self.large_source_canvas = None
+        self.large_thermal_canvas = None
+        self.large_source_state = {}
+        self.large_thermal_state = {}
+
+    def _save_profile(self):
+        if self.estimated_profile is None:
+            self._estimate_models()
+            if self.estimated_profile is None:
+                return
+
+        self.estimated_profile["scope"] = self.scope_var.get()
+        profile_path = self.sorter.save_calibration_profile(self.estimated_profile)
+        self.current_profile = dict(self.estimated_profile)
+        self.current_profile["profile_path"] = profile_path
+        self.profile_path_var.set(f"Saved profile:\n{profile_path}")
+        messagebox.showinfo("Calibration Saved", f"Calibration profile saved:\n{profile_path}")
+
+    def _export_validation(self):
+        profile = self.estimated_profile or self.current_profile
+        export_root = Path(self.burn_set["source_root"])
+        if export_root.name.lower() == "images":
+            export_root = export_root.parent
+        debug_root = self.sorter.export_alignment_debug_samples(
+            str(export_root),
+            self.dataset_name,
+            self.burn_set_name,
+            self.pairs,
+            calibration_profile=profile,
+        )
+        if not debug_root:
+            messagebox.showinfo("No samples", "No validation samples were generated.")
+            return
+        messagebox.showinfo("Validation Exported", f"Validation samples exported to:\n{debug_root}")
+
+    def _remove_last_point(self):
+        if not self.control_points:
+            return
+        self.control_points.pop()
+        self.estimated_profile = None
+        self.pending_var.set("Removed the last control point.")
+        self._populate_point_tree()
+        self._refresh_canvases()
+
+    def _clear_points(self):
+        self.control_points = []
+        self.pending_source = None
+        self.pending_target = None
+        self.estimated_profile = None
+        self.pending_var.set("All control points cleared.")
+        self._populate_point_tree()
+        self._refresh_canvases()
+
+    def _show_previous_pair(self):
+        if not self.pairs:
+            return
+        self.current_pair_index = (self.current_pair_index - 1) % len(self.pairs)
+        self._load_pair()
+
+    def _show_next_pair(self):
+        if not self.pairs:
+            return
+        self.current_pair_index = (self.current_pair_index + 1) % len(self.pairs)
+        self._load_pair()
+
+    def _populate_model_tree(self, profile):
+        self.model_tree.delete(*self.model_tree.get_children())
+        if profile is None:
+            return
+
+        selected_model = profile.get("selected_model", "")
+        for model_name in self.sorter.CALIBRATION_MODEL_ORDER:
+            model = profile["models"].get(model_name)
+            if model is None:
+                continue
+            rmse = "" if model.get("rmse") is None else f"{model['rmse']:.4f}"
+            mean_error = "" if model.get("mean_error") is None else f"{model['mean_error']:.4f}"
+            max_error = "" if model.get("max_error") is None else f"{model['max_error']:.4f}"
+            self.model_tree.insert(
+                "",
+                "end",
+                values=(
+                    model_name,
+                    rmse,
+                    mean_error,
+                    max_error,
+                    model.get("point_count", 0),
+                    "yes" if model_name == selected_model else "",
+                ),
+            )
+
+    def _populate_point_tree(self):
+        self.point_tree.delete(*self.point_tree.get_children())
+        error_lookup = {}
+        if self.estimated_profile is not None:
+            selected_model = self.estimated_profile["selected_model"]
+            model = self.estimated_profile["models"].get(selected_model, {})
+            error_lookup = {
+                item["point_id"]: item["error"]
+                for item in model.get("per_point_error", [])
+            }
+
+        for point in self.control_points:
+            error_text = ""
+            if point["point_id"] in error_lookup:
+                error_text = f"{error_lookup[point['point_id']]:.4f}"
+            self.point_tree.insert(
+                "",
+                "end",
+                values=(
+                    point["point_id"],
+                    point["pair_label"],
+                    f"({point['source'][0]:.1f}, {point['source'][1]:.1f})",
+                    f"({point['target'][0]:.1f}, {point['target'][1]:.1f})",
+                    error_text,
+                ),
+            )
+
+
 class PairPreviewWindow:
     def __init__(self, parent, sorter_module, burn_set, initial_index=0):
         self.sorter = sorter_module
@@ -141,10 +1337,24 @@ class PairPreviewWindow:
         actions.grid(row=4, column=0, columnspan=2, sticky="ew", pady=(10, 10))
         actions.columnconfigure(0, weight=1)
         actions.columnconfigure(1, weight=1)
+        actions.columnconfigure(2, weight=1)
+        actions.columnconfigure(3, weight=1)
         self.open_raw_button = ttk.Button(actions, text="Open Matching Raw RGB", command=self._open_matching_raw_rgb)
         self.open_raw_button.grid(row=0, column=0, sticky="ew", padx=(0, 8))
         self.open_output_button = ttk.Button(actions, text="Open Output Folder", command=self._open_output_folder)
-        self.open_output_button.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        self.open_output_button.grid(row=0, column=1, sticky="ew", padx=8)
+        self.alignment_tool_button = ttk.Button(
+            actions,
+            text="Validate Alignment Overlay",
+            command=self._open_alignment_validation,
+        )
+        self.alignment_tool_button.grid(row=0, column=2, sticky="ew", padx=8)
+        self.calibration_tool_button = ttk.Button(
+            actions,
+            text="Developer Calibration",
+            command=self._open_calibration_tool,
+        )
+        self.calibration_tool_button.grid(row=0, column=3, sticky="ew", padx=(8, 0))
 
         ttk.Label(preview_area, text="Raw RGB with Crop Outline", font=("Segoe UI", 10, "bold")).grid(row=6, column=0, sticky="w")
         ttk.Label(preview_area, text="Raw vs Corrected FOV", font=("Segoe UI", 10, "bold")).grid(row=6, column=1, sticky="w")
@@ -248,13 +1458,17 @@ class PairPreviewWindow:
         pair_index = self.filtered_indices[self.current_filtered_pos]
         pair = self.all_pairs[pair_index]
         self.current_pair = pair
+        self.current_dataset_name = pair.get("dataset_name", self.burn_set.get("dataset_name"))
+        self.current_burn_set_name = pair.get("burn_set_name", self.burn_set.get("name"))
+        self.current_detected_camera = pair.get("detected_camera", self.burn_set.get("detected_camera"))
 
-        corrected = self._load_preview_image(pair["rgb"]["filepath"], mode="rgb_corrected")
         thermal_source = (
             pair["thermal_jpg"]["filepath"]
             if pair["thermal_jpg"] is not None
             else pair["cal_tiff"]["filepath"] if pair["cal_tiff"] is not None else pair["thermal_tiff"]["filepath"]
         )
+        self.current_thermal_source = thermal_source
+        corrected = self._load_preview_image(pair["rgb"]["filepath"], mode="rgb_corrected")
         thermal = self._load_preview_image(thermal_source, mode="thermal")
         raw_overlay = self._build_raw_overlay_image(pair["rgb"]["filepath"])
         compare_image = self._build_compare_image(pair["rgb"]["filepath"])
@@ -286,7 +1500,13 @@ class PairPreviewWindow:
     def _load_preview_image(self, path, mode="rgb"):
         img = Image.open(path)
         if mode == "rgb_corrected":
-            corrected = self.sorter._apply_rgb_fov_correction(path)
+            corrected = self.sorter._apply_rgb_fov_correction(
+                path,
+                getattr(self, "current_thermal_source", None),
+                dataset_name=getattr(self, "current_dataset_name", None),
+                burn_set_name=getattr(self, "current_burn_set_name", None),
+                camera_used=getattr(self, "current_detected_camera", None),
+            )
             if corrected.mode not in ("RGB", "RGBA"):
                 corrected = corrected.convert("RGB")
             img.close()
@@ -298,37 +1518,50 @@ class PairPreviewWindow:
             img = img.convert("RGB")
         return img
 
-    def _get_crop_box(self, raw_image):
-        if self.sorter.CAMERA_USED == "M30T":
-            return (
-                640 + 40 - 60,
-                412 + 30 + 12,
-                4000 - 640 - 40 - 40 - 40 - 16 - 16 + 40,
-                3000 - 412 - 30 - 30 - 30 - 12,
-            )
-        if self.sorter.CAMERA_USED == "M2EA":
-            return (1280 + 80, 824, 8000 - 1280 + 80, 6000 - 824)
-        return (0, 0, raw_image.width, raw_image.height)
+    def _get_crop_box(self, raw_path):
+        raw = self._load_preview_image(raw_path, mode="rgb")
+        crop_box = self.sorter._get_aligned_crop_box(
+            raw_path,
+            getattr(self, "current_thermal_source", None),
+            dataset_name=getattr(self, "current_dataset_name", None),
+            burn_set_name=getattr(self, "current_burn_set_name", None),
+            camera_used=getattr(self, "current_detected_camera", None),
+        )
+        return raw, crop_box
 
     def _build_raw_overlay_image(self, raw_path):
-        raw = self._load_preview_image(raw_path, mode="rgb")
+        raw, crop_box = self._get_crop_box(raw_path)
         overlay = raw.copy()
         draw = ImageDraw.Draw(overlay)
-        crop_box = self._get_crop_box(raw)
-        draw.rectangle(crop_box, outline=(255, 80, 80), width=max(4, raw.width // 400))
+        dash = max(10, raw.width // 120)
+        gap = max(6, dash // 2)
+        x1, y1, x2, y2 = crop_box
+
+        x = x1
+        while x < x2:
+            draw.line((x, y1, min(x + dash, x2), y1), fill=(0, 0, 0), width=max(3, raw.width // 600))
+            draw.line((x, y2, min(x + dash, x2), y2), fill=(0, 0, 0), width=max(3, raw.width // 600))
+            x += dash + gap
+        y = y1
+        while y < y2:
+            draw.line((x1, y, x1, min(y + dash, y2)), fill=(0, 0, 0), width=max(3, raw.width // 600))
+            draw.line((x2, y, x2, min(y + dash, y2)), fill=(0, 0, 0), width=max(3, raw.width // 600))
+            y += dash + gap
         return overlay
 
     def _build_compare_image(self, raw_path):
         raw = self._load_preview_image(raw_path, mode="rgb")
         corrected = self._load_preview_image(raw_path, mode="rgb_corrected")
-        canvas_width = max(raw.width, corrected.width)
-        canvas_height = raw.height + corrected.height
-        combined = Image.new("RGB", (canvas_width, canvas_height), color=(18, 18, 18))
-        combined.paste(raw, (0, 0))
-        combined.paste(corrected, (0, raw.height))
+        pad = 24
+        label_h = 40
+        canvas_width = raw.width + corrected.width + pad * 3
+        canvas_height = max(raw.height, corrected.height) + pad * 2 + label_h
+        combined = Image.new("RGB", (canvas_width, canvas_height), color=(245, 245, 245))
+        combined.paste(raw, (pad, pad + label_h))
+        combined.paste(corrected, (raw.width + pad * 2, pad + label_h))
         draw = ImageDraw.Draw(combined)
-        draw.text((16, 16), "Raw RGB", fill=(255, 255, 255))
-        draw.text((16, raw.height + 16), "Corrected FOV", fill=(255, 255, 255))
+        draw.text((pad, 10), "Raw RGB", fill=(0, 0, 0))
+        draw.text((raw.width + pad * 2, 10), "Corrected FOV", fill=(0, 0, 0))
         return combined
 
     def _open_matching_raw_rgb(self):
@@ -338,6 +1571,17 @@ class PairPreviewWindow:
 
     def _open_output_folder(self):
         self._open_path(self.burn_set["source_root"])
+
+    def _open_alignment_validation(self):
+        if not hasattr(self, "current_pair"):
+            return
+        AlignmentValidationWindow(self.window, self.sorter, self.current_pair)
+
+    def _open_calibration_tool(self):
+        if not hasattr(self, "current_pair"):
+            return
+        pair_index = self.filtered_indices[self.current_filtered_pos]
+        CalibrationProfileWindow(self.window, self.sorter, self.burn_set, initial_index=pair_index)
 
     def _open_path(self, path):
         try:
@@ -359,8 +1603,8 @@ class RawSortingGui:
 
         self.input_var = tk.StringVar(value=str(SCRIPT_DIR / "Input Folder"))
         self.output_var = tk.StringVar(value=str(SCRIPT_DIR / "Output Folder"))
-        self.mode_var = tk.StringVar(value="PRESORTED_STANDARD")
-        self.camera_var = tk.StringVar(value="M30T")
+        self.mode_var = tk.StringVar(value="AUTO")
+        self.camera_var = tk.StringVar(value="Detected automatically per dataset")
         self.status_var = tk.StringVar(
             value="Set folders, then run the sort. After a successful run, Check Results becomes available."
         )
@@ -396,6 +1640,7 @@ class RawSortingGui:
             header,
             text=(
                 "Run the sort to build the FLAME labeling-tool folder structure. "
+                "The tool auto-detects the workflow, then writes the standard FLAME output. "
                 "After sorting finishes, use Check Results to inspect detected burn sets, pair counts, and image matches."
             ),
             wraplength=1280,
@@ -414,24 +1659,14 @@ class RawSortingGui:
         ttk.Entry(controls, textvariable=self.output_var).grid(row=0, column=6, sticky="ew", padx=(8, 8))
         ttk.Button(controls, text="Browse", command=self._browse_output).grid(row=0, column=7, sticky="ew")
 
-        ttk.Label(controls, text="Mode").grid(row=1, column=0, sticky="w", pady=(10, 0))
-        mode_combo = ttk.Combobox(
-            controls,
-            textvariable=self.mode_var,
-            values=["PRESORTED_STANDARD", "DJI_RAW"],
-            state="readonly",
-            width=22,
-        )
-        mode_combo.grid(row=1, column=1, sticky="w", padx=(8, 8), pady=(10, 0))
-        mode_combo.bind("<<ComboboxSelected>>", self._handle_mode_change)
+        ttk.Label(controls, text="Workflow").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(controls, text="Auto-detect from Input Folder").grid(row=1, column=1, sticky="w", padx=(8, 8), pady=(10, 0))
 
         ttk.Label(controls, text="Camera").grid(row=1, column=2, sticky="w", pady=(10, 0))
-        ttk.Combobox(
+        ttk.Label(
             controls,
             textvariable=self.camera_var,
-            values=["M30T", "M2EA"],
-            state="readonly",
-            width=10,
+            wraplength=180,
         ).grid(row=1, column=3, sticky="w", pady=(10, 0))
 
         self.check_results_button = ttk.Button(
@@ -542,12 +1777,9 @@ class RawSortingGui:
             self._sync_existing_results_state()
 
     def _handle_mode_change(self, event=None):
-        presorted = self.mode_var.get() == "PRESORTED_STANDARD"
         self._sync_existing_results_state()
         self.status_var.set(
-            "PRESORTED_STANDARD mode supports Check Results and clickable pair previews after sorting."
-            if presorted
-            else "DJI_RAW mode is ready to run. Check Results is currently only available for PRESORTED_STANDARD."
+            "Auto-detect is enabled. Run Sort will inspect the input folder, detect the camera per dataset, and choose the appropriate workflow."
         )
 
     def _dataset_output_root(self, dataset_name):
@@ -560,86 +1792,124 @@ class RawSortingGui:
 
         analysis = []
         for dataset_dir in sorted([p for p in output_root.iterdir() if p.is_dir()]):
-            images_root = dataset_dir / "Images"
-            rgb_corrected = images_root / "RGB" / "Corrected FOV"
-            rgb_raw = images_root / "RGB" / "Raw"
-            thermal_jpg = images_root / "Thermal" / "JPG"
-            thermal_tiff = images_root / "Thermal" / "Celsius TIFF"
+            burn_set_roots = []
+            direct_images_root = dataset_dir / "Images"
+            if direct_images_root.exists():
+                burn_set_roots.append(("sorted_output", direct_images_root))
+            else:
+                for child_dir in sorted([p for p in dataset_dir.iterdir() if p.is_dir()]):
+                    child_images_root = child_dir / "Images"
+                    if child_images_root.exists():
+                        burn_set_roots.append((child_dir.name, child_images_root))
 
-            if not (rgb_corrected.exists() and rgb_raw.exists() and thermal_jpg.exists() and thermal_tiff.exists()):
+            if not burn_set_roots:
                 continue
 
-            rgb_files = sorted([p for p in rgb_corrected.iterdir() if p.is_file()])
-            thermal_jpg_files = sorted([p for p in thermal_jpg.iterdir() if p.is_file()])
-            thermal_tiff_files = sorted([p for p in thermal_tiff.iterdir() if p.is_file()])
-            if not rgb_files:
-                continue
+            dataset_entry = {"name": dataset_dir.name, "root": str(dataset_dir), "burn_sets": []}
+            for burn_set_name, images_root in burn_set_roots:
+                rgb_corrected = images_root / "RGB" / "Corrected FOV"
+                rgb_raw = images_root / "RGB" / "Raw"
+                thermal_jpg = images_root / "Thermal" / "JPG"
+                thermal_tiff = images_root / "Thermal" / "Celsius TIFF"
 
-            pairs = []
-            for rgb_path in rgb_files:
-                stem = rgb_path.stem
-                jpg_match = thermal_jpg / f"{stem}.JPG"
-                if not jpg_match.exists():
-                    jpg_match = thermal_jpg / f"{stem}.jpg"
-                tiff_match = thermal_tiff / f"{stem}.TIFF"
-                if not tiff_match.exists():
-                    tiff_match = thermal_tiff / f"{stem}.tiff"
-                raw_match = rgb_raw / rgb_path.name
-
-                if not tiff_match.exists():
+                if not (rgb_corrected.exists() and rgb_raw.exists() and thermal_tiff.exists()):
                     continue
 
-                rgb_record = {
-                    "filename": rgb_path.name,
-                    "filepath": str(raw_match if raw_match.exists() else rgb_path),
-                    "datetime": sorter._extract_capture_datetime(str(raw_match if raw_match.exists() else rgb_path)),
-                }
-                pairs.append(
+                rgb_files = sorted([p for p in rgb_corrected.iterdir() if p.is_file() and p.name != ".gitkeep"])
+                thermal_jpg_files = sorted([p for p in thermal_jpg.iterdir() if p.is_file() and p.name != ".gitkeep"]) if thermal_jpg.exists() else []
+                thermal_tiff_files = sorted([p for p in thermal_tiff.iterdir() if p.is_file() and p.name != ".gitkeep"])
+                if not rgb_files:
+                    continue
+
+                pairs = []
+                for rgb_path in rgb_files:
+                    stem = rgb_path.stem
+                    jpg_match = thermal_jpg / f"{stem}.JPG"
+                    if not jpg_match.exists():
+                        jpg_match = thermal_jpg / f"{stem}.jpg"
+                    tiff_match = thermal_tiff / f"{stem}.TIFF"
+                    if not tiff_match.exists():
+                        tiff_match = thermal_tiff / f"{stem}.tiff"
+                    raw_match = rgb_raw / rgb_path.name
+
+                    if not tiff_match.exists():
+                        continue
+
+                    rgb_source_path = raw_match if raw_match.exists() else rgb_path
+                    pairs.append(
+                        {
+                            "dataset_name": dataset_dir.name,
+                            "burn_set_name": burn_set_name,
+                            "rgb": {
+                                "filename": rgb_path.name,
+                                "filepath": str(rgb_source_path),
+                                "datetime": sorter._extract_capture_datetime(str(rgb_source_path)),
+                            },
+                            "thermal_jpg": {
+                                "filename": jpg_match.name,
+                                "filepath": str(jpg_match),
+                                "datetime": sorter._extract_capture_datetime(str(jpg_match)),
+                            } if jpg_match.exists() else None,
+                            "thermal_tiff": {
+                                "filename": tiff_match.name,
+                                "filepath": str(tiff_match),
+                                "datetime": sorter._extract_capture_datetime(str(tiff_match)),
+                            },
+                            "cal_tiff": None,
+                            "match_types": {
+                                "thermal_jpg": "output",
+                                "thermal_tiff": "output",
+                                "cal_tiff": "output",
+                            },
+                        }
+                    )
+
+                rgb_records = [
+                    {"filepath": pair["rgb"]["filepath"], "image_size": None}
+                    for pair in pairs
+                ]
+                camera_detection = sorter.detect_camera_from_rgb_records(rgb_records)
+                profile = sorter.load_calibration_profile(
+                    camera_used=camera_detection["camera"],
+                    dataset_name=dataset_dir.name,
+                    burn_set_name=burn_set_name,
+                )
+                for pair in pairs:
+                    pair["detected_camera"] = camera_detection["camera"]
+                    pair["camera_detection_reason"] = camera_detection["reason"]
+                    pair["camera_image_size"] = camera_detection.get("image_size")
+                dataset_entry["burn_sets"].append(
                     {
-                        "rgb": rgb_record,
-                        "thermal_jpg": {
-                            "filename": jpg_match.name,
-                            "filepath": str(jpg_match),
-                            "datetime": sorter._extract_capture_datetime(str(jpg_match)),
-                        } if jpg_match.exists() else None,
-                        "thermal_tiff": {
-                            "filename": tiff_match.name,
-                            "filepath": str(tiff_match),
-                            "datetime": sorter._extract_capture_datetime(str(tiff_match)),
-                        },
-                        "cal_tiff": None,
-                        "match_types": {
-                            "thermal_jpg": "output",
-                            "thermal_tiff": "output",
-                            "cal_tiff": "output",
-                        },
+                        "name": burn_set_name,
+                        "dataset_name": dataset_dir.name,
+                        "source_root": str(images_root),
+                        "layout": "sorted_output",
+                        "rgb_count": len(rgb_files),
+                        "thermal_jpg_count": len(thermal_jpg_files),
+                        "thermal_tiff_count": len(thermal_tiff_files),
+                        "cal_tiff_count": 0,
+                        "pair_count": len(pairs),
+                        "detected_camera": camera_detection["camera"],
+                        "camera_dimension_summary": camera_detection.get("dimension_summary", ""),
+                        "camera_detection_reason": camera_detection["reason"],
+                        "correction_model": profile["selected_model"] if profile else "crop_only",
+                        "correction_rmse": (
+                            profile.get("selected_model_summary", {}).get("rmse")
+                            if profile is not None
+                            else None
+                        ),
+                        "calibration_profile_path": profile.get("profile_path", "") if profile else "",
+                        "pairs": pairs,
                     }
                 )
 
-            analysis.append(
-                {
-                    "name": dataset_dir.name,
-                    "root": str(dataset_dir),
-                    "burn_sets": [
-                        {
-                            "name": "sorted_output",
-                            "source_root": str(images_root),
-                            "layout": "sorted_output",
-                            "rgb_count": len(rgb_files),
-                            "thermal_jpg_count": len(thermal_jpg_files),
-                            "thermal_tiff_count": len(thermal_tiff_files),
-                            "cal_tiff_count": 0,
-                            "pair_count": len(pairs),
-                            "pairs": pairs,
-                        }
-                    ],
-                }
-            )
+            if dataset_entry["burn_sets"]:
+                analysis.append(dataset_entry)
 
         return analysis
 
     def _sync_existing_results_state(self):
-        existing_results = self._scan_existing_output_results() if self.mode_var.get() == "PRESORTED_STANDARD" else []
+        existing_results = self._scan_existing_output_results()
         self.results_ready = bool(existing_results)
         self.check_results_button.configure(state="normal" if self.results_ready else "disabled")
 
@@ -680,8 +1950,7 @@ class RawSortingGui:
                     self.progress_label_var.set(payload["message"])
                 elif kind == "results_ready":
                     self.results_ready = True
-                    if self.mode_var.get() == "PRESORTED_STANDARD":
-                        self.check_results_button.configure(state="normal")
+                    self.check_results_button.configure(state="normal")
                 elif kind == "error":
                     self.status_var.set("Error encountered. See log below.")
                     self._append_log(payload + "\n")
@@ -694,13 +1963,10 @@ class RawSortingGui:
         threading.Thread(target=target, daemon=True).start()
 
     def _check_results(self):
-        if self.mode_var.get() != "PRESORTED_STANDARD":
-            messagebox.showinfo("Unavailable", "Check Results is only available for PRESORTED_STANDARD mode.")
-            return
         if not self.results_ready:
-            messagebox.showinfo("Not ready", "Run Sort successfully first, then Check Results will become available.")
-            return
-        self.status_var.set("Checking results and loading detected matches...")
+            self.status_var.set("Checking results from the current output folder...")
+        else:
+            self.status_var.set("Checking results and loading detected matches...")
 
         def worker():
             try:
@@ -739,13 +2005,18 @@ class RawSortingGui:
             if not should_replace:
                 return
 
+            gitkeep_path = output_path / ".gitkeep"
+            gitkeep_exists = gitkeep_path.exists()
             for child in output_path.iterdir():
+                if child.name == ".gitkeep":
+                    continue
                 if child.is_dir():
                     shutil.rmtree(child)
                 else:
                     child.unlink()
+            if gitkeep_exists and not gitkeep_path.exists():
+                gitkeep_path.write_text("", encoding="utf-8")
 
-        sorter.CAMERA_USED = self.camera_var.get()
         sorter.PROCESSING_MODE = self.mode_var.get()
         self._reset_results_state()
         self.status_var.set("Running sort...")
@@ -757,20 +2028,15 @@ class RawSortingGui:
             writer = QueueWriter(self.output_queue)
             try:
                 with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                    if sorter.PROCESSING_MODE == "PRESORTED_STANDARD":
-                        def progress_callback(payload):
-                            self.output_queue.put(("progress", payload))
+                    def progress_callback(payload):
+                        self.output_queue.put(("progress", payload))
 
-                        sorter.process_presorted_standard(
-                            input_folder=input_folder,
-                            output_folder=output_folder,
-                            dry_run_only=False,
-                            progress_callback=progress_callback,
-                        )
-                    else:
-                        sorter.INPUT_FOLDER = os.path.abspath(input_folder)
-                        sorter.OUTPUT_FOLDER = os.path.abspath(output_folder)
-                        sorter.raw_file_sorting()
+                    sorter.run_sort_pipeline(
+                        input_folder=input_folder,
+                        output_folder=output_folder,
+                        processing_mode=self.mode_var.get(),
+                        progress_callback=progress_callback,
+                    )
             except SystemExit as exc:
                 if exc.code not in (0, None):
                     self.output_queue.put(("error", f"Sorter exited with code {exc.code}."))
@@ -850,7 +2116,12 @@ class RawSortingGui:
             f"{self.selected_burn_set['pair_count']} matched pairs, "
             f"{self.selected_burn_set['rgb_count']} RGB, "
             f"{self.selected_burn_set['thermal_jpg_count']} thermal JPG, "
-            f"{self.selected_burn_set['thermal_tiff_count']} thermal TIFF."
+            f"{self.selected_burn_set['thermal_tiff_count']} thermal TIFF, "
+            f"camera={self.selected_burn_set.get('detected_camera', 'unknown')}, "
+            f"correction model={self.selected_burn_set.get('correction_model', 'crop_only')}."
+        )
+        self.camera_var.set(
+            f"Detected in results: {self.selected_burn_set.get('detected_camera', 'unknown')}"
         )
 
         children = self.pair_tree.get_children()

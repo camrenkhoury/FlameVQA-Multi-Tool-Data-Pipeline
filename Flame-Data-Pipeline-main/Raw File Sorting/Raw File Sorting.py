@@ -16,15 +16,39 @@
 #### WARNING:       This program has a known memory leak. As a result, it is not recommended to process >3000 image pairs at a time.
 ####                Largest working batch: 3000 image pairs - 40,000 MiB peak RAM usage (as reported by task manager) - 2 hour runtime
 
+# import required dependencies
+import csv
+import datetime
+import gc
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+import time
+
+import numpy as np
+from PIL import Image, ImageDraw, ImageOps
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+
 # specify the input and output folder filenames
 INPUT_FOLDER = "./Input Folder/"
 OUTPUT_FOLDER = "./Output Folder/"
 # Current valid options:
+# - "AUTO": inspect the input folder and choose the appropriate workflow
 # - "DJI_RAW": original workflow for M30T/M2EA RJPG inputs
 # - "PRESORTED_STANDARD": existing RGB JPG + thermal JPG/TIFF/Cal TIFF folders
-PROCESSING_MODE = "DJI_RAW"
+PROCESSING_MODE = "AUTO"
 # Current valid options: "M2EA", "M30T"
-CAMERA_USED = 'M30T'
+CAMERA_USED = "M30T"
 # Boolean that controls whether files will be renamed or not when placed in output folder
 RENAME_FILES = True
 OUTPUT_FILENAME_DIGITS = 5
@@ -37,66 +61,95 @@ PRESORTED_RGB_DIRNAME = "raw_rgb_jpg"
 PRESORTED_THERMAL_JPG_DIRNAME = "raw_thermal_jpg"
 PRESORTED_THERMAL_TIFF_DIRNAME = "raw_thermal_tiff"
 PRESORTED_CAL_TIFF_DIRNAME = "calibrated_thermal_tiff"
-PRESORTED_METADATA_FILENAME = "pairs.csv"
+PRESORTED_PAIRING_LOG_FILENAME = "pairing_log.csv"
+PRESORTED_PAIRING_REVIEW_FILENAME = "pairing_review.csv"
 PAIR_TIME_TOLERANCE_SECONDS = 3.0
 DRY_RUN_ONLY = False
-ALLOW_INDEX_FALLBACK_WHEN_TIMESTAMP_FAILS = True
+HIGH_CONFIDENCE_THRESHOLD = 80.0
+MEDIUM_CONFIDENCE_THRESHOLD = 55.0
 
+CORRECTED_FOV_OUTPUT_SIZE = (640, 512)
+CORRECTION_VALIDATION_SAMPLE_COUNT = 5
+CORRECTION_VALIDATION_DIRNAME = "correction_validation"
+CALIBRATION_PROFILES_DIRNAME = "Calibration Profiles"
+CALIBRATION_PROFILE_VERSION = 1
+CALIBRATION_MODEL_SELECTION_ABSOLUTE_TOLERANCE_PX = 1.5
+CALIBRATION_MODEL_SELECTION_RELATIVE_TOLERANCE = 1.10
+CALIBRATION_ACCEPTABLE_RMSE_PX = 6.0
+CALIBRATION_MIN_POINTS = {
+    "crop_only": 1,
+    "translation": 1,
+    "scale_translate": 2,
+    "affine": 3,
+    "homography": 4,
+}
+CALIBRATION_MODEL_ORDER = [
+    "crop_only",
+    "translation",
+    "scale_translate",
+    "affine",
+    "homography",
+]
+CALIBRATION_MODELS_WITH_MATRIX = {"translation", "scale_translate", "affine", "homography"}
 
-def _prompt_yes_no(prompt_text, default=False):
-    suffix = " [Y/n]: " if default else " [y/N]: "
-    response = input(prompt_text + suffix).strip().lower()
-    if response == "":
-        return default
-    return response in {"y", "yes"}
+# Fixed baseline crop. This is only the approximate thermal FOV region.
+# Any additional alignment is applied later through a saved geometric calibration profile.
+CAMERA_BASELINE_CROP_BOXES = {
+    "M30T": {
+        "crop_left": 620,
+        "crop_top": 454,
+        "crop_right": 3248,
+        "crop_bottom": 2486,
+    },
+    "M2EA": {
+        "crop_left": 1360,
+        "crop_top": 824,
+        "crop_right": 6800,
+        "crop_bottom": 5176,
+    },
+}
+
+CAMERA_RESOLUTION_HINTS = {
+    "M30T": {
+        "target": (4000, 3000),
+        "width_range": (3600, 4400),
+        "height_range": (2600, 3400),
+    },
+    "M2EA": {
+        "target": (8000, 6000),
+        "width_range": (7200, 8400),
+        "height_range": (5200, 6400),
+    },
+}
+
+CAMERA_EXIF_HINTS = {
+    "M30T": ["M30T", "MATRICE 30T", "MATRICE30T", "M30 THERMAL"],
+    "M2EA": ["M2EA", "MAVIC 2 ENTERPRISE ADVANCED", "MAVIC2 ENTERPRISE ADVANCED"],
+}
+
+# The thermal hot-mask centroid heuristic is retained only as an explicit experiment.
+# It is not geometric registration and must not be treated as the default alignment path.
+EXPERIMENTAL_THERMAL_SHIFT_ENABLED = False
+EXPORT_ALIGNMENT_DEBUG_SAMPLES = False
+ALIGNMENT_DEBUG_SAMPLE_COUNT = 5
+ALIGNMENT_DEBUG_DIRNAME = "alignment_debug"
 
 
 def configure_runtime():
     global INPUT_FOLDER
     global OUTPUT_FOLDER
     global PROCESSING_MODE
-    global DRY_RUN_ONLY
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    default_input = os.path.abspath(os.path.join(script_dir, INPUT_FOLDER))
-    default_output = os.path.abspath(os.path.join(script_dir, OUTPUT_FOLDER))
+    INPUT_FOLDER = str((SCRIPT_DIR / INPUT_FOLDER).resolve())
+    OUTPUT_FOLDER = str((SCRIPT_DIR / OUTPUT_FOLDER).resolve())
+    if PROCESSING_MODE not in {"AUTO", "DJI_RAW", "PRESORTED_STANDARD"}:
+        PROCESSING_MODE = "AUTO"
 
     print("Runtime configuration")
-    print(f"Script directory: {script_dir}")
-    print("Select processing mode:")
-    print("  1. DJI_RAW")
-    print("  2. PRESORTED_STANDARD")
-
-    mode_choice = input("Enter 1 or 2 [default: 1]: ").strip()
-    if mode_choice == "2":
-        PROCESSING_MODE = "PRESORTED_STANDARD"
-    else:
-        PROCESSING_MODE = "DJI_RAW"
-
-    INPUT_FOLDER = default_input
-    OUTPUT_FOLDER = default_output
-
-    if PROCESSING_MODE == "PRESORTED_STANDARD":
-        DRY_RUN_ONLY = _prompt_yes_no("Run as dry-run only?", default=True)
-    else:
-        DRY_RUN_ONLY = False
-
-    print(f"Selected mode: {PROCESSING_MODE}")
+    print(f"Script directory: {SCRIPT_DIR}")
     print(f"Input folder: {INPUT_FOLDER}")
     print(f"Output folder: {OUTPUT_FOLDER}")
-    if PROCESSING_MODE == "PRESORTED_STANDARD":
-        print(f"Dry run only: {DRY_RUN_ONLY}")
-
-# import required dependencies
-import os
-import sys
-from PIL import Image
-import datetime
-import shutil
-import time
-import gc
-import csv
-import json
+    print(f"Processing mode: {PROCESSING_MODE}")
 
 try:
     import exif as EXIF
@@ -166,14 +219,8 @@ def _extract_capture_datetime(filepath):
 
 def _numeric_suffix(filename):
     stem = os.path.splitext(os.path.basename(filename))[0]
-    digits = ""
-    for char in reversed(stem):
-        if char.isdigit():
-            digits = char + digits
-        else:
-            break
-
-    return int(digits) if digits else None
+    match = re.search(r"(\d+)(?=[^0-9]*$)", stem)
+    return int(match.group(1)) if match else None
 
 
 def _copy_if_exists(src, dst):
@@ -181,19 +228,936 @@ def _copy_if_exists(src, dst):
         shutil.copy(src, dst)
 
 
-def _apply_rgb_fov_correction(rgb_source_path):
-    rgb_img = Image.open(rgb_source_path)
+def _ensure_gitkeep(directory):
+    if os.path.isdir(directory):
+        gitkeep_path = os.path.join(directory, ".gitkeep")
+        if not os.path.exists(gitkeep_path):
+            with open(gitkeep_path, "w", encoding="utf-8"):
+                pass
 
-    if CAMERA_USED == "M30T":
-        rgb_img = rgb_img.crop(
-            (640 + 40 - 60, 412 + 30 + 12, 4000 - 640 - 40 - 40 - 40 - 16 - 16 + 40, 3000 - 412 - 30 - 30 - 30 - 12)
+
+def _meaningful_directory_entries(directory):
+    if not os.path.isdir(directory):
+        return []
+    return [entry for entry in os.listdir(directory) if entry != ".gitkeep"]
+
+
+def _calibration_profiles_root():
+    profiles_root = SCRIPT_DIR / CALIBRATION_PROFILES_DIRNAME
+    profiles_root.mkdir(parents=True, exist_ok=True)
+    return profiles_root
+
+
+def _sanitize_identifier(text):
+    if text is None:
+        return ""
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(text)).strip("._-")
+    return cleaned or "default"
+
+
+def _camera_used(camera_used=None):
+    return camera_used or CAMERA_USED
+
+
+def _get_output_size():
+    return tuple(int(value) for value in CORRECTED_FOV_OUTPUT_SIZE)
+
+
+def _get_baseline_crop_parameters(camera_used=None):
+    camera_name = _camera_used(camera_used)
+    parameters = CAMERA_BASELINE_CROP_BOXES.get(camera_name)
+    if parameters is None:
+        raise ValueError(f"Unsupported camera profile: {camera_name}")
+    return dict(parameters)
+
+
+def _scale_crop_box(crop_box, from_size, to_size):
+    if from_size == to_size:
+        return tuple(int(value) for value in crop_box)
+
+    from_width, from_height = from_size
+    to_width, to_height = to_size
+    scale_x = to_width / float(from_width)
+    scale_y = to_height / float(from_height)
+    return (
+        int(round(crop_box[0] * scale_x)),
+        int(round(crop_box[1] * scale_y)),
+        int(round(crop_box[2] * scale_x)),
+        int(round(crop_box[3] * scale_y)),
+    )
+
+
+def _get_base_crop_box(image_size, camera_used=None, calibration_profile=None):
+    width, height = image_size
+    if calibration_profile and calibration_profile.get("baseline_crop_box"):
+        profile_crop_box = tuple(
+            int(calibration_profile["baseline_crop_box"][key])
+            for key in ("left", "top", "right", "bottom")
         )
-        rgb_img = rgb_img.resize((640, 512))
-    elif CAMERA_USED == "M2EA":
-        rgb_img = rgb_img.crop((1280 + 80, 824, 8000 - 1280 + 80, 6000 - 824))
-        rgb_img = rgb_img.resize((640, 512))
+        profile_source_size = tuple(
+            int(value) for value in calibration_profile.get("source_rgb_size", image_size)
+        )
+        scaled_profile_crop_box = _scale_crop_box(profile_crop_box, profile_source_size, image_size)
+        return _clamp_crop_box(*scaled_profile_crop_box, width, height)
 
-    return rgb_img
+    parameters = _get_baseline_crop_parameters(camera_used=camera_used)
+    return _clamp_crop_box(
+        parameters["crop_left"],
+        parameters["crop_top"],
+        parameters["crop_right"],
+        parameters["crop_bottom"],
+        width,
+        height,
+    )
+
+
+def _clamp_crop_box(left, top, right, bottom, width, height):
+    if left < 0:
+        right -= left
+        left = 0
+    if top < 0:
+        bottom -= top
+        top = 0
+    if right > width:
+        left -= (right - width)
+        right = width
+    if bottom > height:
+        top -= (bottom - height)
+        bottom = height
+
+    left = max(0, left)
+    top = max(0, top)
+    right = min(width, right)
+    bottom = min(height, bottom)
+    return (int(left), int(top), int(right), int(bottom))
+
+
+def _estimate_thermal_alignment_shift(thermal_source_path, crop_width, crop_height):
+    if not thermal_source_path or not os.path.exists(thermal_source_path):
+        return (0, 0)
+
+    try:
+        thermal_img = Image.open(thermal_source_path)
+        arr = np.array(thermal_img)
+        thermal_img.close()
+    except Exception:
+        return (0, 0)
+
+    if arr.ndim == 3:
+        arr = arr.mean(axis=2)
+    arr = arr.astype("float32")
+    if arr.size == 0:
+        return (0, 0)
+
+    # Estimate the active thermal region from the hottest pixels.
+    threshold = np.percentile(arr, 95.0)
+    hot_mask = arr >= threshold
+    if hot_mask.sum() < 10:
+        threshold = np.percentile(arr, 90.0)
+        hot_mask = arr >= threshold
+    if hot_mask.sum() < 10:
+        return (0, 0)
+
+    ys, xs = np.nonzero(hot_mask)
+    centroid_x = float(xs.mean())
+    centroid_y = float(ys.mean())
+
+    thermal_height, thermal_width = arr.shape[:2]
+    delta_x_norm = (centroid_x - (thermal_width / 2.0)) / float(thermal_width)
+    delta_y_norm = (centroid_y - (thermal_height / 2.0)) / float(thermal_height)
+
+    # Scale the thermal offset into RGB crop-space shift.
+    shift_x = int(delta_x_norm * crop_width * 0.8)
+    shift_y = int(delta_y_norm * crop_height * 0.8)
+    return (shift_x, shift_y)
+
+
+def _identity_transform_matrix():
+    return np.eye(3, dtype=np.float32)
+
+
+def _matrix_to_list(matrix):
+    return [[float(value) for value in row] for row in np.asarray(matrix, dtype=np.float32).tolist()]
+
+
+def _list_to_matrix(matrix_values):
+    if matrix_values is None:
+        return _identity_transform_matrix()
+    return np.asarray(matrix_values, dtype=np.float32)
+
+
+def _transform_points(points, matrix):
+    if len(points) == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    homogenous = np.hstack([points.astype(np.float32), np.ones((len(points), 1), dtype=np.float32)])
+    mapped = homogenous @ np.asarray(matrix, dtype=np.float32).T
+    mapped[:, 0] /= mapped[:, 2]
+    mapped[:, 1] /= mapped[:, 2]
+    return mapped[:, :2]
+
+
+def _rmse_from_errors(errors):
+    if len(errors) == 0:
+        return None
+    return float(np.sqrt(np.mean(np.square(errors))))
+
+
+def _model_summary(model_name, matrix, source_points, target_points, point_ids=None, estimation_details=None):
+    predicted = _transform_points(source_points, matrix)
+    deltas = predicted - target_points
+    errors = np.linalg.norm(deltas, axis=1)
+    summary = {
+        "name": model_name,
+        "available": True,
+        "matrix": _matrix_to_list(matrix),
+        "rmse": _rmse_from_errors(errors),
+        "mean_error": float(np.mean(errors)) if len(errors) else None,
+        "max_error": float(np.max(errors)) if len(errors) else None,
+        "point_count": int(len(source_points)),
+        "per_point_error": [
+            {
+                "point_id": point_ids[index] if point_ids else str(index + 1),
+                "error": float(errors[index]),
+            }
+            for index in range(len(errors))
+        ],
+    }
+    if estimation_details:
+        summary.update(estimation_details)
+    return summary
+
+
+def _unavailable_model_summary(model_name, reason):
+    return {
+        "name": model_name,
+        "available": False,
+        "reason": reason,
+        "matrix": _matrix_to_list(_identity_transform_matrix()),
+        "rmse": None,
+        "mean_error": None,
+        "max_error": None,
+        "point_count": 0,
+        "per_point_error": [],
+    }
+
+
+def _estimate_translation_matrix(source_points, target_points):
+    translation = np.mean(target_points - source_points, axis=0)
+    return np.asarray(
+        [
+            [1.0, 0.0, float(translation[0])],
+            [0.0, 1.0, float(translation[1])],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _estimate_scale_translate_matrix(source_points, target_points):
+    x_design = np.column_stack([source_points[:, 0], np.ones(len(source_points), dtype=np.float32)])
+    y_design = np.column_stack([source_points[:, 1], np.ones(len(source_points), dtype=np.float32)])
+    sx, tx = np.linalg.lstsq(x_design, target_points[:, 0], rcond=None)[0]
+    sy, ty = np.linalg.lstsq(y_design, target_points[:, 1], rcond=None)[0]
+    return np.asarray(
+        [
+            [float(sx), 0.0, float(tx)],
+            [0.0, float(sy), float(ty)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def estimate_calibration_models(control_points):
+    source_points = np.asarray(
+        [point["source"] for point in control_points],
+        dtype=np.float32,
+    )
+    target_points = np.asarray(
+        [point["target"] for point in control_points],
+        dtype=np.float32,
+    )
+    point_ids = [point.get("point_id", str(index + 1)) for index, point in enumerate(control_points)]
+    models = {}
+
+    if len(control_points) < CALIBRATION_MIN_POINTS["crop_only"]:
+        return {
+            name: _unavailable_model_summary(name, "not_enough_points")
+            for name in CALIBRATION_MODEL_ORDER
+        }
+
+    models["crop_only"] = _model_summary(
+        "crop_only",
+        _identity_transform_matrix(),
+        source_points,
+        target_points,
+        point_ids=point_ids,
+    )
+
+    if len(control_points) >= CALIBRATION_MIN_POINTS["translation"]:
+        translation_matrix = _estimate_translation_matrix(source_points, target_points)
+        models["translation"] = _model_summary(
+            "translation",
+            translation_matrix,
+            source_points,
+            target_points,
+            point_ids=point_ids,
+            estimation_details={
+                "translation_x": float(translation_matrix[0, 2]),
+                "translation_y": float(translation_matrix[1, 2]),
+            },
+        )
+    else:
+        models["translation"] = _unavailable_model_summary("translation", "not_enough_points")
+
+    if len(control_points) >= CALIBRATION_MIN_POINTS["scale_translate"]:
+        scale_translate_matrix = _estimate_scale_translate_matrix(source_points, target_points)
+        models["scale_translate"] = _model_summary(
+            "scale_translate",
+            scale_translate_matrix,
+            source_points,
+            target_points,
+            point_ids=point_ids,
+            estimation_details={
+                "scale_x": float(scale_translate_matrix[0, 0]),
+                "scale_y": float(scale_translate_matrix[1, 1]),
+                "translation_x": float(scale_translate_matrix[0, 2]),
+                "translation_y": float(scale_translate_matrix[1, 2]),
+            },
+        )
+    else:
+        models["scale_translate"] = _unavailable_model_summary("scale_translate", "not_enough_points")
+
+    if cv2 is None:
+        models["affine"] = _unavailable_model_summary("affine", "opencv_unavailable")
+        models["homography"] = _unavailable_model_summary("homography", "opencv_unavailable")
+        return models
+
+    if len(control_points) >= CALIBRATION_MIN_POINTS["affine"]:
+        affine_matrix, inliers = cv2.estimateAffine2D(
+            source_points.reshape(-1, 1, 2),
+            target_points.reshape(-1, 1, 2),
+            method=cv2.LMEDS,
+        )
+        if affine_matrix is not None:
+            affine_homography = np.vstack([affine_matrix, [0.0, 0.0, 1.0]]).astype(np.float32)
+            models["affine"] = _model_summary(
+                "affine",
+                affine_homography,
+                source_points,
+                target_points,
+                point_ids=point_ids,
+                estimation_details={
+                    "inlier_count": int(np.count_nonzero(inliers)) if inliers is not None else len(control_points),
+                },
+            )
+        else:
+            models["affine"] = _unavailable_model_summary("affine", "estimation_failed")
+    else:
+        models["affine"] = _unavailable_model_summary("affine", "not_enough_points")
+
+    if len(control_points) >= CALIBRATION_MIN_POINTS["homography"]:
+        homography_matrix, inliers = cv2.findHomography(
+            source_points.reshape(-1, 1, 2),
+            target_points.reshape(-1, 1, 2),
+            method=0,
+        )
+        if homography_matrix is not None:
+            models["homography"] = _model_summary(
+                "homography",
+                homography_matrix.astype(np.float32),
+                source_points,
+                target_points,
+                point_ids=point_ids,
+                estimation_details={
+                    "inlier_count": int(np.count_nonzero(inliers)) if inliers is not None else len(control_points),
+                },
+            )
+        else:
+            models["homography"] = _unavailable_model_summary("homography", "estimation_failed")
+    else:
+        models["homography"] = _unavailable_model_summary("homography", "not_enough_points")
+
+    return models
+
+
+def _select_best_calibration_model(models):
+    available_models = [
+        models[name]
+        for name in CALIBRATION_MODEL_ORDER
+        if models.get(name, {}).get("available") and models[name].get("rmse") is not None
+    ]
+    if not available_models:
+        return "crop_only", models.get("crop_only", _unavailable_model_summary("crop_only", "not_available"))
+
+    acceptable_models = [
+        model for model in available_models if model["rmse"] <= CALIBRATION_ACCEPTABLE_RMSE_PX
+    ]
+    if acceptable_models:
+        chosen_name = acceptable_models[0]["name"]
+        return chosen_name, models[chosen_name]
+
+    best_rmse = min(model["rmse"] for model in available_models)
+    for model_name in CALIBRATION_MODEL_ORDER:
+        model = models.get(model_name)
+        if not model or not model.get("available") or model.get("rmse") is None:
+            continue
+        if (
+            model["rmse"] <= best_rmse + CALIBRATION_MODEL_SELECTION_ABSOLUTE_TOLERANCE_PX
+            or model["rmse"] <= best_rmse * CALIBRATION_MODEL_SELECTION_RELATIVE_TOLERANCE
+        ):
+            return model_name, model
+
+    best_model = min(available_models, key=lambda model: model["rmse"])
+    return best_model["name"], best_model
+
+
+def build_calibration_profile(
+    control_points,
+    camera_used=None,
+    dataset_name=None,
+    burn_set_name=None,
+    profile_scope="dataset",
+    baseline_crop_box=None,
+    source_rgb_size=None,
+    notes=None,
+):
+    camera_name = _camera_used(camera_used)
+    models = estimate_calibration_models(control_points)
+    selected_model_name, selected_model = _select_best_calibration_model(models)
+    crop_box = baseline_crop_box or _get_base_crop_box(source_rgb_size or (4000, 3000), camera_used=camera_name)
+    now_utc = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    crop_only_rmse = models.get("crop_only", {}).get("rmse")
+    selected_rmse = selected_model.get("rmse")
+
+    return {
+        "version": CALIBRATION_PROFILE_VERSION,
+        "camera": camera_name,
+        "scope": profile_scope,
+        "dataset_name": dataset_name,
+        "burn_set_name": burn_set_name,
+        "output_size": list(_get_output_size()),
+        "source_rgb_size": list(source_rgb_size) if source_rgb_size is not None else None,
+        "baseline_crop_box": {
+            "left": int(crop_box[0]),
+            "top": int(crop_box[1]),
+            "right": int(crop_box[2]),
+            "bottom": int(crop_box[3]),
+        },
+        "selected_model": selected_model_name,
+        "selected_model_summary": selected_model,
+        "crop_only_rmse": crop_only_rmse,
+        "selected_model_rmse": selected_rmse,
+        "rmse_improvement_vs_crop_only": (
+            None
+            if crop_only_rmse is None or selected_rmse is None
+            else float(crop_only_rmse - selected_rmse)
+        ),
+        "models": models,
+        "control_points": [
+            {
+                "point_id": point.get("point_id", str(index + 1)),
+                "pair_label": point.get("pair_label", ""),
+                "source": [float(point["source"][0]), float(point["source"][1])],
+                "target": [float(point["target"][0]), float(point["target"][1])],
+                "source_basis": point.get("source_basis", "crop_baseline"),
+            }
+            for index, point in enumerate(control_points)
+        ],
+        "notes": notes or "",
+        "created_at": now_utc,
+        "updated_at": now_utc,
+    }
+
+
+def _profile_filename(camera_used=None, dataset_name=None, burn_set_name=None, scope="dataset"):
+    camera_name = _sanitize_identifier(_camera_used(camera_used))
+    if scope == "camera_default":
+        return f"{camera_name}__camera_default.json"
+    if scope == "burn_set":
+        return (
+            f"{camera_name}__{_sanitize_identifier(dataset_name)}__"
+            f"{_sanitize_identifier(burn_set_name)}__burn_set.json"
+        )
+    return f"{camera_name}__{_sanitize_identifier(dataset_name)}__dataset.json"
+
+
+def save_calibration_profile(profile_data):
+    if profile_data.get("scope") == "camera_default":
+        filename = _profile_filename(
+            camera_used=profile_data.get("camera"),
+            scope="camera_default",
+        )
+    elif profile_data.get("scope") == "burn_set":
+        filename = _profile_filename(
+            camera_used=profile_data.get("camera"),
+            dataset_name=profile_data.get("dataset_name"),
+            burn_set_name=profile_data.get("burn_set_name"),
+            scope="burn_set",
+        )
+    else:
+        filename = _profile_filename(
+            camera_used=profile_data.get("camera"),
+            dataset_name=profile_data.get("dataset_name"),
+            scope="dataset",
+        )
+
+    profile_path = _calibration_profiles_root() / filename
+    payload = dict(profile_data)
+    payload["updated_at"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    with open(profile_path, "w", encoding="utf-8") as profile_file:
+        json.dump(payload, profile_file, indent=2)
+    return str(profile_path)
+
+
+def _load_profile_file(profile_path):
+    if not profile_path.exists():
+        return None
+    with open(profile_path, "r", encoding="utf-8") as profile_file:
+        return json.load(profile_file)
+
+
+def load_calibration_profile(camera_used=None, dataset_name=None, burn_set_name=None):
+    camera_name = _camera_used(camera_used)
+    candidate_paths = []
+    if dataset_name and burn_set_name:
+        candidate_paths.append(
+            _calibration_profiles_root()
+            / _profile_filename(
+                camera_used=camera_name,
+                dataset_name=dataset_name,
+                burn_set_name=burn_set_name,
+                scope="burn_set",
+            )
+        )
+    if dataset_name:
+        candidate_paths.append(
+            _calibration_profiles_root()
+            / _profile_filename(
+                camera_used=camera_name,
+                dataset_name=dataset_name,
+                scope="dataset",
+            )
+        )
+    candidate_paths.append(
+        _calibration_profiles_root()
+        / _profile_filename(camera_used=camera_name, scope="camera_default")
+    )
+
+    for candidate_path in candidate_paths:
+        profile = _load_profile_file(candidate_path)
+        if profile is not None:
+            profile["profile_path"] = str(candidate_path)
+            return profile
+    return None
+
+
+def _rendered_baseline_crop_box(image_size, camera_used=None, calibration_profile=None):
+    return _get_base_crop_box(
+        image_size,
+        camera_used=camera_used,
+        calibration_profile=calibration_profile,
+    )
+
+
+def _project_raw_point_to_corrected_coords(raw_coords, crop_box, output_size=None):
+    output_width, output_height = output_size or _get_output_size()
+    crop_width = max(crop_box[2] - crop_box[0], 1)
+    crop_height = max(crop_box[3] - crop_box[1], 1)
+    corrected_x = ((raw_coords[0] - crop_box[0]) / float(crop_width)) * output_width
+    corrected_y = ((raw_coords[1] - crop_box[1]) / float(crop_height)) * output_height
+    return (float(corrected_x), float(corrected_y))
+
+
+def _get_active_calibration_profile(dataset_name=None, burn_set_name=None, camera_used=None, calibration_profile=None):
+    if calibration_profile is not None:
+        return calibration_profile
+    return load_calibration_profile(
+        camera_used=camera_used,
+        dataset_name=dataset_name,
+        burn_set_name=burn_set_name,
+    )
+
+
+def _describe_selected_model(selected_model_name, selected_model_summary):
+    description = {
+        "model": selected_model_name,
+        "rmse": selected_model_summary.get("rmse"),
+        "translation_x": selected_model_summary.get("translation_x", 0.0),
+        "translation_y": selected_model_summary.get("translation_y", 0.0),
+        "scale_x": selected_model_summary.get("scale_x", 1.0),
+        "scale_y": selected_model_summary.get("scale_y", 1.0),
+        "matrix": selected_model_summary.get("matrix", _matrix_to_list(_identity_transform_matrix())),
+    }
+    return description
+
+
+def _get_crop_debug_info(
+    rgb_source_path,
+    thermal_source_path=None,
+    use_experimental_shift=None,
+    dataset_name=None,
+    burn_set_name=None,
+    calibration_profile=None,
+    camera_used=None,
+):
+    with Image.open(rgb_source_path) as rgb_img:
+        width, height = rgb_img.size
+
+    active_profile = _get_active_calibration_profile(
+        dataset_name=dataset_name,
+        burn_set_name=burn_set_name,
+        camera_used=camera_used,
+        calibration_profile=calibration_profile,
+    )
+    base_crop_box = _rendered_baseline_crop_box(
+        (width, height),
+        camera_used=camera_used,
+        calibration_profile=active_profile,
+    )
+    crop_width = base_crop_box[2] - base_crop_box[0]
+    crop_height = base_crop_box[3] - base_crop_box[1]
+    use_shift = (
+        EXPERIMENTAL_THERMAL_SHIFT_ENABLED
+        if use_experimental_shift is None
+        else use_experimental_shift
+    )
+
+    shift_x, shift_y = (0, 0)
+    shift_mode = "fixed_camera_crop"
+    shift_source = "none"
+    if use_shift:
+        shift_x, shift_y = _estimate_thermal_alignment_shift(
+            thermal_source_path,
+            crop_width,
+            crop_height,
+        )
+        shift_mode = "experimental_thermal_hotmask_centroid_shift"
+        shift_source = "thermal_hotmask_centroid"
+
+    final_crop_box = _clamp_crop_box(
+        base_crop_box[0] + shift_x,
+        base_crop_box[1] + shift_y,
+        base_crop_box[2] + shift_x,
+        base_crop_box[3] + shift_y,
+        width,
+        height,
+    )
+
+    selected_model_name = "crop_only"
+    selected_model_summary = _model_summary(
+        "crop_only",
+        _identity_transform_matrix(),
+        np.asarray([[0.0, 0.0]], dtype=np.float32),
+        np.asarray([[0.0, 0.0]], dtype=np.float32),
+    )
+    if active_profile is not None:
+        selected_model_name = active_profile.get("selected_model", "crop_only")
+        selected_model_summary = active_profile.get("models", {}).get(
+            selected_model_name,
+            active_profile.get("selected_model_summary", selected_model_summary),
+        )
+
+    return {
+        "rgb_size": (width, height),
+        "base_crop_box": tuple(int(value) for value in base_crop_box),
+        "applied_shift": (int(shift_x), int(shift_y)),
+        "final_crop_box": final_crop_box,
+        "used_experimental_shift": bool(use_shift),
+        "shift_mode": shift_mode,
+        "shift_source": shift_source,
+        "output_size": _get_output_size(),
+        "dataset_name": dataset_name,
+        "burn_set_name": burn_set_name,
+        "calibration_profile": active_profile,
+        "selected_model": selected_model_name,
+        "selected_model_summary": _describe_selected_model(selected_model_name, selected_model_summary),
+        "final_transform_matrix": selected_model_summary.get("matrix", _matrix_to_list(_identity_transform_matrix())),
+    }
+
+
+def _get_aligned_crop_box(
+    rgb_source_path,
+    thermal_source_path=None,
+    use_experimental_shift=None,
+    dataset_name=None,
+    burn_set_name=None,
+    calibration_profile=None,
+    camera_used=None,
+):
+    return _get_crop_debug_info(
+        rgb_source_path,
+        thermal_source_path=thermal_source_path,
+        use_experimental_shift=use_experimental_shift,
+        dataset_name=dataset_name,
+        burn_set_name=burn_set_name,
+        calibration_profile=calibration_profile,
+        camera_used=camera_used,
+    )["final_crop_box"]
+
+
+def _warp_corrected_image(corrected_image, transform_matrix, output_size):
+    matrix = np.asarray(transform_matrix, dtype=np.float32)
+    if np.allclose(matrix, _identity_transform_matrix()):
+        return corrected_image.copy()
+
+    rgb_array = np.array(corrected_image.convert("RGB"))
+    if cv2 is None:
+        return corrected_image.copy()
+
+    warped = cv2.warpPerspective(
+        rgb_array,
+        matrix,
+        tuple(int(value) for value in output_size),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REPLICATE,
+    )
+    return Image.fromarray(warped)
+
+
+def _apply_rgb_fov_correction(
+    rgb_source_path,
+    thermal_source_path=None,
+    use_experimental_shift=None,
+    dataset_name=None,
+    burn_set_name=None,
+    calibration_profile=None,
+    camera_used=None,
+    return_debug_info=False,
+):
+    debug_info = _get_crop_debug_info(
+        rgb_source_path,
+        thermal_source_path=thermal_source_path,
+        use_experimental_shift=use_experimental_shift,
+        dataset_name=dataset_name,
+        burn_set_name=burn_set_name,
+        calibration_profile=calibration_profile,
+        camera_used=camera_used,
+    )
+
+    with Image.open(rgb_source_path) as rgb_img:
+        exif_bytes = rgb_img.info.get("exif")
+        baseline_corrected = rgb_img.crop(debug_info["final_crop_box"]).resize(
+            debug_info["output_size"],
+            Image.LANCZOS,
+        )
+
+    selected_model_summary = debug_info["selected_model_summary"]
+    final_image = _warp_corrected_image(
+        baseline_corrected,
+        selected_model_summary.get("matrix", _matrix_to_list(_identity_transform_matrix())),
+        debug_info["output_size"],
+    )
+    if exif_bytes:
+        final_image.info["exif"] = exif_bytes
+
+    if return_debug_info:
+        debug_info["baseline_only_image_size"] = baseline_corrected.size
+        return final_image, debug_info
+    return final_image
+
+
+def _fit_image_to_panel(image, panel_size=(640, 512), background=(245, 245, 245)):
+    panel = Image.new("RGB", panel_size, color=background)
+    image_copy = image.copy()
+    image_copy.thumbnail(panel_size)
+    x_offset = (panel_size[0] - image_copy.width) // 2
+    y_offset = (panel_size[1] - image_copy.height) // 2
+    panel.paste(image_copy, (x_offset, y_offset))
+    return panel
+
+
+def _load_debug_preview_image(path):
+    with Image.open(path) as image:
+        if image.mode not in ("RGB", "RGBA"):
+            return ImageOps.autocontrast(image.convert("L")).convert("RGB")
+        return image.convert("RGB")
+
+
+def _build_alignment_debug_image(
+    rgb_path,
+    thermal_preview_path,
+    thermal_shift_source_path,
+    dataset_name=None,
+    burn_set_name=None,
+    calibration_profile=None,
+    camera_used=None,
+):
+    raw_rgb = _load_debug_preview_image(rgb_path)
+    crop_only_corrected, crop_only_debug = _apply_rgb_fov_correction(
+        rgb_path,
+        thermal_source_path=thermal_shift_source_path,
+        use_experimental_shift=False,
+        dataset_name=dataset_name,
+        burn_set_name=burn_set_name,
+        calibration_profile=None,
+        camera_used=camera_used,
+        return_debug_info=True,
+    )
+    final_corrected, final_debug = _apply_rgb_fov_correction(
+        rgb_path,
+        thermal_source_path=thermal_shift_source_path,
+        use_experimental_shift=False,
+        dataset_name=dataset_name,
+        burn_set_name=burn_set_name,
+        calibration_profile=calibration_profile,
+        camera_used=camera_used,
+        return_debug_info=True,
+    )
+    crop_only_corrected = crop_only_corrected.convert("RGB")
+    final_corrected = final_corrected.convert("RGB")
+    thermal_preview = _load_debug_preview_image(thermal_preview_path)
+
+    panel_size = _get_output_size()
+    label_height = 44
+    gap = 20
+    labels = [
+        ("Raw RGB", raw_rgb),
+        ("Crop-Only Corrected FOV", crop_only_corrected),
+        (
+            f"Final Corrected FOV ({final_debug['selected_model']})",
+            final_corrected,
+        ),
+        ("Thermal", thermal_preview),
+    ]
+
+    canvas_width = panel_size[0] * 2 + gap * 3
+    canvas_height = (panel_size[1] + label_height) * 2 + gap * 3
+    canvas = Image.new("RGB", (canvas_width, canvas_height), color=(245, 245, 245))
+    draw = ImageDraw.Draw(canvas)
+
+    for panel_index, (label, image) in enumerate(labels):
+        row = panel_index // 2
+        col = panel_index % 2
+        x = gap + col * (panel_size[0] + gap)
+        y = gap + row * (panel_size[1] + label_height + gap)
+        draw.text((x, y), label, fill=(0, 0, 0))
+        panel = _fit_image_to_panel(image, panel_size=panel_size)
+        canvas.paste(panel, (x, y + label_height))
+
+    crop_only_corrected.close()
+    final_corrected.close()
+    return canvas, crop_only_debug, final_debug
+
+
+def _sample_pair_indices(pair_count, sample_count):
+    if pair_count <= 0:
+        return []
+    if pair_count <= sample_count:
+        return list(range(pair_count))
+    if sample_count <= 1:
+        return [0]
+
+    indices = []
+    for position in range(sample_count):
+        index = round(position * (pair_count - 1) / (sample_count - 1))
+        if index not in indices:
+            indices.append(index)
+    return indices
+
+
+def export_alignment_debug_samples(
+    output_root,
+    dataset_name,
+    burn_set_name,
+    pairs,
+    sample_count=None,
+    calibration_profile=None,
+):
+    if not pairs:
+        return None
+
+    sample_count = CORRECTION_VALIDATION_SAMPLE_COUNT if sample_count is None else sample_count
+    debug_root = os.path.join(output_root, CORRECTION_VALIDATION_DIRNAME)
+    os.makedirs(debug_root, exist_ok=True)
+    summary_path = os.path.join(debug_root, "correction_validation_summary.csv")
+    fieldnames = [
+        "sample_index",
+        "detected_camera",
+        "rgb_filename",
+        "thermal_preview_filename",
+        "base_crop_box",
+        "crop_only_shift",
+        "crop_only_final_crop_box",
+        "final_shift",
+        "final_final_crop_box",
+        "selected_model",
+        "selected_model_rmse",
+        "translation_x",
+        "translation_y",
+        "scale_x",
+        "scale_y",
+        "final_transform_matrix",
+        "calibration_profile_path",
+    ]
+
+    rows = []
+    for sample_number, pair_index in enumerate(_sample_pair_indices(len(pairs), sample_count), start=1):
+        pair = pairs[pair_index]
+        thermal_preview_path = (
+            pair["thermal_jpg"]["filepath"]
+            if pair["thermal_jpg"] is not None
+            else pair["thermal_tiff"]["filepath"]
+        )
+        thermal_shift_source_path = (
+            pair["cal_tiff"]["filepath"]
+            if pair["cal_tiff"] is not None
+            else pair["thermal_tiff"]["filepath"]
+        )
+        debug_image, crop_only_debug, final_debug = _build_alignment_debug_image(
+            pair["rgb"]["filepath"],
+            thermal_preview_path,
+            thermal_shift_source_path,
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            calibration_profile=calibration_profile,
+            camera_used=pair.get("detected_camera"),
+        )
+        debug_image_path = os.path.join(debug_root, f"sample_{sample_number:02d}.png")
+        debug_image.save(debug_image_path)
+        debug_image.close()
+
+        row = {
+            "sample_index": sample_number,
+            "detected_camera": pair.get("detected_camera", ""),
+            "rgb_filename": pair["rgb"]["filename"],
+            "thermal_preview_filename": os.path.basename(thermal_preview_path),
+            "base_crop_box": str(crop_only_debug["base_crop_box"]),
+            "crop_only_shift": str(crop_only_debug["applied_shift"]),
+            "crop_only_final_crop_box": str(crop_only_debug["final_crop_box"]),
+            "final_shift": str(final_debug["applied_shift"]),
+            "final_final_crop_box": str(final_debug["final_crop_box"]),
+            "selected_model": final_debug["selected_model"],
+            "selected_model_rmse": (
+                ""
+                if final_debug["selected_model_summary"]["rmse"] is None
+                else f"{final_debug['selected_model_summary']['rmse']:.4f}"
+            ),
+            "translation_x": f"{final_debug['selected_model_summary']['translation_x']:.4f}",
+            "translation_y": f"{final_debug['selected_model_summary']['translation_y']:.4f}",
+            "scale_x": f"{final_debug['selected_model_summary']['scale_x']:.6f}",
+            "scale_y": f"{final_debug['selected_model_summary']['scale_y']:.6f}",
+            "final_transform_matrix": json.dumps(final_debug["selected_model_summary"]["matrix"]),
+            "calibration_profile_path": (
+                ""
+                if final_debug["calibration_profile"] is None
+                else final_debug["calibration_profile"].get("profile_path", "")
+            ),
+        }
+        rows.append(row)
+        print(
+            f"[Correction Validation] {dataset_name}/{burn_set_name} sample {sample_number}: "
+            f"base_crop_box={row['base_crop_box']} crop_only_final_crop_box={row['crop_only_final_crop_box']} "
+            f"final_model={row['selected_model']} translation=({row['translation_x']}, {row['translation_y']}) "
+            f"scale=({row['scale_x']}, {row['scale_y']})"
+        )
+
+    with open(summary_path, "w", newline="", encoding="utf-8") as summary_file:
+        writer = csv.DictWriter(summary_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+    return debug_root
 
 
 def _discover_presorted_sets(root_folder):
@@ -222,6 +1186,222 @@ def _discover_presorted_sets(root_folder):
     return burn_sets
 
 
+def _safe_image_size(filepath):
+    try:
+        with Image.open(filepath) as image:
+            return image.size
+    except Exception:
+        return None
+
+
+def _extract_exif_camera_text(filepath):
+    try:
+        with Image.open(filepath) as image:
+            exif = image.getexif()
+            values = [
+                exif.get(271),   # Make
+                exif.get(272),   # Model
+                exif.get(42036), # LensModel
+                exif.get(305),   # Software
+            ]
+    except Exception:
+        return ""
+
+    text_parts = []
+    for value in values:
+        if not value:
+            continue
+        cleaned = str(value).replace("\x00", "").strip()
+        if cleaned:
+            text_parts.append(cleaned)
+    return " | ".join(text_parts).upper()
+
+
+def _camera_from_resolution(image_size):
+    if image_size is None:
+        return None
+
+    width, height = image_size
+    normalized = (max(width, height), min(width, height))
+    for camera_name, hint in CAMERA_RESOLUTION_HINTS.items():
+        target_width, target_height = max(hint["target"]), min(hint["target"])
+        if (
+            hint["width_range"][0] <= normalized[0] <= hint["width_range"][1]
+            and hint["height_range"][0] <= normalized[1] <= hint["height_range"][1]
+        ):
+            return {
+                "camera": camera_name,
+                "reason": f"resolution:{width}x{height}",
+                "target_resolution": f"{target_width}x{target_height}",
+            }
+    return None
+
+
+def _camera_from_exif(filepath):
+    exif_text = _extract_exif_camera_text(filepath)
+    if not exif_text:
+        return None
+
+    for camera_name, hints in CAMERA_EXIF_HINTS.items():
+        if any(hint in exif_text for hint in hints):
+            return {
+                "camera": camera_name,
+                "reason": f"exif:{exif_text}",
+                "exif_text": exif_text,
+            }
+    return {
+        "camera": None,
+        "reason": f"exif_unmapped:{exif_text}",
+        "exif_text": exif_text,
+    }
+
+
+def detect_camera_from_rgb_file(filepath, fallback_camera=None):
+    image_size = _safe_image_size(filepath)
+    resolution_guess = _camera_from_resolution(image_size)
+    exif_guess = _camera_from_exif(filepath)
+
+    selected_camera = None
+    reasons = []
+    if resolution_guess is not None:
+        selected_camera = resolution_guess["camera"]
+        reasons.append(resolution_guess["reason"])
+    if exif_guess is not None and exif_guess.get("camera") is not None:
+        reasons.append(exif_guess["reason"])
+        if selected_camera is None:
+            selected_camera = exif_guess["camera"]
+        elif selected_camera != exif_guess["camera"]:
+            reasons.append(f"resolution_primary_over_exif:{exif_guess['camera']}")
+    elif exif_guess is not None:
+        reasons.append(exif_guess["reason"])
+
+    if selected_camera is None:
+        selected_camera = fallback_camera or CAMERA_USED
+        reasons.append(f"fallback:{selected_camera}")
+
+    return {
+        "camera": selected_camera,
+        "image_size": image_size,
+        "resolution_guess": resolution_guess["camera"] if resolution_guess is not None else None,
+        "exif_guess": exif_guess.get("camera") if exif_guess is not None else None,
+        "exif_text": exif_guess.get("exif_text", "") if exif_guess is not None else "",
+        "reason": " | ".join(reasons),
+        "filepath": filepath,
+    }
+
+
+def detect_camera_from_rgb_records(rgb_records, fallback_camera=None, sample_size=8):
+    sampled_records = []
+    for record in rgb_records:
+        filepath = record.get("filepath")
+        if filepath and os.path.exists(filepath):
+            sampled_records.append(record)
+        if len(sampled_records) >= sample_size:
+            break
+
+    detections = [
+        detect_camera_from_rgb_file(record["filepath"], fallback_camera=fallback_camera)
+        for record in sampled_records
+    ]
+    if not detections:
+        return {
+            "camera": fallback_camera or CAMERA_USED,
+            "image_size": None,
+            "reason": f"fallback:{fallback_camera or CAMERA_USED}",
+            "sample_count": 0,
+            "profile_camera": fallback_camera or CAMERA_USED,
+        }
+
+    camera_counts = {}
+    for detection in detections:
+        camera_counts[detection["camera"]] = camera_counts.get(detection["camera"], 0) + 1
+    selected_camera = max(camera_counts.items(), key=lambda item: (item[1], item[0]))[0]
+
+    representative = next(
+        (detection for detection in detections if detection["camera"] == selected_camera),
+        detections[0],
+    )
+    reasons = []
+    seen_reasons = set()
+    for detection in detections:
+        reason = detection["reason"]
+        if reason in seen_reasons:
+            continue
+        seen_reasons.add(reason)
+        reasons.append(reason)
+    dimensions = [detection["image_size"] for detection in detections if detection["image_size"] is not None]
+    dimension_summary = ""
+    if dimensions:
+        unique_dimensions = sorted({f"{width}x{height}" for width, height in dimensions})
+        dimension_summary = ", ".join(unique_dimensions[:3])
+
+    return {
+        "camera": selected_camera,
+        "profile_camera": selected_camera,
+        "image_size": representative.get("image_size"),
+        "dimension_summary": dimension_summary,
+        "reason": " || ".join(reasons),
+        "sample_count": len(detections),
+        "samples": detections,
+        "profile_path": "",
+    }
+
+
+def detect_camera_from_folder(folder_path, fallback_camera=None):
+    rgb_candidates = []
+    for entry in sorted(os.listdir(folder_path)):
+        filepath = os.path.join(folder_path, entry)
+        if not os.path.isfile(filepath):
+            continue
+        if os.path.splitext(entry)[1].lower() not in {".jpg", ".jpeg"}:
+            continue
+        image_size = _safe_image_size(filepath)
+        if image_size is None:
+            continue
+        width, height = image_size
+        if max(width, height) >= 1500:
+            rgb_candidates.append({"filepath": filepath, "image_size": image_size})
+
+    return detect_camera_from_rgb_records(rgb_candidates, fallback_camera=fallback_camera)
+
+
+def _infer_standard_modality(filepath):
+    filename = os.path.basename(filepath)
+    name_upper = filename.upper()
+    ext = os.path.splitext(filename)[1].lower()
+    stem_upper = os.path.splitext(filename)[0].upper()
+
+    if ext in {".tif", ".tiff"}:
+        if "CAL" in stem_upper:
+            return "cal_tiff"
+        return "thermal_tiff"
+
+    if ext not in {".jpg", ".jpeg"}:
+        return None
+
+    if name_upper.startswith("MAX_") or "_W" in stem_upper:
+        return "rgb"
+    if name_upper.startswith("IRX_") or "_T" in stem_upper:
+        return "thermal_jpg"
+
+    image_size = _safe_image_size(filepath)
+    if image_size is None:
+        return None
+
+    width, height = image_size
+    if max(width, height) >= 1500:
+        return "rgb"
+    if (
+        abs(width - CORRECTED_FOV_OUTPUT_SIZE[0]) <= 48
+        and abs(height - CORRECTED_FOV_OUTPUT_SIZE[1]) <= 48
+    ) or (
+        abs(width - CORRECTED_FOV_OUTPUT_SIZE[1]) <= 48
+        and abs(height - CORRECTED_FOV_OUTPUT_SIZE[0]) <= 48
+    ):
+        return "thermal_jpg"
+    return None
+
+
 def _collect_flat_dataset_records(folder):
     if not os.path.isdir(folder):
         return None
@@ -240,21 +1420,25 @@ def _collect_flat_dataset_records(folder):
         if ext not in {".jpg", ".jpeg", ".tif", ".tiff"}:
             continue
 
+        modality = _infer_standard_modality(filepath)
+        if modality is None:
+            continue
+
         record = {
             "filename": file,
             "filepath": filepath,
             "datetime": _extract_capture_datetime(filepath),
             "index": _numeric_suffix(file),
+            "image_size": _safe_image_size(filepath),
         }
 
-        name_upper = file.upper()
-        if name_upper.startswith("MAX_") and "_W" in name_upper and ext in {".jpg", ".jpeg"}:
+        if modality == "rgb":
             rgb_records.append(record)
-        elif name_upper.startswith("IRX_") and "CAL" in name_upper and ext in {".tif", ".tiff"}:
+        elif modality == "cal_tiff":
             cal_tiff_records.append(record)
-        elif name_upper.startswith("IRX_") and "_T" in name_upper and ext in {".tif", ".tiff"}:
+        elif modality == "thermal_tiff":
             thermal_tiff_records.append(record)
-        elif name_upper.startswith("IRX_") and "_T" in name_upper and ext in {".jpg", ".jpeg"}:
+        elif modality == "thermal_jpg":
             thermal_jpg_records.append(record)
 
     if not rgb_records or not thermal_tiff_records:
@@ -281,9 +1465,19 @@ def _discover_presorted_datasets(root_folder):
             continue
 
         burn_sets = _discover_presorted_sets(dataset_root)
-        flat_dataset = _collect_flat_dataset_records(dataset_root)
-        if flat_dataset is not None:
-            burn_sets = [flat_dataset]
+        seen_roots = {os.path.abspath(burn_set["source_root"]) for burn_set in burn_sets}
+
+        for current_root, _, _ in os.walk(dataset_root):
+            flat_dataset = _collect_flat_dataset_records(current_root)
+            if flat_dataset is None:
+                continue
+            current_root_abs = os.path.abspath(flat_dataset["source_root"])
+            if current_root_abs in seen_roots:
+                continue
+            burn_sets.append(flat_dataset)
+            seen_roots.add(current_root_abs)
+
+        burn_sets.sort(key=lambda item: item["source_root"])
         if burn_sets:
             datasets.append({"name": entry, "root": dataset_root, "burn_sets": burn_sets})
 
@@ -309,85 +1503,508 @@ def _collect_media_records(folder):
                 "filepath": filepath,
                 "datetime": _extract_capture_datetime(filepath),
                 "index": _numeric_suffix(file),
+                "image_size": _safe_image_size(filepath),
             }
         )
 
     return records
 
 
-def _match_record(target_record, candidate_records, used_candidates):
-    if not candidate_records:
-        return None, "missing"
+def _time_delta_seconds(first_dt, second_dt):
+    if first_dt is None or second_dt is None:
+        return None
+    return abs((first_dt - second_dt).total_seconds())
 
-    # Prefer nearest timestamp within tolerance.
+
+def _unique_reasons(reasons):
+    unique = []
+    seen = set()
+    for reason in reasons:
+        if not reason or reason in seen:
+            continue
+        unique.append(reason)
+        seen.add(reason)
+    return unique
+
+
+def _record_matches_expected_pattern(record, modality):
+    if record is None:
+        return False
+
+    name_upper = record["filename"].upper()
+    ext = os.path.splitext(record["filename"])[1].lower()
+    if modality == "rgb":
+        return name_upper.startswith("MAX_") and "_W" in name_upper and ext in {".jpg", ".jpeg"}
+    if modality == "thermal_jpg":
+        return (
+            name_upper.startswith("IRX_")
+            and "_T" in name_upper
+            and "CAL" not in name_upper
+            and ext in {".jpg", ".jpeg"}
+        )
+    if modality == "thermal_tiff":
+        return (
+            name_upper.startswith("IRX_")
+            and "_T" in name_upper
+            and "CAL" not in name_upper
+            and ext in {".tif", ".tiff"}
+        )
+    if modality == "cal_tiff":
+        return name_upper.startswith("IRX_") and "CAL" in name_upper and ext in {".tif", ".tiff"}
+    return False
+
+
+def _timestamp_score(time_delta):
+    if time_delta is None:
+        return 0.0, ["timestamp_unavailable"]
+
+    if time_delta <= PAIR_TIME_TOLERANCE_SECONDS:
+        closeness = 1.0 - (time_delta / max(PAIR_TIME_TOLERANCE_SECONDS, 0.001))
+        return 18.0 + (closeness * 14.0), []
+
+    soft_limit = PAIR_TIME_TOLERANCE_SECONDS * 3.0
+    if time_delta <= soft_limit:
+        closeness = 1.0 - (
+            (time_delta - PAIR_TIME_TOLERANCE_SECONDS)
+            / max((soft_limit - PAIR_TIME_TOLERANCE_SECONDS), 0.001)
+        )
+        return max(2.0, closeness * 12.0), [f"timestamp_delta_high:{time_delta:.3f}s"]
+
+    return 0.0, [f"timestamp_delta_high:{time_delta:.3f}s"]
+
+
+def _confidence_level(score):
+    if score >= HIGH_CONFIDENCE_THRESHOLD:
+        return "HIGH"
+    if score >= MEDIUM_CONFIDENCE_THRESHOLD:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _candidate_sort_key(target_record, candidate_record):
+    time_delta = _time_delta_seconds(target_record["datetime"], candidate_record["datetime"])
+    return (
+        float("inf") if time_delta is None else time_delta,
+        candidate_record["filename"],
+    )
+
+
+def _score_candidate(target_record, candidate_record, modality, strategy):
+    score = 0.0
+    reasons = []
+
+    numeric_match = (
+        target_record["index"] is not None
+        and candidate_record["index"] is not None
+        and target_record["index"] == candidate_record["index"]
+    )
+    if numeric_match:
+        score += 46.0
+    else:
+        reasons.append("numeric_suffix_mismatch")
+
+    time_delta = _time_delta_seconds(target_record["datetime"], candidate_record["datetime"])
+    timestamp_points, timestamp_reasons = _timestamp_score(time_delta)
+    score += timestamp_points
+    reasons.extend(timestamp_reasons)
+
+    if _record_matches_expected_pattern(candidate_record, modality):
+        score += 10.0
+    else:
+        reasons.append("filename_pattern_unexpected")
+
+    if strategy == "suffix":
+        score += 4.0
+    elif strategy == "timestamp" and time_delta is not None and time_delta <= PAIR_TIME_TOLERANCE_SECONDS:
+        score += 4.0
+    elif strategy == "suffix+timestamp":
+        score += 8.0
+
+    return {
+        "record": candidate_record,
+        "strategy": strategy,
+        "score": min(score, 100.0),
+        "time_delta": time_delta,
+        "numeric_match": numeric_match,
+        "reasons": _unique_reasons(reasons),
+    }
+
+
+def _select_candidate(target_record, candidate_records, used_candidates, modality):
     available_candidates = [
         candidate for candidate in candidate_records if candidate["filepath"] not in used_candidates
     ]
     if not available_candidates:
-        return None, "missing"
+        return {
+            "record": None,
+            "strategy": "missing",
+            "score": 0.0,
+            "time_delta": None,
+            "numeric_match": False,
+            "reasons": [f"{modality}_missing"],
+        }
 
-    best_candidate = min(
-        available_candidates,
-        key=lambda candidate: abs((candidate["datetime"] - target_record["datetime"]).total_seconds()),
-    )
-    time_delta = abs((best_candidate["datetime"] - target_record["datetime"]).total_seconds())
-    if time_delta <= PAIR_TIME_TOLERANCE_SECONDS:
-        return best_candidate, "timestamp"
-
-    # Only fall back to index matching if timestamp matching fails.
-    if ALLOW_INDEX_FALLBACK_WHEN_TIMESTAMP_FAILS and target_record["index"] is not None:
+    suffix_candidate = None
+    if target_record["index"] is not None:
         exact_matches = [
-            candidate
-            for candidate in available_candidates
-            if candidate["index"] == target_record["index"]
+            candidate for candidate in available_candidates if candidate["index"] == target_record["index"]
         ]
         if exact_matches:
-            return exact_matches[0], f"index_fallback_after_time_delta:{time_delta:0.3f}"
+            suffix_candidate = min(
+                exact_matches,
+                key=lambda candidate: _candidate_sort_key(target_record, candidate),
+            )
 
-    return None, f"time_delta_exceeded:{time_delta:0.3f}"
+    timestamp_candidate = min(
+        available_candidates,
+        key=lambda candidate: _candidate_sort_key(target_record, candidate),
+    )
+
+    evaluations = {}
+    if suffix_candidate is not None:
+        strategy = "suffix+timestamp" if suffix_candidate["filepath"] == timestamp_candidate["filepath"] else "suffix"
+        evaluations[suffix_candidate["filepath"]] = _score_candidate(
+            target_record,
+            suffix_candidate,
+            modality,
+            strategy,
+        )
+
+    if timestamp_candidate["filepath"] not in evaluations:
+        evaluations[timestamp_candidate["filepath"]] = _score_candidate(
+            target_record,
+            timestamp_candidate,
+            modality,
+            "timestamp",
+        )
+
+    ranked = sorted(
+        evaluations.values(),
+        key=lambda evaluation: (
+            evaluation["score"],
+            1 if evaluation["numeric_match"] else 0,
+            -(float("inf") if evaluation["time_delta"] is None else evaluation["time_delta"]),
+        ),
+        reverse=True,
+    )
+    best_evaluation = ranked[0]
+
+    if len(ranked) > 1 and ranked[0]["record"]["filepath"] != ranked[1]["record"]["filepath"]:
+        best_evaluation["reasons"] = _unique_reasons(
+            best_evaluation["reasons"]
+            + [f"preferred_{ranked[0]['strategy']}_over_{ranked[1]['strategy']}"]
+        )
+
+    return best_evaluation
+
+
+def _pair_confidence(rgb_record, thermal_jpg_eval, thermal_tiff_eval, cal_tiff_eval):
+    score = 10.0
+    reasons = []
+
+    if _record_matches_expected_pattern(rgb_record, "rgb"):
+        score += 10.0
+    else:
+        reasons.append("rgb_filename_pattern_unexpected")
+
+    for modality_name, evaluation, weight, missing_penalty in [
+        ("thermal_tiff", thermal_tiff_eval, 50.0, 12.0),
+        ("thermal_jpg", thermal_jpg_eval, 18.0, 5.0),
+        ("cal_tiff", cal_tiff_eval, 12.0, 3.0),
+    ]:
+        if evaluation["record"] is None:
+            reasons.append(f"{modality_name}_missing")
+            score -= missing_penalty
+            continue
+
+        normalized_score = min(evaluation["score"], 100.0) / 100.0
+        score += weight * normalized_score
+        reasons.extend(evaluation["reasons"])
+
+    score = max(0.0, min(score, 100.0))
+    return {
+        "score": round(score, 1),
+        "level": _confidence_level(score),
+        "reasons": _unique_reasons(reasons),
+    }
+
+
+def _apply_confidence_penalty(decision, penalty_points, reason):
+    decision["confidence"]["score"] = round(max(0.0, decision["confidence"]["score"] - penalty_points), 1)
+    decision["confidence"]["reasons"] = _unique_reasons(
+        decision["confidence"]["reasons"] + [reason]
+    )
+    decision["confidence"]["level"] = _confidence_level(decision["confidence"]["score"])
+
+
+def _nearest_timestamp_map(rgb_records, candidate_records):
+    mapping = {}
+    if not candidate_records:
+        return mapping
+
+    for rgb_record in rgb_records:
+        best_candidate = min(
+            candidate_records,
+            key=lambda candidate: _candidate_sort_key(rgb_record, candidate),
+        )
+        mapping[rgb_record["filepath"]] = {
+            "candidate_filepath": best_candidate["filepath"],
+            "time_delta": _time_delta_seconds(rgb_record["datetime"], best_candidate["datetime"]),
+        }
+    return mapping
+
+
+def _apply_neighbor_consistency(decisions, thermal_tiff_nearest_map):
+    accepted_decisions = [decision for decision in decisions if decision["status"].startswith("accepted")]
+    accepted_decisions.sort(
+        key=lambda decision: (
+            decision["rgb"]["index"] is None,
+            float("inf") if decision["rgb"]["index"] is None else decision["rgb"]["index"],
+            decision["rgb"]["datetime"],
+            decision["rgb"]["filename"],
+        )
+    )
+
+    for idx, decision in enumerate(accepted_decisions):
+        tiff_evaluation = decision["evaluations"]["thermal_tiff"]
+        if idx > 0 and idx < len(accepted_decisions) - 1:
+            prev_decision = accepted_decisions[idx - 1]
+            next_decision = accepted_decisions[idx + 1]
+            prev_tiff_eval = prev_decision["evaluations"]["thermal_tiff"]
+            next_tiff_eval = next_decision["evaluations"]["thermal_tiff"]
+
+            current_delta = float("inf") if tiff_evaluation["time_delta"] is None else tiff_evaluation["time_delta"]
+            prev_delta = float("inf") if prev_tiff_eval["time_delta"] is None else prev_tiff_eval["time_delta"]
+            next_delta = float("inf") if next_tiff_eval["time_delta"] is None else next_tiff_eval["time_delta"]
+
+            if (
+                current_delta > PAIR_TIME_TOLERANCE_SECONDS
+                and prev_delta <= PAIR_TIME_TOLERANCE_SECONDS
+                and next_delta <= PAIR_TIME_TOLERANCE_SECONDS
+            ):
+                _apply_confidence_penalty(decision, 12.0, "neighbor_timestamp_jump")
+
+            prev_rgb_index = prev_decision["rgb"]["index"]
+            current_rgb_index = decision["rgb"]["index"]
+            next_rgb_index = next_decision["rgb"]["index"]
+            prev_tiff_index = prev_decision["thermal_tiff"]["index"]
+            current_tiff_index = decision["thermal_tiff"]["index"]
+            next_tiff_index = next_decision["thermal_tiff"]["index"]
+            if all(
+                index is not None
+                for index in [
+                    prev_rgb_index,
+                    current_rgb_index,
+                    next_rgb_index,
+                    prev_tiff_index,
+                    current_tiff_index,
+                    next_tiff_index,
+                ]
+            ):
+                prev_offset = prev_tiff_index - prev_rgb_index
+                current_offset = current_tiff_index - current_rgb_index
+                next_offset = next_tiff_index - next_rgb_index
+                if prev_offset == next_offset and current_offset != prev_offset:
+                    _apply_confidence_penalty(decision, 10.0, "neighbor_index_pattern_break")
+
+            if (
+                not tiff_evaluation["numeric_match"]
+                and prev_tiff_eval["numeric_match"]
+                and next_tiff_eval["numeric_match"]
+            ):
+                _apply_confidence_penalty(decision, 8.0, "neighbors_support_numeric_pattern")
+
+    for current_decision, next_decision in zip(accepted_decisions, accepted_decisions[1:]):
+        current_best = thermal_tiff_nearest_map.get(current_decision["rgb"]["filepath"])
+        next_best = thermal_tiff_nearest_map.get(next_decision["rgb"]["filepath"])
+        if not current_best or not next_best:
+            continue
+        if current_best["candidate_filepath"] != next_best["candidate_filepath"]:
+            continue
+
+        current_delta = current_decision["evaluations"]["thermal_tiff"]["time_delta"]
+        next_delta = next_decision["evaluations"]["thermal_tiff"]["time_delta"]
+        current_delta = float("inf") if current_delta is None else current_delta
+        next_delta = float("inf") if next_delta is None else next_delta
+        lower_confidence_decision = current_decision if current_delta >= next_delta else next_decision
+        _apply_confidence_penalty(lower_confidence_decision, 8.0, "shared_best_timestamp_candidate_with_neighbor")
+
+
+def _finalize_pair_status(decision):
+    if decision["thermal_tiff"] is None:
+        decision["status"] = "skipped_missing_thermal_tiff"
+    elif decision["confidence"]["level"] == "HIGH":
+        decision["status"] = "accepted_high"
+    elif decision["confidence"]["level"] == "MEDIUM":
+        decision["status"] = "accepted_medium_review"
+    else:
+        decision["status"] = "accepted_low_review"
+        decision["confidence"]["reasons"] = _unique_reasons(
+            decision["confidence"]["reasons"] + ["accepted_low_no_better_candidate"]
+        )
+    decision["review_required"] = decision["status"] != "accepted_high"
+
+
+def _format_time_delta_for_csv(time_delta):
+    if time_delta is None:
+        return ""
+    return f"{time_delta:.3f}"
+
+
+def _pair_log_row(decision):
+    return {
+        "output_stem": decision.get("output_stem", ""),
+        "status": decision["status"],
+        "confidence_level": decision["confidence"]["level"],
+        "confidence_score": f"{decision['confidence']['score']:.1f}",
+        "detected_camera": decision.get("detected_camera", ""),
+        "camera_dimension_summary": decision.get("camera_dimension_summary", ""),
+        "camera_detection_reason": decision.get("camera_detection_reason", ""),
+        "calibration_profile_used": decision.get("calibration_profile_path", ""),
+        "rgb_filename": decision["rgb"]["filename"],
+        "rgb_index": "" if decision["rgb"]["index"] is None else decision["rgb"]["index"],
+        "thermal_jpg_filename": "" if decision["thermal_jpg"] is None else decision["thermal_jpg"]["filename"],
+        "thermal_tiff_filename": "" if decision["thermal_tiff"] is None else decision["thermal_tiff"]["filename"],
+        "cal_tiff_filename": "" if decision["cal_tiff"] is None else decision["cal_tiff"]["filename"],
+        "thermal_jpg_numeric_match": str(decision["evaluations"]["thermal_jpg"]["numeric_match"]),
+        "thermal_tiff_numeric_match": str(decision["evaluations"]["thermal_tiff"]["numeric_match"]),
+        "cal_tiff_numeric_match": str(decision["evaluations"]["cal_tiff"]["numeric_match"]),
+        "thermal_jpg_timestamp_delta_seconds": _format_time_delta_for_csv(
+            decision["evaluations"]["thermal_jpg"]["time_delta"]
+        ),
+        "thermal_tiff_timestamp_delta_seconds": _format_time_delta_for_csv(
+            decision["evaluations"]["thermal_tiff"]["time_delta"]
+        ),
+        "cal_tiff_timestamp_delta_seconds": _format_time_delta_for_csv(
+            decision["evaluations"]["cal_tiff"]["time_delta"]
+        ),
+        "thermal_jpg_match_strategy": decision["evaluations"]["thermal_jpg"]["strategy"],
+        "thermal_tiff_match_strategy": decision["evaluations"]["thermal_tiff"]["strategy"],
+        "cal_tiff_match_strategy": decision["evaluations"]["cal_tiff"]["strategy"],
+        "downgrade_reasons": " | ".join(decision["confidence"]["reasons"]),
+    }
+
+
+def _write_pairing_logs(output_root, decisions):
+    if not decisions:
+        return
+
+    fieldnames = list(_pair_log_row(decisions[0]).keys())
+    log_rows = [_pair_log_row(decision) for decision in decisions]
+    review_rows = [
+        row
+        for row in log_rows
+        if row["confidence_level"] in {"MEDIUM", "LOW"} or row["status"].startswith("skipped")
+    ]
+
+    with open(
+        os.path.join(output_root, PRESORTED_PAIRING_LOG_FILENAME),
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as log_file:
+        writer = csv.DictWriter(log_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(log_rows)
+
+    with open(
+        os.path.join(output_root, PRESORTED_PAIRING_REVIEW_FILENAME),
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as review_file:
+        writer = csv.DictWriter(review_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(review_rows)
 
 
 def _pair_presorted_records(rgb_records, thermal_jpg_records, thermal_tiff_records, cal_tiff_records):
-    pairs = []
+    decisions = []
     used_thermal_jpg = set()
     used_thermal_tiff = set()
     used_cal_tiff = set()
+    thermal_tiff_nearest_map = _nearest_timestamp_map(rgb_records, thermal_tiff_records)
 
-    for rgb_record in rgb_records:
-        thermal_tiff_record, tiff_match_type = _match_record(
-            rgb_record, thermal_tiff_records, used_thermal_tiff
+    ordered_rgb_records = sorted(
+        rgb_records,
+        key=lambda record: (
+            record["index"] is None,
+            float("inf") if record["index"] is None else record["index"],
+            record["datetime"],
+            record["filename"],
+        ),
+    )
+
+    for rgb_record in ordered_rgb_records:
+        thermal_tiff_evaluation = _select_candidate(
+            rgb_record,
+            thermal_tiff_records,
+            used_thermal_tiff,
+            "thermal_tiff",
         )
-        if thermal_tiff_record is None:
-            continue
-
-        thermal_jpg_record, jpg_match_type = _match_record(
-            rgb_record, thermal_jpg_records, used_thermal_jpg
+        thermal_jpg_evaluation = _select_candidate(
+            rgb_record,
+            thermal_jpg_records,
+            used_thermal_jpg,
+            "thermal_jpg",
         )
-        cal_tiff_record, cal_match_type = _match_record(
-            rgb_record, cal_tiff_records, used_cal_tiff
-        )
-
-        used_thermal_tiff.add(thermal_tiff_record["filepath"])
-        if thermal_jpg_record is not None:
-            used_thermal_jpg.add(thermal_jpg_record["filepath"])
-        if cal_tiff_record is not None:
-            used_cal_tiff.add(cal_tiff_record["filepath"])
-
-        pairs.append(
-            {
-                "rgb": rgb_record,
-                "thermal_jpg": thermal_jpg_record,
-                "thermal_tiff": thermal_tiff_record,
-                "cal_tiff": cal_tiff_record,
-                "match_types": {
-                    "thermal_jpg": jpg_match_type,
-                    "thermal_tiff": tiff_match_type,
-                    "cal_tiff": cal_match_type,
-                },
-            }
+        cal_tiff_evaluation = _select_candidate(
+            rgb_record,
+            cal_tiff_records,
+            used_cal_tiff,
+            "cal_tiff",
         )
 
-    return pairs
+        if thermal_tiff_evaluation["record"] is not None:
+            used_thermal_tiff.add(thermal_tiff_evaluation["record"]["filepath"])
+        if thermal_jpg_evaluation["record"] is not None:
+            used_thermal_jpg.add(thermal_jpg_evaluation["record"]["filepath"])
+        if cal_tiff_evaluation["record"] is not None:
+            used_cal_tiff.add(cal_tiff_evaluation["record"]["filepath"])
+
+        decision = {
+            "rgb": rgb_record,
+            "thermal_jpg": thermal_jpg_evaluation["record"],
+            "thermal_tiff": thermal_tiff_evaluation["record"],
+            "cal_tiff": cal_tiff_evaluation["record"],
+            "evaluations": {
+                "thermal_jpg": thermal_jpg_evaluation,
+                "thermal_tiff": thermal_tiff_evaluation,
+                "cal_tiff": cal_tiff_evaluation,
+            },
+            "match_types": {
+                "thermal_jpg": thermal_jpg_evaluation["strategy"],
+                "thermal_tiff": thermal_tiff_evaluation["strategy"],
+                "cal_tiff": cal_tiff_evaluation["strategy"],
+            },
+            "confidence": _pair_confidence(
+                rgb_record,
+                thermal_jpg_evaluation,
+                thermal_tiff_evaluation,
+                cal_tiff_evaluation,
+            ),
+            "output_stem": "",
+        }
+        _finalize_pair_status(decision)
+        decisions.append(decision)
+
+    _apply_neighbor_consistency(decisions, thermal_tiff_nearest_map)
+    for decision in decisions:
+        _finalize_pair_status(decision)
+
+    accepted_pairs = [decision for decision in decisions if decision["status"].startswith("accepted")]
+    confidence_counts = {
+        "HIGH": sum(1 for decision in accepted_pairs if decision["confidence"]["level"] == "HIGH"),
+        "MEDIUM": sum(1 for decision in accepted_pairs if decision["confidence"]["level"] == "MEDIUM"),
+        "LOW": sum(1 for decision in accepted_pairs if decision["confidence"]["level"] == "LOW"),
+    }
+
+    return {
+        "pairs": accepted_pairs,
+        "decisions": decisions,
+        "confidence_counts": confidence_counts,
+        "review_count": sum(1 for decision in decisions if decision["review_required"]),
+    }
 
 
 def analyze_presorted_standard(input_folder=None):
@@ -406,6 +2023,7 @@ def analyze_presorted_standard(input_folder=None):
         }
 
         for burn_set_id, burn_set in enumerate(dataset["burn_sets"], start=1):
+            burn_set_name = f"burn_set_{burn_set_id:03d}"
             if burn_set.get("layout") == "flat_mixed":
                 rgb_records = burn_set["rgb_records"]
                 thermal_jpg_records = burn_set["thermal_jpg_records"]
@@ -417,13 +2035,30 @@ def analyze_presorted_standard(input_folder=None):
                 thermal_tiff_records = _collect_media_records(burn_set["thermal_tiff_dir"])
                 cal_tiff_records = _collect_media_records(burn_set["cal_tiff_dir"])
 
-            pairs = _pair_presorted_records(
+            pairing_result = _pair_presorted_records(
                 rgb_records, thermal_jpg_records, thermal_tiff_records, cal_tiff_records
             )
+            pairs = pairing_result["pairs"]
+            camera_detection = detect_camera_from_rgb_records(rgb_records)
+            active_profile = load_calibration_profile(
+                camera_used=camera_detection["profile_camera"],
+                dataset_name=dataset["name"],
+                burn_set_name=burn_set_name,
+            )
+            camera_detection["profile_path"] = (
+                active_profile.get("profile_path", "") if active_profile is not None else ""
+            )
+            for pair in pairs:
+                pair["dataset_name"] = dataset["name"]
+                pair["burn_set_name"] = burn_set_name
+                pair["detected_camera"] = camera_detection["camera"]
+                pair["camera_detection_reason"] = camera_detection["reason"]
+                pair["camera_image_size"] = camera_detection["image_size"]
 
             dataset_entry["burn_sets"].append(
                 {
-                    "name": f"burn_set_{burn_set_id:03d}",
+                    "name": burn_set_name,
+                    "dataset_name": dataset["name"],
                     "source_root": burn_set["source_root"],
                     "layout": burn_set.get("layout", "nested"),
                     "rgb_count": len(rgb_records),
@@ -431,6 +2066,23 @@ def analyze_presorted_standard(input_folder=None):
                     "thermal_tiff_count": len(thermal_tiff_records),
                     "cal_tiff_count": len(cal_tiff_records),
                     "pair_count": len(pairs),
+                    "confidence_counts": pairing_result["confidence_counts"],
+                    "review_count": pairing_result["review_count"],
+                    "detected_camera": camera_detection["camera"],
+                    "camera_image_size": camera_detection["image_size"],
+                    "camera_dimension_summary": camera_detection.get("dimension_summary", ""),
+                    "camera_detection_reason": camera_detection["reason"],
+                    "correction_model": active_profile["selected_model"] if active_profile else "crop_only",
+                    "correction_rmse": (
+                        active_profile.get("selected_model_summary", {}).get("rmse")
+                        if active_profile is not None
+                        else None
+                    ),
+                    "calibration_profile_path": (
+                        active_profile.get("profile_path")
+                        if active_profile is not None
+                        else ""
+                    ),
                     "pairs": pairs,
                 }
             )
@@ -438,6 +2090,56 @@ def analyze_presorted_standard(input_folder=None):
         analysis.append(dataset_entry)
 
     return analysis
+
+
+def detect_processing_mode(input_folder=None):
+    effective_input_folder = os.path.abspath(input_folder if input_folder else INPUT_FOLDER)
+    if not os.path.isdir(effective_input_folder):
+        raise FileNotFoundError(f"Input folder does not exist: {effective_input_folder}")
+
+    if _discover_presorted_datasets(effective_input_folder):
+        return "PRESORTED_STANDARD"
+
+    for current_root, _, filenames in os.walk(effective_input_folder):
+        for filename in filenames:
+            ext = os.path.splitext(filename)[1].lower()
+            if ext in {".tif", ".tiff"}:
+                return "PRESORTED_STANDARD"
+            if ext in {".jpg", ".jpeg"} and _infer_standard_modality(os.path.join(current_root, filename)) is not None:
+                return "PRESORTED_STANDARD"
+
+    return "DJI_RAW"
+
+
+def run_sort_pipeline(input_folder=None, output_folder=None, processing_mode=None, progress_callback=None):
+    global INPUT_FOLDER
+    global OUTPUT_FOLDER
+    global PROCESSING_MODE
+
+    effective_input_folder = os.path.abspath(input_folder if input_folder else INPUT_FOLDER)
+    effective_output_folder = os.path.abspath(output_folder if output_folder else OUTPUT_FOLDER)
+    selected_mode = processing_mode or PROCESSING_MODE
+    if selected_mode == "AUTO":
+        selected_mode = detect_processing_mode(effective_input_folder)
+
+    INPUT_FOLDER = effective_input_folder
+    OUTPUT_FOLDER = effective_output_folder
+    PROCESSING_MODE = selected_mode
+
+    print(f"Detected processing mode: {selected_mode}")
+    if selected_mode == "PRESORTED_STANDARD":
+        return process_presorted_standard(
+            input_folder=effective_input_folder,
+            output_folder=effective_output_folder,
+            dry_run_only=False,
+            progress_callback=progress_callback,
+        )
+
+    if not INPUT_FOLDER.endswith(os.sep):
+        INPUT_FOLDER = INPUT_FOLDER + os.sep
+    if not OUTPUT_FOLDER.endswith(os.sep):
+        OUTPUT_FOLDER = OUTPUT_FOLDER + os.sep
+    return raw_file_sorting()
 
 
 def process_presorted_standard(input_folder=None, output_folder=None, dry_run_only=None, progress_callback=None):
@@ -453,8 +2155,9 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
 
     if not os.path.exists(effective_output_folder):
         os.makedirs(effective_output_folder)
+    _ensure_gitkeep(effective_output_folder)
 
-    if len(os.listdir(effective_output_folder)) > 0 and not effective_dry_run and RESUME_ID == 0:
+    if len(_meaningful_directory_entries(effective_output_folder)) > 0 and not effective_dry_run and RESUME_ID == 0:
         print("Error: Output folder is not empty. Make sure old data is removed before use.")
         sys.exit(1)
 
@@ -472,6 +2175,7 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
         print(f"Dataset: {dataset['name']} | burn sets detected: {len(dataset['burn_sets'])}")
 
         for burn_set_id, burn_set in enumerate(dataset["burn_sets"], start=1):
+            burn_set_name = f"burn_set_{burn_set_id:03d}"
             if burn_set.get("layout") == "flat_mixed":
                 rgb_records = burn_set["rgb_records"]
                 thermal_jpg_records = burn_set["thermal_jpg_records"]
@@ -483,16 +2187,56 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                 thermal_tiff_records = _collect_media_records(burn_set["thermal_tiff_dir"])
                 cal_tiff_records = _collect_media_records(burn_set["cal_tiff_dir"])
 
-            pairs = _pair_presorted_records(
+            pairing_result = _pair_presorted_records(
                 rgb_records, thermal_jpg_records, thermal_tiff_records, cal_tiff_records
             )
-
-            burn_set_name = f"burn_set_{burn_set_id:03d}"
+            pairs = pairing_result["pairs"]
+            camera_detection = detect_camera_from_rgb_records(rgb_records)
+            active_profile = load_calibration_profile(
+                camera_used=camera_detection["profile_camera"],
+                dataset_name=dataset["name"],
+                burn_set_name=burn_set_name,
+            )
+            camera_detection["profile_path"] = (
+                active_profile.get("profile_path", "") if active_profile is not None else ""
+            )
+            selected_correction_model = active_profile["selected_model"] if active_profile else "crop_only"
+            selected_correction_rmse = (
+                active_profile.get("selected_model_summary", {}).get("rmse")
+                if active_profile is not None
+                else None
+            )
             print(
                 f"  {burn_set_name}: source={burn_set['source_root']} | "
                 f"rgb={len(rgb_records)} thermal_jpg={len(thermal_jpg_records)} "
                 f"thermal_tiff={len(thermal_tiff_records)} cal_tiff={len(cal_tiff_records)} "
-                f"paired={len(pairs)}"
+                f"paired={len(pairs)} high={pairing_result['confidence_counts']['HIGH']} "
+                f"medium={pairing_result['confidence_counts']['MEDIUM']} "
+                f"low={pairing_result['confidence_counts']['LOW']} "
+                f"review={pairing_result['review_count']}"
+            )
+            print(
+                "    Detected camera: "
+                + camera_detection["camera"]
+                + (
+                    ""
+                    if not camera_detection.get("dimension_summary")
+                    else f" | image_dimensions={camera_detection['dimension_summary']}"
+                )
+            )
+            print(
+                "    Corrected FOV model: "
+                + selected_correction_model
+                + (
+                    ""
+                    if selected_correction_rmse is None
+                    else f" | calibration_rmse={selected_correction_rmse:.4f}px"
+                )
+                + (
+                    ""
+                    if not camera_detection.get("profile_path")
+                    else f" | calibration_profile={camera_detection['profile_path']}"
+                )
             )
 
             if effective_dry_run:
@@ -528,14 +2272,33 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                 )
 
             for pair_index, pair in enumerate(pairs, start=1):
+                pair["dataset_name"] = dataset["name"]
+                pair["burn_set_name"] = burn_set_name
+                pair["detected_camera"] = camera_detection["camera"]
+                pair["camera_detection_reason"] = camera_detection["reason"]
+                pair["camera_image_size"] = camera_detection["image_size"]
                 output_stem = f'{"0" * (OUTPUT_FILENAME_DIGITS - len(str(pair_index))) + str(pair_index)}'
+                pair["output_stem"] = output_stem
                 rgb_output_name = f"{output_stem}.JPG"
                 thermal_jpg_output_name = f"{output_stem}.JPG"
                 thermal_tiff_output_name = f"{output_stem}.TIFF"
 
                 shutil.copy(pair["rgb"]["filepath"], os.path.join(rgb_raw_output_dir, rgb_output_name))
 
-                corrected_rgb = _apply_rgb_fov_correction(pair["rgb"]["filepath"])
+                thermal_alignment_source = (
+                    pair["cal_tiff"]["filepath"]
+                    if pair["cal_tiff"] is not None
+                    else pair["thermal_tiff"]["filepath"]
+                )
+                corrected_rgb = _apply_rgb_fov_correction(
+                    pair["rgb"]["filepath"],
+                    thermal_source_path=thermal_alignment_source,
+                    use_experimental_shift=False,
+                    dataset_name=dataset["name"],
+                    burn_set_name=burn_set_name,
+                    calibration_profile=active_profile,
+                    camera_used=camera_detection["camera"],
+                )
                 if "exif" in corrected_rgb.info:
                     corrected_rgb.save(
                         os.path.join(rgb_corrected_output_dir, rgb_output_name),
@@ -574,6 +2337,21 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                         }
                     )
 
+            for decision in pairing_result["decisions"]:
+                decision["detected_camera"] = camera_detection["camera"]
+                decision["camera_dimension_summary"] = camera_detection.get("dimension_summary", "")
+                decision["camera_detection_reason"] = camera_detection["reason"]
+                decision["calibration_profile_path"] = camera_detection.get("profile_path", "")
+            _write_pairing_logs(burn_output_root, pairing_result["decisions"])
+            if EXPORT_ALIGNMENT_DEBUG_SAMPLES:
+                export_alignment_debug_samples(
+                    burn_output_root,
+                    dataset["name"],
+                    burn_set_name,
+                    pairs,
+                    calibration_profile=active_profile,
+                )
+
     print("PRESORTED_STANDARD processing complete.")
 
 def raw_file_sorting():
@@ -598,19 +2376,34 @@ def raw_file_sorting():
     print(f'Validating output filestructure -- time = {(time.time_ns()-t_start)/1e9:4.3f} seconds')
     if not os.path.exists(OUTPUT_FOLDER):
         os.makedirs(OUTPUT_FOLDER)
+    _ensure_gitkeep(OUTPUT_FOLDER)
     # check to see that the output directory is empty
-    if len(os.listdir(OUTPUT_FOLDER)) > 0 and RESUME_ID == 0:
+    if len(_meaningful_directory_entries(OUTPUT_FOLDER)) > 0 and RESUME_ID == 0:
         print(
             'Error: Output folder is not empty. Make sure old data is removed before use.')
         sys.exit(1)
     #If the output folder contains files and the resume ID is set to 0 or higher
-    elif len(os.listdir(OUTPUT_FOLDER)) > 0 and RESUME_ID >= 0:
+    elif len(_meaningful_directory_entries(OUTPUT_FOLDER)) > 0 and RESUME_ID >= 0:
         print(f'WARNING: Output dir not empty and Resume ID set to {RESUME_ID}. Proceed with caution.')
 
     # Loop through input folder, then loop through subfolders
     print(f'{len(os.listdir(INPUT_FOLDER))} subfolders detected! Starting processing now. -- time = {(time.time_ns()-t_start)/1e9:4.3f} seconds')
     for id_subfolder, subfolder in enumerate(os.listdir(INPUT_FOLDER)):
-        print(f'For subfolder {subfolder} [{id_subfolder+1}/{len(os.listdir(INPUT_FOLDER))}], {len(os.listdir(f"{INPUT_FOLDER}{subfolder}/"))} files detected. Starting processing. -- time = {(time.time_ns()-t_start)/1e9:4.3f} seconds')
+        subfolder_path = f"{INPUT_FOLDER}{subfolder}/"
+        print(f'For subfolder {subfolder} [{id_subfolder+1}/{len(os.listdir(INPUT_FOLDER))}], {len(os.listdir(subfolder_path))} files detected. Starting processing. -- time = {(time.time_ns()-t_start)/1e9:4.3f} seconds')
+        camera_detection = detect_camera_from_folder(subfolder_path, fallback_camera=CAMERA_USED)
+        local_camera_used = camera_detection["camera"]
+        calibration_profile = load_calibration_profile(
+            camera_used=local_camera_used,
+            dataset_name=subfolder,
+            burn_set_name="burn_set_001",
+        )
+        print(
+            f'\tDetected camera: {local_camera_used}'
+            + (f' | image_dimensions={camera_detection.get("dimension_summary", "")}' if camera_detection.get("dimension_summary") else '')
+            + (f' | calibration_profile={calibration_profile.get("profile_path", "")}' if calibration_profile else '')
+            + f' -- time = {(time.time_ns()-t_start)/1e9:4.3f} seconds'
+        )
 
         # create filename and datetime lists
         rgb_image_filenames = []
@@ -623,9 +2416,9 @@ def raw_file_sorting():
         ir_video_datetimes = []
 
         # iterate over all files in the input subfolders
-        for id_file, file in enumerate(os.listdir(f'{INPUT_FOLDER}{subfolder}/')):
+        for id_file, file in enumerate(os.listdir(subfolder_path)):
             # M30T Camera section
-            if CAMERA_USED == "M30T":
+            if local_camera_used == "M30T":
                 # check for .mp4 video file(s)
                 if file.endswith('.MP4'):
                     # Distinguish between RGB (W) and Thermal (T) labeled videos
@@ -667,7 +2460,7 @@ def raw_file_sorting():
                     # else: image is either screen or zoom, which are discarded for now.
                 # else: file is not a video or image and will be excluded
             # M2EA Camera section
-            elif CAMERA_USED == "M2EA":
+            elif local_camera_used == "M2EA":
                 # check for .mp4 video file(s)
                 if file.endswith('.MP4'):
                     # extract various video properties using get_video_properties()
@@ -830,32 +2623,27 @@ def raw_file_sorting():
                 tiff.close()
                 del temp_arr
 
-                # FOV CORRECTIONS HERE
-                rgb_img = Image.open(
-                    f'{INPUT_FOLDER}{subfolder}/{rgb_filename}')
-                # M30T camera images
-                if CAMERA_USED == "M30T":
-                    # NOTE: The following crop transform seems to work fairly well, though cannot deal w/ lens distortions.
-                    #       Crop params were found through iterative improvement (hence the many + & - terms). Aspect ratio must be preserved or a resize operation must occur to preserve 1:1 correlation.
-                    # Left, Upper, Right, Lower
-                    # crop image
-                    rgb_img = rgb_img.crop(
-                        (640+40-(60), 412+30+12, 4000-640-40-40-40-16-16+(40), 3000-412-30-30-30-12))
-                    # resize image
-                    rgb_img = rgb_img.resize((640, 512))
-                # M2EA camera images
-                elif CAMERA_USED == "M2EA":
-                    # rgb_img = rgb_img.crop((640+40-(60), 412+30+12, 4000-640-40-40-40-16-16+(40), 3000-412-30-30-30-12))
-                    #crop image
-                    rgb_img = rgb_img.crop(
-                        (1280+80, 824, 8000-1280+80, 6000-824))
-                    #resize image
-                    rgb_img = rgb_img.resize((640, 512))
+                thermal_alignment_source = f'{OUTPUT_FOLDER}{subfolder}/Images/Thermal/Celsius TIFF/{rgb_filename_n.split(".")[0]}.TIFF'
+                corrected_rgb = _apply_rgb_fov_correction(
+                    f'{INPUT_FOLDER}{subfolder}/{rgb_filename}',
+                    thermal_source_path=thermal_alignment_source,
+                    use_experimental_shift=False,
+                    dataset_name=subfolder,
+                    burn_set_name="burn_set_001",
+                    camera_used=local_camera_used,
+                    calibration_profile=calibration_profile,
+                )
 
-                # Copy cropped rgb image to output w/ orginal exif data
-                rgb_img.save(
-                    f'{OUTPUT_FOLDER}{subfolder}/Images/RGB/Corrected FOV/{rgb_filename_n}', exif=rgb_img.info['exif'])
-                rgb_img.close()
+                # Copy cropped/aligned rgb image to output w/ original exif data when available
+                corrected_rgb_output_path = f'{OUTPUT_FOLDER}{subfolder}/Images/RGB/Corrected FOV/{rgb_filename_n}'
+                if "exif" in corrected_rgb.info:
+                    corrected_rgb.save(
+                        corrected_rgb_output_path,
+                        exif=corrected_rgb.info["exif"],
+                    )
+                else:
+                    corrected_rgb.save(corrected_rgb_output_path)
+                corrected_rgb.close()
 
                 # Now copy original rgb image to output
                 shutil.copy(f'{INPUT_FOLDER}{subfolder}/{rgb_filename}',
@@ -877,7 +2665,8 @@ def raw_file_sorting():
 #main function, run the raw_file_sorting() function
 if __name__ == '__main__':
     configure_runtime()
-    if PROCESSING_MODE == "PRESORTED_STANDARD":
-        process_presorted_standard()
-    else:
-        raw_file_sorting()
+    run_sort_pipeline(
+        input_folder=INPUT_FOLDER,
+        output_folder=OUTPUT_FOLDER,
+        processing_mode=PROCESSING_MODE,
+    )

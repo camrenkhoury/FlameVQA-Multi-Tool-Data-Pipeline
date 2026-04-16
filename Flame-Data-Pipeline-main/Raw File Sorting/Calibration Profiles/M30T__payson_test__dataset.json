@@ -1,0 +1,262 @@
+{
+  "version": 1,
+  "camera": "M30T",
+  "scope": "dataset",
+  "dataset_name": "payson_test",
+  "burn_set_name": "sorted_output",
+  "output_size": [
+    640,
+    512
+  ],
+  "source_rgb_size": [
+    4000,
+    3000
+  ],
+  "baseline_crop_box": {
+    "left": 620,
+    "top": 454,
+    "right": 3248,
+    "bottom": 2486
+  },
+  "selected_model": "scale_translate",
+  "selected_model_summary": {
+    "name": "scale_translate",
+    "available": true,
+    "matrix": [
+      [
+        1.5609755516052246,
+        0.0,
+        -191.68292236328125
+      ],
+      [
+        0.0,
+        5.0,
+        -1056.0
+      ],
+      [
+        0.0,
+        0.0,
+        1.0
+      ]
+    ],
+    "rmse": 0.0,
+    "mean_error": 0.0,
+    "max_error": 0.0,
+    "point_count": 2,
+    "per_point_error": [
+      {
+        "point_id": "P001",
+        "error": 0.0
+      },
+      {
+        "point_id": "P002",
+        "error": 0.0
+      }
+    ],
+    "scale_x": 1.5609755516052246,
+    "scale_y": 5.0,
+    "translation_x": -191.68292236328125,
+    "translation_y": -1056.0
+  },
+  "crop_only_rmse": 27.68573570251465,
+  "selected_model_rmse": 0.0,
+  "rmse_improvement_vs_crop_only": 27.68573570251465,
+  "models": {
+    "crop_only": {
+      "name": "crop_only",
+      "available": true,
+      "matrix": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rmse": 27.68573570251465,
+      "mean_error": 26.157917022705078,
+      "max_error": 35.22782897949219,
+      "point_count": 2,
+      "per_point_error": [
+        {
+          "point_id": "P001",
+          "error": 35.22782897949219
+        },
+        {
+          "point_id": "P002",
+          "error": 17.0880069732666
+        }
+      ]
+    },
+    "translation": {
+      "name": "translation",
+      "available": true,
+      "matrix": [
+        [
+          1.0,
+          0.0,
+          -17.5
+        ],
+        [
+          0.0,
+          1.0,
+          18.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rmse": 11.67261791229248,
+      "mean_error": 11.67261791229248,
+      "max_error": 11.67261791229248,
+      "point_count": 2,
+      "per_point_error": [
+        {
+          "point_id": "P001",
+          "error": 11.67261791229248
+        },
+        {
+          "point_id": "P002",
+          "error": 11.67261791229248
+        }
+      ],
+      "translation_x": -17.5,
+      "translation_y": 18.0
+    },
+    "scale_translate": {
+      "name": "scale_translate",
+      "available": true,
+      "matrix": [
+        [
+          1.5609755516052246,
+          0.0,
+          -191.68292236328125
+        ],
+        [
+          0.0,
+          5.0,
+          -1056.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rmse": 0.0,
+      "mean_error": 0.0,
+      "max_error": 0.0,
+      "point_count": 2,
+      "per_point_error": [
+        {
+          "point_id": "P001",
+          "error": 0.0
+        },
+        {
+          "point_id": "P002",
+          "error": 0.0
+        }
+      ],
+      "scale_x": 1.5609755516052246,
+      "scale_y": 5.0,
+      "translation_x": -191.68292236328125,
+      "translation_y": -1056.0
+    },
+    "affine": {
+      "name": "affine",
+      "available": false,
+      "reason": "not_enough_points",
+      "matrix": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rmse": null,
+      "mean_error": null,
+      "max_error": null,
+      "point_count": 0,
+      "per_point_error": []
+    },
+    "homography": {
+      "name": "homography",
+      "available": false,
+      "reason": "not_enough_points",
+      "matrix": [
+        [
+          1.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          1.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "rmse": null,
+      "mean_error": null,
+      "max_error": null,
+      "point_count": 0,
+      "per_point_error": []
+    }
+  },
+  "control_points": [
+    {
+      "point_id": "P001",
+      "pair_label": "00063",
+      "source": [
+        290.0,
+        269.0
+      ],
+      "target": [
+        261.0,
+        289.0
+      ],
+      "source_basis": "crop_baseline"
+    },
+    {
+      "point_id": "P002",
+      "pair_label": "00063",
+      "source": [
+        331.0,
+        268.0
+      ],
+      "target": [
+        325.0,
+        284.0
+      ],
+      "source_basis": "crop_baseline"
+    }
+  ],
+  "notes": "Created with the Raw File Sorting GUI developer calibration tool.",
+  "created_at": "2026-04-09T20:40:45Z",
+  "updated_at": "2026-04-09T20:40:45Z"
+}
