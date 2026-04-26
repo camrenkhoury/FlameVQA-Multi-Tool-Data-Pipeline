@@ -69,10 +69,10 @@ HIGH_CONFIDENCE_THRESHOLD = 80.0
 MEDIUM_CONFIDENCE_THRESHOLD = 55.0
 
 CORRECTED_FOV_OUTPUT_SIZE = (640, 512)
-# Production output is intentionally crop-only for now. Saved calibration
-# matrices are useful for developer experiments, but bad profiles can visibly
-# distort the FLAME "Corrected FOV" output.
-FOV_CORRECTION_MODE = "CROP_ONLY"
+# Production Corrected FOV now uses guarded automatic alignment. AUTO_ALIGN
+# saves the same aligned RGB candidate that appears in the debug overlay when
+# confidence is HIGH; otherwise it falls back to the crop-only safety baseline.
+FOV_CORRECTION_MODE = "AUTO_ALIGN"
 VALID_FOV_CORRECTION_MODES = {
     "CROP_ONLY",
     "CALIBRATION_PROFILE",
@@ -125,7 +125,14 @@ QUARANTINE_INVALID_CALIBRATION_PROFILES = False
 CALIBRATION_PROFILE_VERSION = 1
 CALIBRATION_MODEL_SELECTION_ABSOLUTE_TOLERANCE_PX = 1.5
 CALIBRATION_MODEL_SELECTION_RELATIVE_TOLERANCE = 1.10
-CALIBRATION_ACCEPTABLE_RMSE_PX = 6.0
+CALIBRATION_ACCEPTABLE_RMSE_PX = 8.0
+CALIBRATION_RANSAC_REPROJECTION_THRESHOLD_PX = 5.0
+CALIBRATION_HOMOGRAPHY_RANSAC_THRESHOLDS_PX = [5.0, 8.0, 12.0, 20.0]
+CALIBRATION_HOMOGRAPHY_MIN_RMSE_IMPROVEMENT_PX = 0.5
+CALIBRATION_HOMOGRAPHY_MIN_MAX_ERROR_IMPROVEMENT_PX = 1.0
+CALIBRATION_HOMOGRAPHY_MIN_AREA_RATIO = 0.25
+CALIBRATION_HOMOGRAPHY_MAX_AREA_RATIO = 4.00
+CALIBRATION_HOMOGRAPHY_MAX_CORNER_EXTENSION_FRACTION = 1.00
 CALIBRATION_MIN_POINTS = {
     "crop_only": 1,
     "translation": 1,
@@ -532,6 +539,22 @@ def _model_summary(model_name, matrix, source_points, target_points, point_ids=N
     return summary
 
 
+def _inlier_details(inliers, point_count, ransac_threshold=None):
+    if inliers is None:
+        inlier_count = point_count
+    else:
+        inlier_count = int(np.count_nonzero(inliers))
+    return {
+        "inlier_count": inlier_count,
+        "inlier_ratio": float(inlier_count / max(point_count, 1)),
+        "ransac_reprojection_threshold_px": (
+            CALIBRATION_RANSAC_REPROJECTION_THRESHOLD_PX
+            if ransac_threshold is None
+            else float(ransac_threshold)
+        ),
+    }
+
+
 def _unavailable_model_summary(model_name, reason):
     return {
         "name": model_name,
@@ -642,7 +665,10 @@ def estimate_calibration_models(control_points):
         affine_matrix, inliers = cv2.estimateAffine2D(
             source_points.reshape(-1, 1, 2),
             target_points.reshape(-1, 1, 2),
-            method=cv2.LMEDS,
+            method=cv2.RANSAC,
+            ransacReprojThreshold=CALIBRATION_RANSAC_REPROJECTION_THRESHOLD_PX,
+            maxIters=2000,
+            confidence=0.995,
         )
         if affine_matrix is not None:
             affine_homography = np.vstack([affine_matrix, [0.0, 0.0, 1.0]]).astype(np.float32)
@@ -652,9 +678,7 @@ def estimate_calibration_models(control_points):
                 source_points,
                 target_points,
                 point_ids=point_ids,
-                estimation_details={
-                    "inlier_count": int(np.count_nonzero(inliers)) if inliers is not None else len(control_points),
-                },
+                estimation_details=_inlier_details(inliers, len(control_points)),
             )
         else:
             models["affine"] = _unavailable_model_summary("affine", "estimation_failed")
@@ -662,22 +686,35 @@ def estimate_calibration_models(control_points):
         models["affine"] = _unavailable_model_summary("affine", "not_enough_points")
 
     if len(control_points) >= CALIBRATION_MIN_POINTS["homography"]:
-        homography_matrix, inliers = cv2.findHomography(
-            source_points.reshape(-1, 1, 2),
-            target_points.reshape(-1, 1, 2),
-            method=0,
-        )
-        if homography_matrix is not None:
-            models["homography"] = _model_summary(
+        best_homography_summary = None
+        for ransac_threshold in CALIBRATION_HOMOGRAPHY_RANSAC_THRESHOLDS_PX:
+            homography_matrix, inliers = cv2.findHomography(
+                source_points.reshape(-1, 1, 2),
+                target_points.reshape(-1, 1, 2),
+                method=cv2.RANSAC,
+                ransacReprojThreshold=ransac_threshold,
+            )
+            if homography_matrix is None:
+                continue
+            candidate_summary = _model_summary(
                 "homography",
                 homography_matrix.astype(np.float32),
                 source_points,
                 target_points,
                 point_ids=point_ids,
-                estimation_details={
-                    "inlier_count": int(np.count_nonzero(inliers)) if inliers is not None else len(control_points),
-                },
+                estimation_details=_inlier_details(
+                    inliers,
+                    len(control_points),
+                    ransac_threshold=ransac_threshold,
+                ),
             )
+            if (
+                best_homography_summary is None
+                or candidate_summary["rmse"] < best_homography_summary["rmse"]
+            ):
+                best_homography_summary = candidate_summary
+        if best_homography_summary is not None:
+            models["homography"] = best_homography_summary
         else:
             models["homography"] = _unavailable_model_summary("homography", "estimation_failed")
     else:
@@ -695,14 +732,31 @@ def _select_best_calibration_model(models):
     if not available_models:
         return "crop_only", models.get("crop_only", _unavailable_model_summary("crop_only", "not_available"))
 
-    acceptable_models = [
-        model for model in available_models if model["rmse"] <= CALIBRATION_ACCEPTABLE_RMSE_PX
-    ]
-    if acceptable_models:
-        chosen_name = acceptable_models[0]["name"]
-        return chosen_name, models[chosen_name]
-
     best_rmse = min(model["rmse"] for model in available_models)
+    homography_model = models.get("homography")
+    simpler_models = [
+        model
+        for model in available_models
+        if model.get("name") != "homography" and model.get("rmse") is not None
+    ]
+    if homography_model and homography_model.get("available") and homography_model.get("rmse") is not None and simpler_models:
+        best_simpler_model = min(simpler_models, key=lambda model: model["rmse"])
+        homography_rmse_improvement = best_simpler_model["rmse"] - homography_model["rmse"]
+        homography_max_error_improvement = (
+            None
+            if best_simpler_model.get("max_error") is None or homography_model.get("max_error") is None
+            else best_simpler_model["max_error"] - homography_model["max_error"]
+        )
+        if (
+            homography_model["rmse"] <= CALIBRATION_ACCEPTABLE_RMSE_PX
+            and homography_rmse_improvement >= CALIBRATION_HOMOGRAPHY_MIN_RMSE_IMPROVEMENT_PX
+            and (
+                homography_max_error_improvement is None
+                or homography_max_error_improvement >= CALIBRATION_HOMOGRAPHY_MIN_MAX_ERROR_IMPROVEMENT_PX
+            )
+        ):
+            return "homography", homography_model
+
     for model_name in CALIBRATION_MODEL_ORDER:
         model = models.get(model_name)
         if not model or not model.get("available") or model.get("rmse") is None:
@@ -810,7 +864,7 @@ def validate_calibration_profile(profile_data):
         reasons.append("selected_model_matrix_missing")
     else:
         output_size = tuple(profile_data.get("output_size") or _get_output_size())
-        reasons.extend(_profile_transform_sanity_reasons(matrix, output_size))
+        reasons.extend(_profile_transform_sanity_reasons(matrix, output_size, model_name=selected_model))
 
     return len(reasons) == 0, _unique_reasons(reasons)
 
@@ -1302,7 +1356,64 @@ def _transform_geometry_summary(matrix, output_size):
     }
 
 
-def _profile_transform_sanity_reasons(matrix, output_size):
+def _signed_polygon_area(points):
+    points = np.asarray(points, dtype=np.float32)
+    if len(points) < 3:
+        return 0.0
+    x_values = points[:, 0]
+    y_values = points[:, 1]
+    return float(0.5 * np.sum(x_values * np.roll(y_values, -1) - y_values * np.roll(x_values, -1)))
+
+
+def _project_output_corners(matrix, output_size):
+    width, height = output_size
+    corners = np.asarray(
+        [
+            [0.0, 0.0],
+            [float(width), 0.0],
+            [float(width), float(height)],
+            [0.0, float(height)],
+        ],
+        dtype=np.float32,
+    )
+    return _transform_points(corners, matrix)
+
+
+def _homography_sanity_reasons(matrix, output_size):
+    reasons = []
+    matrix = np.asarray(matrix, dtype=np.float32)
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        return ["fallback_profile_invalid_homography_matrix"]
+
+    projected_corners = _project_output_corners(matrix, output_size)
+    if not np.all(np.isfinite(projected_corners)):
+        return ["fallback_profile_invalid_homography_corners"]
+
+    width, height = output_size
+    source_area = float(max(width * height, 1))
+    signed_area = _signed_polygon_area(projected_corners)
+    area_ratio = abs(signed_area) / source_area
+    if signed_area <= 0:
+        reasons.append("fallback_profile_orientation_flip")
+    if not (CALIBRATION_HOMOGRAPHY_MIN_AREA_RATIO <= area_ratio <= CALIBRATION_HOMOGRAPHY_MAX_AREA_RATIO):
+        reasons.append("fallback_profile_unrealistic_homography_area")
+
+    min_x = float(np.min(projected_corners[:, 0]))
+    min_y = float(np.min(projected_corners[:, 1]))
+    max_x = float(np.max(projected_corners[:, 0]))
+    max_y = float(np.max(projected_corners[:, 1]))
+    max_extension = max(0.0, -min_x, -min_y, max_x - float(width), max_y - float(height))
+    extension_fraction = max_extension / max(float(max(width, height)), 1.0)
+    if extension_fraction > CALIBRATION_HOMOGRAPHY_MAX_CORNER_EXTENSION_FRACTION:
+        reasons.append("fallback_profile_unrealistic_homography_extent")
+
+    return reasons
+
+
+def _profile_transform_sanity_reasons(matrix, output_size, model_name=None):
+    if str(model_name or "").lower() == "homography":
+        return _homography_sanity_reasons(matrix, output_size)
+
     geometry = _transform_geometry_summary(matrix, output_size)
     reasons = []
     if not (
@@ -1750,6 +1861,7 @@ def _apply_rgb_fov_correction(
             fallback_reasons = _profile_transform_sanity_reasons(
                 fallback_matrix,
                 debug_info["output_size"],
+                model_name=debug_info["available_profile_model"],
             )
             if fallback_reasons:
                 alignment_result["fallback_used"] = "crop_only"
@@ -1918,6 +2030,120 @@ def _blend_rgb_thermal_overlay(rgb_image, thermal_image, opacity=0.50):
     return Image.blend(rgb_base, thermal_gray, max(0.0, min(float(opacity), 1.0)))
 
 
+def _build_validation_comparison_grid(items):
+    panel_size = _get_output_size()
+    label_height = 44
+    gap = 20
+    visible_items = [(label, image) for label, image in items if image is not None]
+    if not visible_items:
+        return Image.new("RGB", panel_size, color=(245, 245, 245))
+
+    column_count = 2
+    row_count = int(np.ceil(len(visible_items) / column_count))
+    canvas_width = panel_size[0] * column_count + gap * (column_count + 1)
+    canvas_height = (panel_size[1] + label_height) * row_count + gap * (row_count + 1)
+    canvas = Image.new("RGB", (canvas_width, canvas_height), color=(245, 245, 245))
+    draw = ImageDraw.Draw(canvas)
+
+    for panel_index, (label, image) in enumerate(visible_items):
+        row = panel_index // column_count
+        col = panel_index % column_count
+        x = gap + col * (panel_size[0] + gap)
+        y = gap + row * (panel_size[1] + label_height + gap)
+        draw.text((x, y), label, fill=(0, 0, 0))
+        canvas.paste(_fit_image_to_panel(image, panel_size=panel_size), (x, y + label_height))
+
+    return canvas
+
+
+def _write_manual_calibration_model_metrics(debug_root, calibration_profile):
+    if not calibration_profile:
+        return None
+
+    model_metrics_path = os.path.join(debug_root, "manual_calibration_model_metrics.csv")
+    point_errors_path = os.path.join(debug_root, "manual_calibration_point_errors.csv")
+    model_fieldnames = [
+        "model",
+        "selected",
+        "available",
+        "reason",
+        "rmse",
+        "mean_error",
+        "max_error",
+        "point_count",
+        "inlier_count",
+        "inlier_ratio",
+        "ransac_reprojection_threshold_px",
+        "matrix",
+    ]
+    selected_model = calibration_profile.get("selected_model", "")
+    model_rows = []
+    point_error_rows = []
+    control_points = calibration_profile.get("control_points", [])
+    source_points = np.asarray([point["source"] for point in control_points], dtype=np.float32)
+    target_points = np.asarray([point["target"] for point in control_points], dtype=np.float32)
+    for model_name in CALIBRATION_MODEL_ORDER:
+        model = calibration_profile.get("models", {}).get(model_name, {})
+        model_rows.append(
+            {
+                "model": model_name,
+                "selected": str(model_name == selected_model),
+                "available": str(model.get("available", False)),
+                "reason": model.get("reason", ""),
+                "rmse": "" if model.get("rmse") is None else f"{model['rmse']:.4f}",
+                "mean_error": "" if model.get("mean_error") is None else f"{model['mean_error']:.4f}",
+                "max_error": "" if model.get("max_error") is None else f"{model['max_error']:.4f}",
+                "point_count": model.get("point_count", ""),
+                "inlier_count": model.get("inlier_count", ""),
+                "inlier_ratio": "" if model.get("inlier_ratio") is None else f"{model['inlier_ratio']:.4f}",
+                "ransac_reprojection_threshold_px": model.get("ransac_reprojection_threshold_px", ""),
+                "matrix": json.dumps(model.get("matrix", "")),
+            }
+        )
+        if model.get("available") and len(control_points):
+            predicted_points = _transform_points(source_points, model.get("matrix"))
+            errors = np.linalg.norm(predicted_points - target_points, axis=1)
+            for point_index, point in enumerate(control_points):
+                point_error_rows.append(
+                    {
+                        "model": model_name,
+                        "selected": str(model_name == selected_model),
+                        "point_id": point.get("point_id", str(point_index + 1)),
+                        "source_x": f"{source_points[point_index, 0]:.4f}",
+                        "source_y": f"{source_points[point_index, 1]:.4f}",
+                        "target_x": f"{target_points[point_index, 0]:.4f}",
+                        "target_y": f"{target_points[point_index, 1]:.4f}",
+                        "predicted_x": f"{predicted_points[point_index, 0]:.4f}",
+                        "predicted_y": f"{predicted_points[point_index, 1]:.4f}",
+                        "error": f"{errors[point_index]:.4f}",
+                    }
+                )
+
+    with open(model_metrics_path, "w", newline="", encoding="utf-8") as metrics_file:
+        writer = csv.DictWriter(metrics_file, fieldnames=model_fieldnames)
+        writer.writeheader()
+        writer.writerows(model_rows)
+
+    point_error_fieldnames = [
+        "model",
+        "selected",
+        "point_id",
+        "source_x",
+        "source_y",
+        "target_x",
+        "target_y",
+        "predicted_x",
+        "predicted_y",
+        "error",
+    ]
+    with open(point_errors_path, "w", newline="", encoding="utf-8") as point_file:
+        writer = csv.DictWriter(point_file, fieldnames=point_error_fieldnames)
+        writer.writeheader()
+        writer.writerows(point_error_rows)
+
+    return model_metrics_path
+
+
 def export_alignment_debug_samples(
     output_root,
     dataset_name,
@@ -1934,6 +2160,7 @@ def export_alignment_debug_samples(
     os.makedirs(debug_root, exist_ok=True)
     summary_path = os.path.join(debug_root, "correction_validation_summary.csv")
     candidate_summary_path = os.path.join(debug_root, "alignment_candidate_metrics.csv")
+    _write_manual_calibration_model_metrics(debug_root, calibration_profile)
     fieldnames = [
         "sample_index",
         "detected_camera",
@@ -1961,6 +2188,10 @@ def export_alignment_debug_samples(
         "alignment_mean_reprojection_error_px",
         "alignment_reasons",
         "auto_align_questionable_reasons",
+        "manual_calibration_model",
+        "manual_calibration_rmse",
+        "manual_calibration_improvement_vs_crop_only",
+        "manual_calibration_transform_matrix",
         "calibration_profile_path",
     ]
     candidate_fieldnames = [
@@ -2006,6 +2237,8 @@ def export_alignment_debug_samples(
             else pair["thermal_tiff"]["filepath"]
         )
         previous_mode = FOV_CORRECTION_MODE
+        manual_image = None
+        manual_debug = None
         try:
             globals()["FOV_CORRECTION_MODE"] = "CROP_ONLY"
             crop_only_image, crop_only_debug = _apply_rgb_fov_correction(
@@ -2029,6 +2262,18 @@ def export_alignment_debug_samples(
                 camera_used=pair.get("detected_camera"),
                 return_debug_info=True,
             )
+            if calibration_profile is not None:
+                globals()["FOV_CORRECTION_MODE"] = "CALIBRATION_PROFILE"
+                manual_image, manual_debug = _apply_rgb_fov_correction(
+                    pair["rgb"]["filepath"],
+                    thermal_source_path=thermal_shift_source_path,
+                    use_experimental_shift=False,
+                    dataset_name=dataset_name,
+                    burn_set_name=burn_set_name,
+                    calibration_profile=calibration_profile,
+                    camera_used=pair.get("detected_camera"),
+                    return_debug_info=True,
+                )
         finally:
             globals()["FOV_CORRECTION_MODE"] = previous_mode
 
@@ -2054,18 +2299,51 @@ def export_alignment_debug_samples(
         )
         crop_overlay = _blend_rgb_thermal_overlay(crop_only_image, thermal_overlay_source)
         auto_overlay = _blend_rgb_thermal_overlay(auto_align_image, thermal_overlay_source)
+        manual_overlay = (
+            _blend_rgb_thermal_overlay(manual_image, thermal_overlay_source)
+            if manual_image is not None
+            else None
+        )
         sample_prefix = f"sample_{sample_number:02d}"
         crop_only_image.save(os.path.join(debug_root, f"{sample_prefix}_crop_only_corrected_fov.png"))
         crop_overlay.save(os.path.join(debug_root, f"{sample_prefix}_overlay_crop_only_vs_thermal.png"))
         auto_overlay.save(os.path.join(debug_root, f"{sample_prefix}_overlay_auto_align_vs_thermal.png"))
         auto_align_image.save(os.path.join(debug_root, f"{sample_prefix}_auto_align_best.png"))
+        if manual_image is not None:
+            manual_image.save(os.path.join(debug_root, f"{sample_prefix}_manual_calibration.png"))
+            manual_overlay.save(os.path.join(debug_root, f"{sample_prefix}_overlay_manual_calibration_vs_thermal.png"))
+        comparison_grid = _build_validation_comparison_grid(
+            [
+                ("Crop-Only Corrected FOV", crop_only_image),
+                (f"AUTO_ALIGN / SIFT ({auto_align_debug['selected_model']})", auto_align_image),
+                (
+                    f"Manual Calibration ({manual_debug['selected_model']})"
+                    if manual_debug is not None
+                    else "Manual Calibration",
+                    manual_image,
+                ),
+                ("Thermal", thermal_overlay_source),
+            ]
+        )
+        comparison_grid.save(os.path.join(debug_root, f"{sample_prefix}_comparison_crop_sift_manual_thermal.png"))
+        comparison_grid.close()
         crop_overlay.close()
         auto_overlay.close()
+        if manual_overlay is not None:
+            manual_overlay.close()
         crop_only_image.close()
         auto_align_image.close()
+        if manual_image is not None:
+            manual_image.close()
         thermal_overlay_source.close()
 
         alignment = auto_align_debug.get("feature_alignment", _default_feature_alignment_result())
+        manual_summary = manual_debug.get("selected_model_summary", {}) if manual_debug is not None else {}
+        manual_improvement = (
+            None
+            if calibration_profile is None
+            else calibration_profile.get("rmse_improvement_vs_crop_only")
+        )
         for candidate_index, candidate in enumerate(auto_align_debug.get("alignment_candidates", []), start=1):
             candidate_rows.append(
                 {
@@ -2140,6 +2418,22 @@ def export_alignment_debug_samples(
             "alignment_reasons": " | ".join(alignment.get("reasons", [])),
             "auto_align_questionable_reasons": " | ".join(
                 alignment.get("auto_align_questionable_reasons", [])
+            ),
+            "manual_calibration_model": "" if manual_debug is None else manual_debug["selected_model"],
+            "manual_calibration_rmse": (
+                ""
+                if manual_summary.get("rmse") is None
+                else f"{manual_summary['rmse']:.4f}"
+            ),
+            "manual_calibration_improvement_vs_crop_only": (
+                ""
+                if manual_improvement is None
+                else f"{manual_improvement:.4f}"
+            ),
+            "manual_calibration_transform_matrix": (
+                ""
+                if manual_debug is None
+                else json.dumps(manual_debug["final_transform_matrix"])
             ),
             "calibration_profile_path": (
                 ""

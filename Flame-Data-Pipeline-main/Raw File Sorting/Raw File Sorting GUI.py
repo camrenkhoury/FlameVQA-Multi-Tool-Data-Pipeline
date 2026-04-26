@@ -577,7 +577,7 @@ class CalibrationProfileWindow:
         self.base_mode_var = tk.StringVar(value="Crop Baseline")
         self.scope_var = tk.StringVar(value="dataset")
         self.pair_label_var = tk.StringVar(value="")
-        self.pending_var = tk.StringVar(value="Click a source point, then the matching thermal point.")
+        self.pending_var = tk.StringVar(value="Click one source point and one thermal point in either order.")
         self.profile_summary_var = tk.StringVar(value="No calibration estimated yet.")
         self.profile_path_var = tk.StringVar(value="No saved calibration profile loaded.")
 
@@ -951,9 +951,31 @@ class CalibrationProfileWindow:
         )
         self.pending_source = None
         self.pending_target = None
-        self.pending_var.set("Click a source point, then the matching thermal point.")
+        self.pending_var.set("Click one source point and one thermal point in either order.")
         self._refresh_canvases()
         self._populate_point_tree()
+
+    def _complete_pending_control_point_if_ready(self):
+        if self.pending_source is None or self.pending_target is None:
+            return False
+
+        point_id = f"P{len(self.control_points) + 1:03d}"
+        self.control_points.append(
+            {
+                "point_id": point_id,
+                "pair_label": f"{self.current_pair_index + 1:05d}",
+                "source": list(self.pending_source["corrected_coords"]),
+                "target": list(self.pending_target["coords"]),
+                "source_basis": self.pending_source["basis"],
+            }
+        )
+        self.pending_source = None
+        self.pending_target = None
+        self.estimated_profile = None
+        self.pending_var.set(f"Added {point_id}. Click one source point and one thermal point in either order.")
+        self._populate_point_tree()
+        self._refresh_canvases()
+        return True
 
     def _handle_source_click(self, event):
         self._handle_source_click_for_state(event, self.current_source_state)
@@ -991,6 +1013,9 @@ class CalibrationProfileWindow:
                 "basis": "crop_baseline",
             }
 
+        if self._complete_pending_control_point_if_ready():
+            return
+
         self.pending_var.set("Source point recorded. Now click the matching point in the thermal image.")
         self._refresh_canvases()
 
@@ -1007,26 +1032,10 @@ class CalibrationProfileWindow:
             return
 
         self.pending_target = {"coords": (float(point[0]), float(point[1]))}
-        if self.pending_source is None:
-            self.pending_var.set("Thermal point recorded. Click a source point next.")
-            self._refresh_canvases()
+        if self._complete_pending_control_point_if_ready():
             return
 
-        point_id = f"P{len(self.control_points) + 1:03d}"
-        self.control_points.append(
-            {
-                "point_id": point_id,
-                "pair_label": f"{self.current_pair_index + 1:05d}",
-                "source": list(self.pending_source["corrected_coords"]),
-                "target": list(self.pending_target["coords"]),
-                "source_basis": self.pending_source["basis"],
-            }
-        )
-        self.pending_source = None
-        self.pending_target = None
-        self.estimated_profile = None
-        self.pending_var.set(f"Added {point_id}. Click the next source point, then the matching thermal point.")
-        self._populate_point_tree()
+        self.pending_var.set("Thermal point recorded. Click the matching source point next.")
         self._refresh_canvases()
 
     def _estimate_models(self):
@@ -1086,8 +1095,8 @@ class CalibrationProfileWindow:
         ttk.Label(
             outer,
             text=(
-                "Use this window for precise point picking. Click the source image first, then click the matching point "
-                "in the thermal image. The control-point list and model estimates stay synced with the developer calibration window."
+                "Use this window for precise point picking. Click one source point and one matching thermal point "
+                "in either order. The control-point list and model estimates stay synced with the developer calibration window."
             ),
             wraplength=1800,
         ).grid(row=0, column=1, sticky="e")
