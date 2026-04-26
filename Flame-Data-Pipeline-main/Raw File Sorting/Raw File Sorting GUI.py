@@ -1247,6 +1247,8 @@ class PairPreviewWindow:
         self.current_filtered_pos = 0
         self.images = {}
         self.source_images = {}
+        self.overlay_opacity_var = tk.DoubleVar(value=50.0)
+        self.metrics_var = tk.StringVar(value="AUTO_ALIGN metrics will appear after a pair is loaded.")
 
         self.window = tk.Toplevel(parent)
         self.window.title(f"Output Viewer - {burn_set['name']}")
@@ -1330,7 +1332,7 @@ class PairPreviewWindow:
         self.raw_overlay_canvas.bind("<Configure>", self._handle_resize)
         self.compare_canvas.bind("<Configure>", self._handle_resize)
 
-        ttk.Label(preview_area, text="Corrected FOV", font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky="w")
+        ttk.Label(preview_area, text="Crop-Only Corrected FOV", font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky="w")
         ttk.Label(preview_area, text="Thermal", font=("Segoe UI", 10, "bold")).grid(row=3, column=1, sticky="w")
 
         actions = ttk.LabelFrame(preview_area, text="Viewer Actions", padding=8)
@@ -1356,8 +1358,24 @@ class PairPreviewWindow:
         )
         self.calibration_tool_button.grid(row=0, column=3, sticky="ew", padx=(8, 0))
 
-        ttk.Label(preview_area, text="Raw RGB with Crop Outline", font=("Segoe UI", 10, "bold")).grid(row=6, column=0, sticky="w")
-        ttk.Label(preview_area, text="Raw vs Corrected FOV", font=("Segoe UI", 10, "bold")).grid(row=6, column=1, sticky="w")
+        ttk.Label(actions, text="Overlay Opacity").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Scale(
+            actions,
+            variable=self.overlay_opacity_var,
+            from_=0,
+            to=100,
+            orient="horizontal",
+            command=lambda value: self._refresh_validation_overlays(),
+        ).grid(row=1, column=1, columnspan=3, sticky="ew", pady=(8, 0))
+
+        ttk.Label(preview_area, text="Crop-Only vs Thermal Overlay", font=("Segoe UI", 10, "bold")).grid(row=6, column=0, sticky="w")
+        ttk.Label(preview_area, text="AUTO_ALIGN vs Thermal Overlay", font=("Segoe UI", 10, "bold")).grid(row=6, column=1, sticky="w")
+        ttk.Label(
+            preview_area,
+            textvariable=self.metrics_var,
+            wraplength=1200,
+            justify="left",
+        ).grid(row=7, column=0, columnspan=2, sticky="ew", pady=(8, 0))
 
         self._populate_pair_tree()
         if self.filtered_indices:
@@ -1389,8 +1407,8 @@ class PairPreviewWindow:
     def _refresh_canvases(self):
         self._draw_canvas_image(self.corrected_canvas, "corrected")
         self._draw_canvas_image(self.thermal_canvas, "thermal")
-        self._draw_canvas_image(self.raw_overlay_canvas, "raw_overlay")
-        self._draw_canvas_image(self.compare_canvas, "compare")
+        self._draw_canvas_image(self.raw_overlay_canvas, "crop_overlay")
+        self._draw_canvas_image(self.compare_canvas, "auto_overlay")
 
     def _handle_resize(self, event=None):
         if self.source_images:
@@ -1468,15 +1486,22 @@ class PairPreviewWindow:
             else pair["cal_tiff"]["filepath"] if pair["cal_tiff"] is not None else pair["thermal_tiff"]["filepath"]
         )
         self.current_thermal_source = thermal_source
-        corrected = self._load_preview_image(pair["rgb"]["filepath"], mode="rgb_corrected")
+        crop_only, crop_debug = self._load_corrected_with_mode(pair["rgb"]["filepath"], "CROP_ONLY")
+        auto_align, auto_debug = self._load_corrected_with_mode(pair["rgb"]["filepath"], "AUTO_ALIGN")
         thermal = self._load_preview_image(thermal_source, mode="thermal")
-        raw_overlay = self._build_raw_overlay_image(pair["rgb"]["filepath"])
-        compare_image = self._build_compare_image(pair["rgb"]["filepath"])
+        self.current_crop_only_image = crop_only
+        self.current_auto_align_image = auto_align
+        self.current_thermal_image = thermal
+        self.current_auto_align_debug = auto_debug
+        self.current_crop_debug = crop_debug
+        crop_overlay = self._build_thermal_overlay(crop_only, thermal)
+        auto_overlay = self._build_thermal_overlay(auto_align, thermal)
 
-        self.source_images["corrected"] = corrected
+        self.source_images["corrected"] = crop_only
         self.source_images["thermal"] = thermal
-        self.source_images["raw_overlay"] = raw_overlay
-        self.source_images["compare"] = compare_image
+        self.source_images["crop_overlay"] = crop_overlay
+        self.source_images["auto_overlay"] = auto_overlay
+        self._update_metrics_text(auto_debug)
         self._refresh_canvases()
 
         self.position_label.configure(
@@ -1517,6 +1542,69 @@ class PairPreviewWindow:
         else:
             img = img.convert("RGB")
         return img
+
+    def _load_corrected_with_mode(self, raw_path, mode):
+        previous_mode = self.sorter.FOV_CORRECTION_MODE
+        try:
+            self.sorter.FOV_CORRECTION_MODE = mode
+            corrected, debug_info = self.sorter._apply_rgb_fov_correction(
+                raw_path,
+                getattr(self, "current_thermal_source", None),
+                dataset_name=getattr(self, "current_dataset_name", None),
+                burn_set_name=getattr(self, "current_burn_set_name", None),
+                camera_used=getattr(self, "current_detected_camera", None),
+                return_debug_info=True,
+            )
+        finally:
+            self.sorter.FOV_CORRECTION_MODE = previous_mode
+
+        if corrected.mode not in ("RGB", "RGBA"):
+            corrected = corrected.convert("RGB")
+        return corrected.convert("RGB"), debug_info
+
+    def _build_thermal_overlay(self, rgb_image, thermal_image):
+        opacity = max(0.0, min(self.overlay_opacity_var.get() / 100.0, 1.0))
+        thermal = ImageOps.autocontrast(thermal_image.convert("L")).convert("RGB").resize(rgb_image.size, Image.LANCZOS)
+        return Image.blend(rgb_image.convert("RGB"), thermal, opacity)
+
+    def _refresh_validation_overlays(self):
+        if not all(
+            hasattr(self, attr)
+            for attr in ("current_crop_only_image", "current_auto_align_image", "current_thermal_image")
+        ):
+            return
+        self.source_images["crop_overlay"] = self._build_thermal_overlay(
+            self.current_crop_only_image,
+            self.current_thermal_image,
+        )
+        self.source_images["auto_overlay"] = self._build_thermal_overlay(
+            self.current_auto_align_image,
+            self.current_thermal_image,
+        )
+        self._refresh_canvases()
+
+    def _update_metrics_text(self, debug_info):
+        alignment = debug_info.get("feature_alignment", {})
+        reasons = " | ".join(alignment.get("reasons", [])) or "none"
+        questionable = " | ".join(alignment.get("auto_align_questionable_reasons", [])) or "none"
+        self.metrics_var.set(
+            "AUTO_ALIGN review: visually_better_unknown | "
+            f"model={alignment.get('transform_type', '')} | "
+            f"prep={alignment.get('representation', '')} | "
+            f"confidence={alignment.get('confidence_level', '')} | "
+            f"status={alignment.get('status', '')} | "
+            f"scale=({alignment.get('scale_x', 1.0):.4f}, {alignment.get('scale_y', 1.0):.4f}) | "
+            f"translation=({alignment.get('translation_x', 0.0):.1f}, {alignment.get('translation_y', 0.0):.1f}) | "
+            f"skew={alignment.get('skew_dot', 0.0):.4f} | "
+            f"rotation={alignment.get('rotation_degrees', 0.0):.2f} deg | "
+            f"inliers={alignment.get('inliers', 0)} | "
+            f"inlier_ratio={alignment.get('inlier_ratio', 0.0)} | "
+            f"inlier_grid_cells={alignment.get('inlier_grid_cells', 0)} | "
+            f"RMSE={alignment.get('mean_reprojection_error_px', '')} | "
+            f"fallback={alignment.get('fallback_used', '')} | "
+            f"reasons={reasons} | "
+            f"questionable={questionable}"
+        )
 
     def _get_crop_box(self, raw_path):
         raw = self._load_preview_image(raw_path, mode="rgb")
@@ -1892,10 +1980,14 @@ class RawSortingGui:
                         "detected_camera": camera_detection["camera"],
                         "camera_dimension_summary": camera_detection.get("dimension_summary", ""),
                         "camera_detection_reason": camera_detection["reason"],
-                        "correction_model": profile["selected_model"] if profile else "crop_only",
+                        "correction_model": (
+                            profile["selected_model"]
+                            if profile and sorter._get_fov_correction_mode() == "CALIBRATION_PROFILE"
+                            else sorter._get_fov_correction_mode().lower()
+                        ),
                         "correction_rmse": (
                             profile.get("selected_model_summary", {}).get("rmse")
-                            if profile is not None
+                            if profile is not None and sorter._get_fov_correction_mode() == "CALIBRATION_PROFILE"
                             else None
                         ),
                         "calibration_profile_path": profile.get("profile_path", "") if profile else "",

@@ -69,9 +69,59 @@ HIGH_CONFIDENCE_THRESHOLD = 80.0
 MEDIUM_CONFIDENCE_THRESHOLD = 55.0
 
 CORRECTED_FOV_OUTPUT_SIZE = (640, 512)
-CORRECTION_VALIDATION_SAMPLE_COUNT = 5
+# Production output is intentionally crop-only for now. Saved calibration
+# matrices are useful for developer experiments, but bad profiles can visibly
+# distort the FLAME "Corrected FOV" output.
+FOV_CORRECTION_MODE = "CROP_ONLY"
+VALID_FOV_CORRECTION_MODES = {
+    "CROP_ONLY",
+    "CALIBRATION_PROFILE",
+    "EXPERIMENTAL_SIFT",
+    "AUTO_ALIGN",
+    "AUTO_SIFT_CALIBRATED",
+}
+# Fractional crop tightening used by AUTO_ALIGN-style modes. This trims extra
+# scene content before feature matching so SIFT does not learn from regions
+# outside the thermal FOV. CROP_ONLY remains the unshrunk safety baseline.
+CROP_SHRINK_LEFT = 0.06
+CROP_SHRINK_RIGHT = 0.02
+CROP_SHRINK_TOP = 0.00
+CROP_SHRINK_BOTTOM = 0.00
+FEATURE_ALIGNMENT_MODEL = "auto"
+FEATURE_ALIGNMENT_MODEL_ORDER = ["similarity", "affine"]
+FEATURE_ALIGNMENT_ENABLE_HOMOGRAPHY = False
+FEATURE_ALIGNMENT_PREPROCESSING_VARIANTS = [
+    "clahe",
+    "edge_blend",
+    "sobel",
+    "canny",
+    "thermal_inverted_clahe",
+]
+FEATURE_ALIGNMENT_USE_EDGE_BLEND = True
+FEATURE_ALIGNMENT_EDGE_BLEND_WEIGHT = 0.35
+FEATURE_ALIGNMENT_MIN_GOOD_MATCHES = 20
+FEATURE_ALIGNMENT_MIN_INLIERS = 12
+FEATURE_ALIGNMENT_MIN_INLIER_RATIO = 0.35
+FEATURE_ALIGNMENT_GRID_SIZE = (4, 4)
+FEATURE_ALIGNMENT_MAX_MATCHES_PER_GRID_CELL = 8
+FEATURE_ALIGNMENT_MIN_MATCH_GRID_CELLS = 4
+FEATURE_ALIGNMENT_MIN_INLIER_GRID_CELLS = 3
+FEATURE_ALIGNMENT_MAX_MEAN_REPROJECTION_ERROR_PX = 8.0
+FEATURE_ALIGNMENT_MAX_HIGH_CONFIDENCE_REPROJECTION_ERROR_PX = 5.0
+FEATURE_ALIGNMENT_MIN_SCALE = 0.45
+FEATURE_ALIGNMENT_MAX_SCALE = 1.90
+FEATURE_ALIGNMENT_MAX_TRANSLATION_FRACTION = 0.45
+FEATURE_ALIGNMENT_MAX_SKEW_DOT = 0.55
+FEATURE_ALIGNMENT_RATIO_TEST = 0.75
+FEATURE_ALIGNMENT_USE_ECC_REFINEMENT = False
+FEATURE_ALIGNMENT_ECC_MAX_ITERATIONS = 80
+FEATURE_ALIGNMENT_ECC_EPSILON = 1e-5
+CORRECTION_VALIDATION_SAMPLE_COUNT = 20
 CORRECTION_VALIDATION_DIRNAME = "correction_validation"
+VISUAL_ALIGNMENT_REVIEW_DEFAULT = "visually_better_unknown"
 CALIBRATION_PROFILES_DIRNAME = "Calibration Profiles"
+INVALID_CALIBRATION_PROFILES_DIRNAME = "Invalid Calibration Profiles"
+QUARANTINE_INVALID_CALIBRATION_PROFILES = False
 CALIBRATION_PROFILE_VERSION = 1
 CALIBRATION_MODEL_SELECTION_ABSOLUTE_TOLERANCE_PX = 1.5
 CALIBRATION_MODEL_SELECTION_RELATIVE_TOLERANCE = 1.10
@@ -263,6 +313,23 @@ def _get_output_size():
     return tuple(int(value) for value in CORRECTED_FOV_OUTPUT_SIZE)
 
 
+def _get_fov_correction_mode():
+    mode = str(FOV_CORRECTION_MODE).upper()
+    if mode not in VALID_FOV_CORRECTION_MODES:
+        return "CROP_ONLY"
+    return mode
+
+
+def _mode_uses_feature_alignment(mode=None):
+    effective_mode = _get_fov_correction_mode() if mode is None else str(mode).upper()
+    return effective_mode in {"EXPERIMENTAL_SIFT", "AUTO_ALIGN", "AUTO_SIFT_CALIBRATED"}
+
+
+def _mode_allows_profile_fallback(mode=None):
+    effective_mode = _get_fov_correction_mode() if mode is None else str(mode).upper()
+    return effective_mode in {"EXPERIMENTAL_SIFT", "AUTO_ALIGN", "AUTO_SIFT_CALIBRATED"}
+
+
 def _get_baseline_crop_parameters(camera_used=None):
     camera_name = _camera_used(camera_used)
     parameters = CAMERA_BASELINE_CROP_BOXES.get(camera_name)
@@ -330,6 +397,44 @@ def _clamp_crop_box(left, top, right, bottom, width, height):
     right = min(width, right)
     bottom = min(height, bottom)
     return (int(left), int(top), int(right), int(bottom))
+
+
+def _apply_crop_shrink(crop_box, image_size, mode=None):
+    if not _mode_uses_feature_alignment(mode):
+        return tuple(int(value) for value in crop_box), {
+            "left": 0.0,
+            "right": 0.0,
+            "top": 0.0,
+            "bottom": 0.0,
+        }
+
+    width, height = image_size
+    left, top, right, bottom = crop_box
+    crop_width = max(right - left, 1)
+    crop_height = max(bottom - top, 1)
+    shrunk_box = _clamp_crop_box(
+        left + int(round(crop_width * CROP_SHRINK_LEFT)),
+        top + int(round(crop_height * CROP_SHRINK_TOP)),
+        right - int(round(crop_width * CROP_SHRINK_RIGHT)),
+        bottom - int(round(crop_height * CROP_SHRINK_BOTTOM)),
+        width,
+        height,
+    )
+
+    if shrunk_box[2] <= shrunk_box[0] or shrunk_box[3] <= shrunk_box[1]:
+        return tuple(int(value) for value in crop_box), {
+            "left": 0.0,
+            "right": 0.0,
+            "top": 0.0,
+            "bottom": 0.0,
+        }
+
+    return shrunk_box, {
+        "left": float(CROP_SHRINK_LEFT),
+        "right": float(CROP_SHRINK_RIGHT),
+        "top": float(CROP_SHRINK_TOP),
+        "bottom": float(CROP_SHRINK_BOTTOM),
+    }
 
 
 def _estimate_thermal_alignment_shift(thermal_source_path, crop_width, crop_height):
@@ -682,7 +787,56 @@ def _profile_filename(camera_used=None, dataset_name=None, burn_set_name=None, s
     return f"{camera_name}__{_sanitize_identifier(dataset_name)}__dataset.json"
 
 
+def validate_calibration_profile(profile_data):
+    reasons = []
+    if profile_data is None:
+        return False, ["profile_missing"]
+
+    selected_model = profile_data.get("selected_model", "crop_only")
+    selected_summary = profile_data.get("selected_model_summary") or profile_data.get("models", {}).get(selected_model)
+    if selected_model == "crop_only":
+        return True, []
+    if not selected_summary:
+        return False, ["selected_model_summary_missing"]
+
+    selected_rmse = selected_summary.get("rmse")
+    if selected_rmse is None:
+        reasons.append("selected_model_rmse_missing")
+    elif selected_rmse > CALIBRATION_ACCEPTABLE_RMSE_PX:
+        reasons.append(f"selected_model_rmse_high:{selected_rmse:.4f}")
+
+    matrix = selected_summary.get("matrix")
+    if matrix is None:
+        reasons.append("selected_model_matrix_missing")
+    else:
+        output_size = tuple(profile_data.get("output_size") or _get_output_size())
+        reasons.extend(_profile_transform_sanity_reasons(matrix, output_size))
+
+    return len(reasons) == 0, _unique_reasons(reasons)
+
+
+def _quarantine_invalid_profile(profile_path, reasons):
+    message = f"Ignoring invalid calibration profile {profile_path}: {' | '.join(reasons)}"
+    print(message)
+    if not QUARANTINE_INVALID_CALIBRATION_PROFILES:
+        return
+
+    invalid_root = SCRIPT_DIR / INVALID_CALIBRATION_PROFILES_DIRNAME
+    invalid_root.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.datetime.utcnow().strftime("%Y%m%dT%H%M%SZ")
+    target = invalid_root / f"{profile_path.stem}__invalid_{timestamp}{profile_path.suffix}"
+    shutil.move(str(profile_path), str(target))
+    print(f"Moved invalid calibration profile to {target}")
+
+
 def save_calibration_profile(profile_data):
+    is_valid, validation_reasons = validate_calibration_profile(profile_data)
+    if not is_valid:
+        raise ValueError(
+            "Calibration profile failed validation and was not saved: "
+            + " | ".join(validation_reasons)
+        )
+
     if profile_data.get("scope") == "camera_default":
         filename = _profile_filename(
             camera_used=profile_data.get("camera"),
@@ -747,6 +901,10 @@ def load_calibration_profile(camera_used=None, dataset_name=None, burn_set_name=
     for candidate_path in candidate_paths:
         profile = _load_profile_file(candidate_path)
         if profile is not None:
+            is_valid, validation_reasons = validate_calibration_profile(profile)
+            if not is_valid:
+                _quarantine_invalid_profile(candidate_path, validation_reasons)
+                continue
             profile["profile_path"] = str(candidate_path)
             return profile
     return None
@@ -810,6 +968,15 @@ def _get_crop_debug_info(
         camera_used=camera_used,
         calibration_profile=calibration_profile,
     )
+    if active_profile is not None:
+        profile_valid, profile_reasons = validate_calibration_profile(active_profile)
+        if not profile_valid:
+            print(
+                "Ignoring invalid active calibration profile: "
+                + " | ".join(profile_reasons)
+            )
+            active_profile = None
+    fov_correction_mode = _get_fov_correction_mode()
     base_crop_box = _rendered_baseline_crop_box(
         (width, height),
         camera_used=camera_used,
@@ -843,24 +1010,39 @@ def _get_crop_debug_info(
         width,
         height,
     )
+    final_crop_box, crop_shrink = _apply_crop_shrink(
+        final_crop_box,
+        (width, height),
+        mode=fov_correction_mode,
+    )
 
-    selected_model_name = "crop_only"
-    selected_model_summary = _model_summary(
+    crop_only_summary = _model_summary(
         "crop_only",
         _identity_transform_matrix(),
         np.asarray([[0.0, 0.0]], dtype=np.float32),
         np.asarray([[0.0, 0.0]], dtype=np.float32),
     )
+    selected_model_name = "crop_only"
+    selected_model_summary = crop_only_summary
+    profile_selected_model_name = ""
+    profile_selected_model_summary = None
     if active_profile is not None:
-        selected_model_name = active_profile.get("selected_model", "crop_only")
-        selected_model_summary = active_profile.get("models", {}).get(
-            selected_model_name,
-            active_profile.get("selected_model_summary", selected_model_summary),
+        profile_selected_model_name = active_profile.get("selected_model", "crop_only")
+        profile_selected_model_summary = active_profile.get("models", {}).get(
+            profile_selected_model_name,
+            active_profile.get("selected_model_summary", crop_only_summary),
         )
+
+    if fov_correction_mode == "CALIBRATION_PROFILE" and profile_selected_model_summary is not None:
+        selected_model_name = profile_selected_model_name
+        selected_model_summary = profile_selected_model_summary
+    elif _mode_uses_feature_alignment(fov_correction_mode):
+        selected_model_name = "auto_align"
 
     return {
         "rgb_size": (width, height),
         "base_crop_box": tuple(int(value) for value in base_crop_box),
+        "crop_shrink": crop_shrink,
         "applied_shift": (int(shift_x), int(shift_y)),
         "final_crop_box": final_crop_box,
         "used_experimental_shift": bool(use_shift),
@@ -870,9 +1052,16 @@ def _get_crop_debug_info(
         "dataset_name": dataset_name,
         "burn_set_name": burn_set_name,
         "calibration_profile": active_profile,
+        "fov_correction_mode": fov_correction_mode,
         "selected_model": selected_model_name,
         "selected_model_summary": _describe_selected_model(selected_model_name, selected_model_summary),
         "final_transform_matrix": selected_model_summary.get("matrix", _matrix_to_list(_identity_transform_matrix())),
+        "available_profile_model": profile_selected_model_name,
+        "available_profile_summary": (
+            None
+            if profile_selected_model_summary is None
+            else _describe_selected_model(profile_selected_model_name, profile_selected_model_summary)
+        ),
     }
 
 
@@ -915,6 +1104,599 @@ def _warp_corrected_image(corrected_image, transform_matrix, output_size):
     return Image.fromarray(warped)
 
 
+def _normalize_feature_array(image, variant="edge_blend", invert=False):
+    array = np.asarray(image)
+    if array.ndim == 3:
+        if cv2 is not None:
+            array = cv2.cvtColor(array[:, :, :3], cv2.COLOR_RGB2GRAY)
+        else:
+            array = np.asarray(Image.fromarray(array[:, :, :3]).convert("L"))
+
+    array = array.astype(np.float32)
+    finite = np.isfinite(array)
+    if not np.any(finite):
+        return np.zeros(array.shape, dtype=np.uint8)
+
+    valid_values = array[finite]
+    low, high = np.percentile(valid_values, [2, 98])
+    if high <= low:
+        low = float(valid_values.min())
+        high = float(valid_values.max())
+    if high <= low:
+        return np.zeros(array.shape, dtype=np.uint8)
+
+    normalized = np.clip((array - low) / (high - low), 0.0, 1.0)
+    normalized = (normalized * 255.0).astype(np.uint8)
+    if invert:
+        normalized = 255 - normalized
+
+    if cv2 is not None:
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        normalized = clahe.apply(normalized)
+        if variant == "clahe":
+            return normalized
+
+        sobel_x = cv2.Sobel(normalized, cv2.CV_32F, 1, 0, ksize=3)
+        sobel_y = cv2.Sobel(normalized, cv2.CV_32F, 0, 1, ksize=3)
+        gradient = cv2.magnitude(sobel_x, sobel_y)
+        gradient = cv2.normalize(gradient, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+        if variant == "sobel":
+            return gradient
+        if variant == "canny":
+            return cv2.Canny(normalized, 50, 150)
+        if variant == "edge_blend" and FEATURE_ALIGNMENT_USE_EDGE_BLEND:
+            return cv2.addWeighted(
+                normalized,
+                1.0 - FEATURE_ALIGNMENT_EDGE_BLEND_WEIGHT,
+                gradient,
+                FEATURE_ALIGNMENT_EDGE_BLEND_WEIGHT,
+                0,
+            )
+    return normalized
+
+
+def _default_feature_alignment_result(status="not_run"):
+    return {
+        "status": status,
+        "confidence_level": "LOW",
+        "fallback_used": "none",
+        "matrix": _matrix_to_list(_identity_transform_matrix()),
+        "keypoints_rgb": 0,
+        "keypoints_thermal": 0,
+        "good_matches": 0,
+        "inliers": 0,
+        "inlier_ratio": 0.0,
+        "match_grid_cells": 0,
+        "inlier_grid_cells": 0,
+        "mean_reprojection_error_px": None,
+        "max_reprojection_error_px": None,
+        "transform_type": FEATURE_ALIGNMENT_MODEL,
+        "scale_x": 1.0,
+        "scale_y": 1.0,
+        "scale_ratio": 1.0,
+        "rotation_degrees": 0.0,
+        "skew_dot": 0.0,
+        "determinant": 1.0,
+        "translation_x": 0.0,
+        "translation_y": 0.0,
+        "accepted": False,
+        "reasons": [],
+    }
+
+
+def _load_thermal_feature_image(thermal_source_path, output_size, variant="edge_blend", invert=False):
+    if not thermal_source_path or not os.path.exists(thermal_source_path):
+        return None
+
+    try:
+        with Image.open(thermal_source_path) as thermal_img:
+            thermal_array = _normalize_feature_array(thermal_img, variant=variant, invert=invert)
+    except Exception:
+        return None
+
+    if cv2 is None:
+        return thermal_array
+    return cv2.resize(
+        thermal_array,
+        tuple(int(value) for value in output_size),
+        interpolation=cv2.INTER_AREA,
+    )
+
+
+def _build_alignment_representation_pairs(corrected_crop_image, thermal_source_path, output_size):
+    representation_pairs = []
+    for variant in FEATURE_ALIGNMENT_PREPROCESSING_VARIANTS:
+        thermal_invert = variant == "thermal_inverted_clahe"
+        representation_variant = "clahe" if thermal_invert else variant
+        rgb_feature = _normalize_feature_array(
+            corrected_crop_image.convert("RGB"),
+            variant=representation_variant,
+            invert=False,
+        )
+        thermal_feature = _load_thermal_feature_image(
+            thermal_source_path,
+            output_size,
+            variant=representation_variant,
+            invert=thermal_invert,
+        )
+        if thermal_feature is None:
+            continue
+        representation_pairs.append(
+            {
+                "name": variant,
+                "rgb": rgb_feature,
+                "thermal": thermal_feature,
+            }
+        )
+    return representation_pairs
+
+
+def _project_points_with_matrix(points, matrix):
+    points = np.asarray(points, dtype=np.float32)
+    matrix = np.asarray(matrix, dtype=np.float32)
+    homogenous_points = np.column_stack([points, np.ones(len(points), dtype=np.float32)])
+    projected = homogenous_points @ matrix.T
+    denominators = projected[:, 2:3]
+    denominators[np.isclose(denominators, 0.0)] = 1.0
+    return projected[:, :2] / denominators
+
+
+def _grid_cell_for_point(point, image_size, grid_size=None):
+    grid_cols, grid_rows = grid_size or FEATURE_ALIGNMENT_GRID_SIZE
+    width, height = image_size
+    col = int(np.clip(point[0] / max(width, 1) * grid_cols, 0, grid_cols - 1))
+    row = int(np.clip(point[1] / max(height, 1) * grid_rows, 0, grid_rows - 1))
+    return (col, row)
+
+
+def _spatially_balance_matches(matches, rgb_keypoints, image_size):
+    grouped_matches = {}
+    for match in matches:
+        cell = _grid_cell_for_point(rgb_keypoints[match.queryIdx].pt, image_size)
+        grouped_matches.setdefault(cell, []).append(match)
+
+    balanced = []
+    for cell_matches in grouped_matches.values():
+        balanced.extend(
+            sorted(cell_matches, key=lambda match: match.distance)[
+                :FEATURE_ALIGNMENT_MAX_MATCHES_PER_GRID_CELL
+            ]
+        )
+
+    return sorted(balanced, key=lambda match: match.distance), len(grouped_matches)
+
+
+def _occupied_grid_cell_count(points, image_size):
+    if points is None or len(points) == 0:
+        return 0
+    return len({_grid_cell_for_point(point, image_size) for point in points})
+
+
+def _transform_geometry_summary(matrix, output_size):
+    matrix = np.asarray(matrix, dtype=np.float32)
+    linear = matrix[:2, :2]
+    first_axis = linear[:, 0]
+    second_axis = linear[:, 1]
+    scale_x = float(np.linalg.norm(first_axis))
+    scale_y = float(np.linalg.norm(second_axis))
+    if scale_x > 0 and scale_y > 0:
+        skew_dot = float(np.dot(first_axis / scale_x, second_axis / scale_y))
+    else:
+        skew_dot = 1.0
+    rotation_degrees = float(np.degrees(np.arctan2(linear[1, 0], linear[0, 0])))
+    translation_x = float(matrix[0, 2])
+    translation_y = float(matrix[1, 2])
+    translation_magnitude = float(np.hypot(translation_x, translation_y))
+    output_diagonal = float(np.hypot(output_size[0], output_size[1]))
+    determinant = float(np.linalg.det(linear))
+    return {
+        "scale_x": scale_x,
+        "scale_y": scale_y,
+        "scale_ratio": scale_x / max(scale_y, 0.0001),
+        "rotation_degrees": rotation_degrees,
+        "skew_dot": skew_dot,
+        "translation_x": translation_x,
+        "translation_y": translation_y,
+        "translation_fraction": translation_magnitude / max(output_diagonal, 1.0),
+        "determinant": determinant,
+    }
+
+
+def _profile_transform_sanity_reasons(matrix, output_size):
+    geometry = _transform_geometry_summary(matrix, output_size)
+    reasons = []
+    if not (
+        FEATURE_ALIGNMENT_MIN_SCALE <= geometry["scale_x"] <= FEATURE_ALIGNMENT_MAX_SCALE
+        and FEATURE_ALIGNMENT_MIN_SCALE <= geometry["scale_y"] <= FEATURE_ALIGNMENT_MAX_SCALE
+    ):
+        reasons.append("fallback_profile_unrealistic_scale")
+    if abs(geometry["skew_dot"]) > FEATURE_ALIGNMENT_MAX_SKEW_DOT:
+        reasons.append("fallback_profile_unrealistic_skew")
+    if geometry["translation_fraction"] > FEATURE_ALIGNMENT_MAX_TRANSLATION_FRACTION:
+        reasons.append("fallback_profile_unrealistic_translation")
+    if geometry["determinant"] <= 0:
+        reasons.append("fallback_profile_orientation_flip")
+    return reasons
+
+
+def _validate_feature_alignment_result(
+    result,
+    source_points,
+    target_points,
+    inlier_mask,
+    output_size,
+    source_image_size=None,
+    match_grid_cells=0,
+):
+    matrix = np.asarray(result["matrix"], dtype=np.float32)
+    inlier_mask = np.asarray(inlier_mask, dtype=bool).reshape(-1) if inlier_mask is not None else np.zeros(
+        len(source_points),
+        dtype=bool,
+    )
+    inlier_count = int(inlier_mask.sum())
+    good_matches = int(result["good_matches"])
+    inlier_ratio = inlier_count / max(good_matches, 1)
+    projected_points = _project_points_with_matrix(source_points, matrix)
+    errors = np.linalg.norm(projected_points - target_points, axis=1)
+    inlier_errors = errors[inlier_mask] if inlier_count else np.asarray([], dtype=np.float32)
+    mean_error = None if not len(inlier_errors) else float(inlier_errors.mean())
+    max_error = None if not len(inlier_errors) else float(inlier_errors.max())
+    geometry = _transform_geometry_summary(matrix, output_size)
+    inlier_grid_cells = _occupied_grid_cell_count(
+        source_points[inlier_mask] if inlier_count else [],
+        source_image_size or output_size,
+    )
+
+    reasons = []
+    if good_matches < FEATURE_ALIGNMENT_MIN_GOOD_MATCHES:
+        reasons.append("not_enough_good_matches")
+    if match_grid_cells < FEATURE_ALIGNMENT_MIN_MATCH_GRID_CELLS:
+        reasons.append("matches_not_spatially_distributed")
+    if inlier_count < FEATURE_ALIGNMENT_MIN_INLIERS:
+        reasons.append("not_enough_ransac_inliers")
+    if inlier_grid_cells < FEATURE_ALIGNMENT_MIN_INLIER_GRID_CELLS:
+        reasons.append("inliers_not_spatially_distributed")
+    if inlier_ratio < FEATURE_ALIGNMENT_MIN_INLIER_RATIO:
+        reasons.append("low_inlier_ratio")
+    if mean_error is None or mean_error > FEATURE_ALIGNMENT_MAX_MEAN_REPROJECTION_ERROR_PX:
+        reasons.append("high_reprojection_error")
+    if not (
+        FEATURE_ALIGNMENT_MIN_SCALE <= geometry["scale_x"] <= FEATURE_ALIGNMENT_MAX_SCALE
+        and FEATURE_ALIGNMENT_MIN_SCALE <= geometry["scale_y"] <= FEATURE_ALIGNMENT_MAX_SCALE
+    ):
+        reasons.append("unrealistic_scale")
+    if abs(geometry["skew_dot"]) > FEATURE_ALIGNMENT_MAX_SKEW_DOT:
+        reasons.append("unrealistic_skew")
+    if geometry["translation_fraction"] > FEATURE_ALIGNMENT_MAX_TRANSLATION_FRACTION:
+        reasons.append("unrealistic_translation")
+    if geometry["determinant"] <= 0:
+        reasons.append("orientation_flip")
+
+    confidence_level = "HIGH"
+    if reasons:
+        confidence_level = "LOW"
+    elif mean_error is not None and mean_error > FEATURE_ALIGNMENT_MAX_HIGH_CONFIDENCE_REPROJECTION_ERROR_PX:
+        confidence_level = "MEDIUM"
+
+    result.update(
+        {
+            "status": "ok" if confidence_level == "HIGH" else "alignment_low_confidence",
+            "confidence_level": confidence_level,
+            "inliers": inlier_count,
+            "inlier_ratio": round(inlier_ratio, 4),
+            "match_grid_cells": int(match_grid_cells),
+            "inlier_grid_cells": int(inlier_grid_cells),
+            "mean_reprojection_error_px": mean_error,
+            "max_reprojection_error_px": max_error,
+            "scale_x": geometry["scale_x"],
+            "scale_y": geometry["scale_y"],
+            "scale_ratio": geometry["scale_ratio"],
+            "rotation_degrees": geometry["rotation_degrees"],
+            "skew_dot": geometry["skew_dot"],
+            "determinant": geometry["determinant"],
+            "translation_x": geometry["translation_x"],
+            "translation_y": geometry["translation_y"],
+            "accepted": confidence_level == "HIGH",
+            "reasons": reasons,
+        }
+    )
+    return result
+
+
+def _alignment_model_order():
+    if FEATURE_ALIGNMENT_MODEL in {"similarity", "affine", "homography"}:
+        return [FEATURE_ALIGNMENT_MODEL]
+
+    models = list(FEATURE_ALIGNMENT_MODEL_ORDER)
+    if FEATURE_ALIGNMENT_ENABLE_HOMOGRAPHY and "homography" not in models:
+        models.append("homography")
+    return models
+
+
+def _estimate_transform_for_model(source_points, target_points, model_name):
+    if model_name == "similarity":
+        affine_matrix, inliers = cv2.estimateAffinePartial2D(
+            source_points.reshape(-1, 1, 2),
+            target_points.reshape(-1, 1, 2),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=4.0,
+        )
+        if affine_matrix is None:
+            return None, None
+        return np.vstack([affine_matrix, np.array([0.0, 0.0, 1.0], dtype=np.float32)]), inliers
+
+    if model_name == "affine":
+        affine_matrix, inliers = cv2.estimateAffine2D(
+            source_points.reshape(-1, 1, 2),
+            target_points.reshape(-1, 1, 2),
+            method=cv2.RANSAC,
+            ransacReprojThreshold=4.0,
+        )
+        if affine_matrix is None:
+            return None, None
+        return np.vstack([affine_matrix, np.array([0.0, 0.0, 1.0], dtype=np.float32)]), inliers
+
+    if model_name == "homography":
+        matrix, inliers = cv2.findHomography(
+            source_points.reshape(-1, 1, 2),
+            target_points.reshape(-1, 1, 2),
+            cv2.RANSAC,
+            4.0,
+        )
+        return matrix, inliers
+
+    return None, None
+
+
+def _refine_candidate_with_ecc(candidate, rgb_feature, thermal_feature, source_points, target_points, inliers, output_size):
+    if not FEATURE_ALIGNMENT_USE_ECC_REFINEMENT or candidate.get("transform_type") == "homography":
+        return candidate
+    if not candidate.get("accepted"):
+        return candidate
+
+    try:
+        rgb_float = rgb_feature.astype(np.float32) / 255.0
+        thermal_float = thermal_feature.astype(np.float32) / 255.0
+        initial_warp = np.asarray(candidate["matrix"], dtype=np.float32)[:2, :]
+        criteria = (
+            cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT,
+            FEATURE_ALIGNMENT_ECC_MAX_ITERATIONS,
+            FEATURE_ALIGNMENT_ECC_EPSILON,
+        )
+        ecc_score, refined_warp = cv2.findTransformECC(
+            thermal_float,
+            rgb_float,
+            initial_warp,
+            cv2.MOTION_AFFINE,
+            criteria,
+            None,
+            5,
+        )
+    except Exception as exc:
+        refined = dict(candidate)
+        refined["ecc_status"] = f"failed:{exc}"
+        return refined
+
+    refined_matrix = np.vstack([refined_warp, np.array([0.0, 0.0, 1.0], dtype=np.float32)])
+    refined = dict(candidate)
+    refined["matrix"] = _matrix_to_list(refined_matrix)
+    refined["ecc_status"] = "ok"
+    refined["ecc_score"] = float(ecc_score)
+    refined = _validate_feature_alignment_result(
+        refined,
+        source_points,
+        target_points,
+        inliers,
+        output_size,
+        source_image_size=output_size,
+        match_grid_cells=refined.get("match_grid_cells", 0),
+    )
+    original_error = candidate.get("mean_reprojection_error_px")
+    refined_error = refined.get("mean_reprojection_error_px")
+    if (
+        refined.get("accepted")
+        and refined_error is not None
+        and (original_error is None or refined_error <= original_error)
+    ):
+        refined["ecc_refined"] = True
+        return refined
+
+    rejected = dict(candidate)
+    rejected["ecc_status"] = "rejected"
+    rejected["ecc_score"] = float(ecc_score)
+    return rejected
+
+
+def _run_sift_alignment_candidate(rgb_feature, thermal_feature, representation_name, model_name, output_size):
+    result = _default_feature_alignment_result("not_run")
+    result["representation"] = representation_name
+    result["transform_type"] = model_name
+
+    if cv2 is None:
+        result["status"] = "opencv_unavailable"
+        result["reasons"] = ["opencv_unavailable"]
+        return result
+
+    sift = cv2.SIFT_create()
+    rgb_keypoints, rgb_descriptors = sift.detectAndCompute(rgb_feature, None)
+    thermal_keypoints, thermal_descriptors = sift.detectAndCompute(thermal_feature, None)
+    result["keypoints_rgb"] = len(rgb_keypoints or [])
+    result["keypoints_thermal"] = len(thermal_keypoints or [])
+    if rgb_descriptors is None or thermal_descriptors is None:
+        result["status"] = "descriptors_unavailable"
+        result["reasons"] = ["descriptors_unavailable"]
+        return result
+
+    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    raw_matches = matcher.knnMatch(rgb_descriptors, thermal_descriptors, k=2)
+    good_matches = []
+    for match_group in raw_matches:
+        if len(match_group) < 2:
+            continue
+        first, second = match_group
+        if first.distance < FEATURE_ALIGNMENT_RATIO_TEST * second.distance:
+            good_matches.append(first)
+
+    result["raw_good_matches"] = len(good_matches)
+    balanced_matches, match_grid_cells = _spatially_balance_matches(
+        good_matches,
+        rgb_keypoints,
+        output_size,
+    )
+    result["good_matches"] = len(balanced_matches)
+    result["match_grid_cells"] = match_grid_cells
+    if len(balanced_matches) < FEATURE_ALIGNMENT_MIN_GOOD_MATCHES:
+        result["status"] = "not_enough_good_matches"
+        result["reasons"] = ["not_enough_good_matches"]
+        return result
+
+    source_points = np.float32([rgb_keypoints[match.queryIdx].pt for match in balanced_matches])
+    target_points = np.float32([thermal_keypoints[match.trainIdx].pt for match in balanced_matches])
+    matrix, inliers = _estimate_transform_for_model(source_points, target_points, model_name)
+    if matrix is None:
+        result["status"] = "transform_estimation_failed"
+        result["reasons"] = ["transform_estimation_failed"]
+        return result
+
+    result["status"] = "ok"
+    result["matrix"] = _matrix_to_list(matrix)
+    result = _validate_feature_alignment_result(
+        result,
+        source_points,
+        target_points,
+        inliers,
+        output_size,
+        source_image_size=output_size,
+        match_grid_cells=match_grid_cells,
+    )
+    return _refine_candidate_with_ecc(
+        result,
+        rgb_feature,
+        thermal_feature,
+        source_points,
+        target_points,
+        inliers,
+        output_size,
+    )
+
+
+def _summarize_alignment_candidate(candidate):
+    summary = {}
+    for key, value in candidate.items():
+        if isinstance(value, np.generic):
+            value = value.item()
+        if key.startswith("_"):
+            continue
+        summary[key] = value
+    return summary
+
+
+def _select_best_alignment_candidate(candidates):
+    if not candidates:
+        return _default_feature_alignment_result("no_candidates")
+
+    model_rank = {"crop_only": 0, "similarity": 1, "affine": 2, "homography": 3}
+    accepted = [candidate for candidate in candidates if candidate.get("accepted")]
+    if accepted:
+        return sorted(
+            accepted,
+            key=lambda candidate: (
+                model_rank.get(candidate.get("transform_type"), 99),
+                candidate.get("mean_reprojection_error_px") or float("inf"),
+                -candidate.get("inlier_grid_cells", 0),
+                -candidate.get("inliers", 0),
+            ),
+        )[0]
+
+    return sorted(
+        candidates,
+        key=lambda candidate: (
+            candidate.get("confidence_level") == "HIGH",
+            candidate.get("confidence_level") == "MEDIUM",
+            candidate.get("inlier_grid_cells", 0),
+            candidate.get("inliers", 0),
+            candidate.get("inlier_ratio", 0.0),
+            -(candidate.get("mean_reprojection_error_px") or float("inf")),
+        ),
+        reverse=True,
+    )[0]
+
+
+def _auto_align_questionable_reasons(alignment_result):
+    reasons = []
+    if not alignment_result.get("accepted"):
+        reasons.append("auto_align_not_accepted")
+    if alignment_result.get("confidence_level") != "HIGH":
+        reasons.append("auto_align_not_high_confidence")
+    if alignment_result.get("inlier_grid_cells", 0) < max(FEATURE_ALIGNMENT_MIN_INLIER_GRID_CELLS + 1, 4):
+        reasons.append("edge_coverage_questionable")
+    scale_ratio = float(alignment_result.get("scale_ratio", 1.0))
+    if scale_ratio < 0.92 or scale_ratio > 1.08:
+        reasons.append("scale_ratio_questionable")
+    scale_x = float(alignment_result.get("scale_x", 1.0))
+    scale_y = float(alignment_result.get("scale_y", 1.0))
+    if abs(scale_x - scale_y) > 0.15:
+        reasons.append("nonuniform_scale_questionable")
+    if abs(float(alignment_result.get("skew_dot", 0.0))) > 0.15:
+        reasons.append("skew_questionable")
+    return _unique_reasons(reasons)
+
+
+def _estimate_sift_alignment_matrix(corrected_crop_image, thermal_source_path, output_size):
+    if cv2 is None:
+        result = _default_feature_alignment_result("opencv_unavailable")
+        result["reasons"] = ["opencv_unavailable"]
+        return result
+
+    representation_pairs = _build_alignment_representation_pairs(
+        corrected_crop_image,
+        thermal_source_path,
+        output_size,
+    )
+    if not representation_pairs:
+        result = _default_feature_alignment_result("thermal_unavailable")
+        result["reasons"] = ["thermal_unavailable"]
+        return result
+
+    candidates = []
+    for representation in representation_pairs:
+        for model_name in _alignment_model_order():
+            candidates.append(
+                _run_sift_alignment_candidate(
+                    representation["rgb"],
+                    representation["thermal"],
+                    representation["name"],
+                    model_name,
+                    output_size,
+                )
+            )
+
+    selected = dict(_select_best_alignment_candidate(candidates))
+    selected["candidate_count"] = len(candidates)
+    selected["alignment_candidates"] = [
+        _summarize_alignment_candidate(candidate) for candidate in candidates
+    ]
+    selected["auto_align_questionable_reasons"] = _auto_align_questionable_reasons(selected)
+    return selected
+
+
+def _apply_sift_alignment_to_color(corrected_crop_image, thermal_source_path, output_size):
+    alignment_result = _estimate_sift_alignment_matrix(
+        corrected_crop_image,
+        thermal_source_path,
+        output_size,
+    )
+    if alignment_result["status"] != "ok":
+        return corrected_crop_image.copy(), alignment_result
+
+    aligned = _warp_corrected_image(
+        corrected_crop_image,
+        alignment_result["matrix"],
+        output_size,
+    )
+    return aligned, alignment_result
+
+
 def _apply_rgb_fov_correction(
     rgb_source_path,
     thermal_source_path=None,
@@ -942,17 +1724,64 @@ def _apply_rgb_fov_correction(
             Image.LANCZOS,
         )
 
-    selected_model_summary = debug_info["selected_model_summary"]
-    final_image = _warp_corrected_image(
-        baseline_corrected,
-        selected_model_summary.get("matrix", _matrix_to_list(_identity_transform_matrix())),
-        debug_info["output_size"],
-    )
+    alignment_result = None
+    if debug_info["fov_correction_mode"] == "CALIBRATION_PROFILE":
+        selected_model_summary = debug_info["selected_model_summary"]
+        final_image = _warp_corrected_image(
+            baseline_corrected,
+            selected_model_summary.get("matrix", _matrix_to_list(_identity_transform_matrix())),
+            debug_info["output_size"],
+        )
+    elif _mode_uses_feature_alignment(debug_info["fov_correction_mode"]):
+        final_image, alignment_result = _apply_sift_alignment_to_color(
+            baseline_corrected,
+            thermal_source_path,
+            debug_info["output_size"],
+        )
+        debug_info["feature_alignment"] = alignment_result
+        debug_info["alignment_candidates"] = alignment_result.get("alignment_candidates", [])
+        if alignment_result["accepted"]:
+            debug_info["final_transform_matrix"] = alignment_result["matrix"]
+        elif _mode_allows_profile_fallback(debug_info["fov_correction_mode"]) and debug_info["available_profile_summary"] is not None:
+            fallback_matrix = debug_info["available_profile_summary"].get(
+                "matrix",
+                _matrix_to_list(_identity_transform_matrix()),
+            )
+            fallback_reasons = _profile_transform_sanity_reasons(
+                fallback_matrix,
+                debug_info["output_size"],
+            )
+            if fallback_reasons:
+                alignment_result["fallback_used"] = "crop_only"
+                alignment_result["reasons"] = _unique_reasons(
+                    alignment_result.get("reasons", []) + fallback_reasons
+                )
+                debug_info["selected_model"] = "experimental_sift_fallback_crop_only"
+                debug_info["final_transform_matrix"] = _matrix_to_list(_identity_transform_matrix())
+            else:
+                final_image.close()
+                final_image = _warp_corrected_image(
+                    baseline_corrected,
+                    fallback_matrix,
+                    debug_info["output_size"],
+                )
+                alignment_result["fallback_used"] = "calibration_profile"
+                debug_info["selected_model"] = "experimental_sift_fallback_calibration_profile"
+                debug_info["final_transform_matrix"] = fallback_matrix
+        else:
+            alignment_result["fallback_used"] = "crop_only"
+            debug_info["selected_model"] = "experimental_sift_fallback_crop_only"
+            debug_info["final_transform_matrix"] = _matrix_to_list(_identity_transform_matrix())
+    else:
+        final_image = baseline_corrected.copy()
+
     if exif_bytes:
         final_image.info["exif"] = exif_bytes
 
     if return_debug_info:
         debug_info["baseline_only_image_size"] = baseline_corrected.size
+        if alignment_result is None:
+            debug_info["feature_alignment"] = _default_feature_alignment_result()
         return final_image, debug_info
     return final_image
 
@@ -1056,6 +1885,39 @@ def _sample_pair_indices(pair_count, sample_count):
     return indices
 
 
+def _save_alignment_candidate_debug_images(debug_root, sample_number, rgb_path, thermal_path, debug_info):
+    sample_prefix = f"sample_{sample_number:02d}"
+    output_size = debug_info["output_size"]
+    with Image.open(rgb_path) as rgb_img:
+        crop_only = rgb_img.crop(debug_info["final_crop_box"]).resize(output_size, Image.LANCZOS).convert("RGB")
+    crop_only.save(os.path.join(debug_root, f"{sample_prefix}_crop_only.png"))
+
+    thermal_preview = _load_debug_preview_image(thermal_path)
+    _fit_image_to_panel(thermal_preview, panel_size=output_size).save(
+        os.path.join(debug_root, f"{sample_prefix}_thermal.png")
+    )
+    thermal_preview.close()
+
+    for candidate_index, candidate in enumerate(debug_info.get("alignment_candidates", []), start=1):
+        matrix = candidate.get("matrix")
+        if matrix is None:
+            continue
+        candidate_image = _warp_corrected_image(crop_only, matrix, output_size)
+        label = _sanitize_identifier(
+            f"{candidate_index:02d}_{candidate.get('representation', 'unknown')}_{candidate.get('transform_type', 'unknown')}_{candidate.get('confidence_level', 'low')}"
+        )
+        candidate_image.save(os.path.join(debug_root, f"{sample_prefix}_{label}.png"))
+        candidate_image.close()
+    crop_only.close()
+
+
+def _blend_rgb_thermal_overlay(rgb_image, thermal_image, opacity=0.50):
+    rgb_base = rgb_image.convert("RGB").resize(_get_output_size(), Image.LANCZOS)
+    thermal_base = thermal_image.convert("RGB").resize(rgb_base.size, Image.LANCZOS)
+    thermal_gray = ImageOps.autocontrast(thermal_base.convert("L")).convert("RGB")
+    return Image.blend(rgb_base, thermal_gray, max(0.0, min(float(opacity), 1.0)))
+
+
 def export_alignment_debug_samples(
     output_root,
     dataset_name,
@@ -1071,11 +1933,13 @@ def export_alignment_debug_samples(
     debug_root = os.path.join(output_root, CORRECTION_VALIDATION_DIRNAME)
     os.makedirs(debug_root, exist_ok=True)
     summary_path = os.path.join(debug_root, "correction_validation_summary.csv")
+    candidate_summary_path = os.path.join(debug_root, "alignment_candidate_metrics.csv")
     fieldnames = [
         "sample_index",
         "detected_camera",
         "rgb_filename",
         "thermal_preview_filename",
+        "visual_review_status",
         "base_crop_box",
         "crop_only_shift",
         "crop_only_final_crop_box",
@@ -1088,10 +1952,47 @@ def export_alignment_debug_samples(
         "scale_x",
         "scale_y",
         "final_transform_matrix",
+        "alignment_status",
+        "alignment_confidence_level",
+        "alignment_fallback_used",
+        "alignment_good_matches",
+        "alignment_inliers",
+        "alignment_inlier_ratio",
+        "alignment_mean_reprojection_error_px",
+        "alignment_reasons",
+        "auto_align_questionable_reasons",
         "calibration_profile_path",
+    ]
+    candidate_fieldnames = [
+        "sample_index",
+        "rgb_filename",
+        "candidate_index",
+        "representation",
+        "transform_type",
+        "status",
+        "confidence_level",
+        "accepted",
+        "raw_good_matches",
+        "good_matches",
+        "match_grid_cells",
+        "inliers",
+        "inlier_grid_cells",
+        "inlier_ratio",
+        "mean_reprojection_error_px",
+        "max_reprojection_error_px",
+        "scale_x",
+        "scale_y",
+        "scale_ratio",
+        "rotation_degrees",
+        "skew_dot",
+        "determinant",
+        "translation_x",
+        "translation_y",
+        "reasons",
     ]
 
     rows = []
+    candidate_rows = []
     for sample_number, pair_index in enumerate(_sample_pair_indices(len(pairs), sample_count), start=1):
         pair = pairs[pair_index]
         thermal_preview_path = (
@@ -1104,7 +2005,35 @@ def export_alignment_debug_samples(
             if pair["cal_tiff"] is not None
             else pair["thermal_tiff"]["filepath"]
         )
-        debug_image, crop_only_debug, final_debug = _build_alignment_debug_image(
+        previous_mode = FOV_CORRECTION_MODE
+        try:
+            globals()["FOV_CORRECTION_MODE"] = "CROP_ONLY"
+            crop_only_image, crop_only_debug = _apply_rgb_fov_correction(
+                pair["rgb"]["filepath"],
+                thermal_source_path=thermal_shift_source_path,
+                use_experimental_shift=False,
+                dataset_name=dataset_name,
+                burn_set_name=burn_set_name,
+                calibration_profile=None,
+                camera_used=pair.get("detected_camera"),
+                return_debug_info=True,
+            )
+            globals()["FOV_CORRECTION_MODE"] = "AUTO_ALIGN"
+            auto_align_image, auto_align_debug = _apply_rgb_fov_correction(
+                pair["rgb"]["filepath"],
+                thermal_source_path=thermal_shift_source_path,
+                use_experimental_shift=False,
+                dataset_name=dataset_name,
+                burn_set_name=burn_set_name,
+                calibration_profile=calibration_profile,
+                camera_used=pair.get("detected_camera"),
+                return_debug_info=True,
+            )
+        finally:
+            globals()["FOV_CORRECTION_MODE"] = previous_mode
+
+        thermal_overlay_source = _load_debug_preview_image(thermal_preview_path)
+        debug_image, _, _ = _build_alignment_debug_image(
             pair["rgb"]["filepath"],
             thermal_preview_path,
             thermal_shift_source_path,
@@ -1116,32 +2045,106 @@ def export_alignment_debug_samples(
         debug_image_path = os.path.join(debug_root, f"sample_{sample_number:02d}.png")
         debug_image.save(debug_image_path)
         debug_image.close()
+        _save_alignment_candidate_debug_images(
+            debug_root,
+            sample_number,
+            pair["rgb"]["filepath"],
+            thermal_preview_path,
+            auto_align_debug,
+        )
+        crop_overlay = _blend_rgb_thermal_overlay(crop_only_image, thermal_overlay_source)
+        auto_overlay = _blend_rgb_thermal_overlay(auto_align_image, thermal_overlay_source)
+        sample_prefix = f"sample_{sample_number:02d}"
+        crop_only_image.save(os.path.join(debug_root, f"{sample_prefix}_crop_only_corrected_fov.png"))
+        crop_overlay.save(os.path.join(debug_root, f"{sample_prefix}_overlay_crop_only_vs_thermal.png"))
+        auto_overlay.save(os.path.join(debug_root, f"{sample_prefix}_overlay_auto_align_vs_thermal.png"))
+        auto_align_image.save(os.path.join(debug_root, f"{sample_prefix}_auto_align_best.png"))
+        crop_overlay.close()
+        auto_overlay.close()
+        crop_only_image.close()
+        auto_align_image.close()
+        thermal_overlay_source.close()
 
+        alignment = auto_align_debug.get("feature_alignment", _default_feature_alignment_result())
+        for candidate_index, candidate in enumerate(auto_align_debug.get("alignment_candidates", []), start=1):
+            candidate_rows.append(
+                {
+                    "sample_index": sample_number,
+                    "rgb_filename": pair["rgb"]["filename"],
+                    "candidate_index": candidate_index,
+                    "representation": candidate.get("representation", ""),
+                    "transform_type": candidate.get("transform_type", ""),
+                    "status": candidate.get("status", ""),
+                    "confidence_level": candidate.get("confidence_level", ""),
+                    "accepted": str(candidate.get("accepted", False)),
+                    "raw_good_matches": candidate.get("raw_good_matches", ""),
+                    "good_matches": candidate.get("good_matches", ""),
+                    "match_grid_cells": candidate.get("match_grid_cells", ""),
+                    "inliers": candidate.get("inliers", ""),
+                    "inlier_grid_cells": candidate.get("inlier_grid_cells", ""),
+                    "inlier_ratio": candidate.get("inlier_ratio", ""),
+                    "mean_reprojection_error_px": (
+                        ""
+                        if candidate.get("mean_reprojection_error_px") is None
+                        else f"{candidate['mean_reprojection_error_px']:.4f}"
+                    ),
+                    "max_reprojection_error_px": (
+                        ""
+                        if candidate.get("max_reprojection_error_px") is None
+                        else f"{candidate['max_reprojection_error_px']:.4f}"
+                    ),
+                    "scale_x": f"{candidate.get('scale_x', 1.0):.6f}",
+                    "scale_y": f"{candidate.get('scale_y', 1.0):.6f}",
+                    "scale_ratio": f"{candidate.get('scale_ratio', 1.0):.6f}",
+                    "rotation_degrees": f"{candidate.get('rotation_degrees', 0.0):.4f}",
+                    "skew_dot": f"{candidate.get('skew_dot', 0.0):.6f}",
+                    "determinant": f"{candidate.get('determinant', 1.0):.6f}",
+                    "translation_x": f"{candidate.get('translation_x', 0.0):.4f}",
+                    "translation_y": f"{candidate.get('translation_y', 0.0):.4f}",
+                    "reasons": " | ".join(candidate.get("reasons", [])),
+                }
+            )
         row = {
             "sample_index": sample_number,
             "detected_camera": pair.get("detected_camera", ""),
             "rgb_filename": pair["rgb"]["filename"],
             "thermal_preview_filename": os.path.basename(thermal_preview_path),
+            "visual_review_status": VISUAL_ALIGNMENT_REVIEW_DEFAULT,
             "base_crop_box": str(crop_only_debug["base_crop_box"]),
             "crop_only_shift": str(crop_only_debug["applied_shift"]),
             "crop_only_final_crop_box": str(crop_only_debug["final_crop_box"]),
-            "final_shift": str(final_debug["applied_shift"]),
-            "final_final_crop_box": str(final_debug["final_crop_box"]),
-            "selected_model": final_debug["selected_model"],
+            "final_shift": str(auto_align_debug["applied_shift"]),
+            "final_final_crop_box": str(auto_align_debug["final_crop_box"]),
+            "selected_model": auto_align_debug["selected_model"],
             "selected_model_rmse": (
                 ""
-                if final_debug["selected_model_summary"]["rmse"] is None
-                else f"{final_debug['selected_model_summary']['rmse']:.4f}"
+                if auto_align_debug["selected_model_summary"]["rmse"] is None
+                else f"{auto_align_debug['selected_model_summary']['rmse']:.4f}"
             ),
-            "translation_x": f"{final_debug['selected_model_summary']['translation_x']:.4f}",
-            "translation_y": f"{final_debug['selected_model_summary']['translation_y']:.4f}",
-            "scale_x": f"{final_debug['selected_model_summary']['scale_x']:.6f}",
-            "scale_y": f"{final_debug['selected_model_summary']['scale_y']:.6f}",
-            "final_transform_matrix": json.dumps(final_debug["selected_model_summary"]["matrix"]),
+            "translation_x": f"{alignment.get('translation_x', 0.0):.4f}",
+            "translation_y": f"{alignment.get('translation_y', 0.0):.4f}",
+            "scale_x": f"{alignment.get('scale_x', 1.0):.6f}",
+            "scale_y": f"{alignment.get('scale_y', 1.0):.6f}",
+            "final_transform_matrix": json.dumps(auto_align_debug["final_transform_matrix"]),
+            "alignment_status": alignment.get("status", ""),
+            "alignment_confidence_level": alignment.get("confidence_level", ""),
+            "alignment_fallback_used": alignment.get("fallback_used", ""),
+            "alignment_good_matches": alignment.get("good_matches", ""),
+            "alignment_inliers": alignment.get("inliers", ""),
+            "alignment_inlier_ratio": alignment.get("inlier_ratio", ""),
+            "alignment_mean_reprojection_error_px": (
+                ""
+                if alignment.get("mean_reprojection_error_px") is None
+                else f"{alignment['mean_reprojection_error_px']:.4f}"
+            ),
+            "alignment_reasons": " | ".join(alignment.get("reasons", [])),
+            "auto_align_questionable_reasons": " | ".join(
+                alignment.get("auto_align_questionable_reasons", [])
+            ),
             "calibration_profile_path": (
                 ""
-                if final_debug["calibration_profile"] is None
-                else final_debug["calibration_profile"].get("profile_path", "")
+                if auto_align_debug["calibration_profile"] is None
+                else auto_align_debug["calibration_profile"].get("profile_path", "")
             ),
         }
         rows.append(row)
@@ -1156,6 +2159,11 @@ def export_alignment_debug_samples(
         writer = csv.DictWriter(summary_file, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
+
+    with open(candidate_summary_path, "w", newline="", encoding="utf-8") as candidate_file:
+        writer = csv.DictWriter(candidate_file, fieldnames=candidate_fieldnames)
+        writer.writeheader()
+        writer.writerows(candidate_rows)
 
     return debug_root
 
@@ -1852,6 +2860,7 @@ def _format_time_delta_for_csv(time_delta):
 
 
 def _pair_log_row(decision):
+    alignment = decision.get("feature_alignment", _default_feature_alignment_result())
     return {
         "output_stem": decision.get("output_stem", ""),
         "status": decision["status"],
@@ -1860,7 +2869,44 @@ def _pair_log_row(decision):
         "detected_camera": decision.get("detected_camera", ""),
         "camera_dimension_summary": decision.get("camera_dimension_summary", ""),
         "camera_detection_reason": decision.get("camera_detection_reason", ""),
-        "calibration_profile_used": decision.get("calibration_profile_path", ""),
+        "fov_correction_mode": decision.get("fov_correction_mode", _get_fov_correction_mode()),
+        "final_crop_box": str(decision.get("final_crop_box", "")),
+        "crop_shrink": str(decision.get("crop_shrink", "")),
+        "calibration_profile_available": decision.get("calibration_profile_path", ""),
+        "alignment_status": alignment.get("status", ""),
+        "alignment_confidence_level": alignment.get("confidence_level", ""),
+        "alignment_fallback_used": alignment.get("fallback_used", ""),
+        "alignment_representation": alignment.get("representation", ""),
+        "alignment_candidate_count": alignment.get("candidate_count", ""),
+        "alignment_transform_type": alignment.get("transform_type", ""),
+        "alignment_raw_good_matches": alignment.get("raw_good_matches", ""),
+        "alignment_good_matches": alignment.get("good_matches", ""),
+        "alignment_inliers": alignment.get("inliers", ""),
+        "alignment_inlier_ratio": alignment.get("inlier_ratio", ""),
+        "alignment_match_grid_cells": alignment.get("match_grid_cells", ""),
+        "alignment_inlier_grid_cells": alignment.get("inlier_grid_cells", ""),
+        "alignment_mean_reprojection_error_px": (
+            ""
+            if alignment.get("mean_reprojection_error_px") is None
+            else f"{alignment['mean_reprojection_error_px']:.4f}"
+        ),
+        "alignment_max_reprojection_error_px": (
+            ""
+            if alignment.get("max_reprojection_error_px") is None
+            else f"{alignment['max_reprojection_error_px']:.4f}"
+        ),
+        "alignment_scale_x": f"{alignment.get('scale_x', 1.0):.6f}",
+        "alignment_scale_y": f"{alignment.get('scale_y', 1.0):.6f}",
+        "alignment_scale_ratio": f"{alignment.get('scale_ratio', 1.0):.6f}",
+        "alignment_rotation_degrees": f"{alignment.get('rotation_degrees', 0.0):.4f}",
+        "alignment_skew_dot": f"{alignment.get('skew_dot', 0.0):.6f}",
+        "alignment_determinant": f"{alignment.get('determinant', 1.0):.6f}",
+        "alignment_translation_x": f"{alignment.get('translation_x', 0.0):.4f}",
+        "alignment_translation_y": f"{alignment.get('translation_y', 0.0):.4f}",
+        "alignment_reasons": " | ".join(alignment.get("reasons", [])),
+        "auto_align_questionable_reasons": " | ".join(
+            alignment.get("auto_align_questionable_reasons", [])
+        ),
         "rgb_filename": decision["rgb"]["filename"],
         "rgb_index": "" if decision["rgb"]["index"] is None else decision["rgb"]["index"],
         "thermal_jpg_filename": "" if decision["thermal_jpg"] is None else decision["thermal_jpg"]["filename"],
@@ -2072,10 +3118,14 @@ def analyze_presorted_standard(input_folder=None):
                     "camera_image_size": camera_detection["image_size"],
                     "camera_dimension_summary": camera_detection.get("dimension_summary", ""),
                     "camera_detection_reason": camera_detection["reason"],
-                    "correction_model": active_profile["selected_model"] if active_profile else "crop_only",
+                    "correction_model": (
+                        active_profile["selected_model"]
+                        if active_profile and _get_fov_correction_mode() == "CALIBRATION_PROFILE"
+                        else _get_fov_correction_mode().lower()
+                    ),
                     "correction_rmse": (
                         active_profile.get("selected_model_summary", {}).get("rmse")
-                        if active_profile is not None
+                        if active_profile is not None and _get_fov_correction_mode() == "CALIBRATION_PROFILE"
                         else None
                     ),
                     "calibration_profile_path": (
@@ -2200,10 +3250,14 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
             camera_detection["profile_path"] = (
                 active_profile.get("profile_path", "") if active_profile is not None else ""
             )
-            selected_correction_model = active_profile["selected_model"] if active_profile else "crop_only"
+            selected_correction_model = (
+                active_profile["selected_model"]
+                if active_profile and _get_fov_correction_mode() == "CALIBRATION_PROFILE"
+                else _get_fov_correction_mode().lower()
+            )
             selected_correction_rmse = (
                 active_profile.get("selected_model_summary", {}).get("rmse")
-                if active_profile is not None
+                if active_profile is not None and _get_fov_correction_mode() == "CALIBRATION_PROFILE"
                 else None
             )
             print(
@@ -2235,7 +3289,7 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                 + (
                     ""
                     if not camera_detection.get("profile_path")
-                    else f" | calibration_profile={camera_detection['profile_path']}"
+                    else f" | calibration_profile_available={camera_detection['profile_path']}"
                 )
             )
 
@@ -2290,7 +3344,7 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                     if pair["cal_tiff"] is not None
                     else pair["thermal_tiff"]["filepath"]
                 )
-                corrected_rgb = _apply_rgb_fov_correction(
+                corrected_rgb, correction_debug = _apply_rgb_fov_correction(
                     pair["rgb"]["filepath"],
                     thermal_source_path=thermal_alignment_source,
                     use_experimental_shift=False,
@@ -2298,7 +3352,12 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                     burn_set_name=burn_set_name,
                     calibration_profile=active_profile,
                     camera_used=camera_detection["camera"],
+                    return_debug_info=True,
                 )
+                pair["fov_correction_mode"] = correction_debug["fov_correction_mode"]
+                pair["final_crop_box"] = correction_debug["final_crop_box"]
+                pair["crop_shrink"] = correction_debug["crop_shrink"]
+                pair["feature_alignment"] = correction_debug["feature_alignment"]
                 if "exif" in corrected_rgb.info:
                     corrected_rgb.save(
                         os.path.join(rgb_corrected_output_dir, rgb_output_name),
@@ -2342,6 +3401,7 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                 decision["camera_dimension_summary"] = camera_detection.get("dimension_summary", "")
                 decision["camera_detection_reason"] = camera_detection["reason"]
                 decision["calibration_profile_path"] = camera_detection.get("profile_path", "")
+                decision["fov_correction_mode"] = _get_fov_correction_mode()
             _write_pairing_logs(burn_output_root, pairing_result["decisions"])
             if EXPORT_ALIGNMENT_DEBUG_SAMPLES:
                 export_alignment_debug_samples(
