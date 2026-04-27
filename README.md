@@ -328,7 +328,23 @@ AUTO_ALIGN does the following:
 
 The final saved RGB output is never grayscale. Grayscale/edge images are temporary working images only.
 
+AUTO_ALIGN uses per-image SIFT/RANSAC transforms. It does not reuse developer calibration points or a dataset-level calibration profile for normal AUTO_ALIGN output. If strict high-confidence validation is not met, a guarded medium-confidence affine transform may still be accepted when it has low reprojection error, spatial coverage, sane geometry, and a reasonable scale ratio. Otherwise the image falls back to crop-only.
+
+After per-image export, the pipeline runs dataset-wide alignment QA before writing the pairing logs. The QA logs each transform's model, confidence, inliers, RMSE, scale, translation, rotation, and fallback state. It flags accepted transforms with weak support, scale/translation/rotation outliers compared with the dataset median, and sudden transform jumps between neighboring frames. Flagged transforms are marked review-required and the saved Final Corrected FOV is overwritten with crop-only to avoid silently corrupting unseen datasets.
+
 AUTO_ALIGN is slower than crop-only because each exported pair runs feature extraction, feature matching, RANSAC validation, and image warping. Crop-only only crops and resizes.
+
+Corrected FOV export can run in parallel using a bounded worker pool:
+
+```
+PARALLEL_CORRECTED_FOV_EXPORT = True
+PARALLEL_CORRECTED_FOV_WORKERS = "AUTO"
+PARALLEL_CORRECTED_FOV_MAX_WORKERS = 4
+PARALLEL_CORRECTED_FOV_MIN_FREE_RAM_GB = 6.0
+PARALLEL_CORRECTED_FOV_ESTIMATED_RAM_PER_WORKER_GB = 2.0
+```
+
+Each worker still runs the full AUTO_ALIGN Corrected FOV generation for its assigned pair. The automatic worker count reserves RAM first, then limits by CPU, and the exporter keeps only a bounded number of active jobs instead of queuing the whole dataset at once.
 
 ### Crop Tightening
 

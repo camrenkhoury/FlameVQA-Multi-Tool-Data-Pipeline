@@ -577,7 +577,7 @@ class CalibrationProfileWindow:
         self.profile_path_var = tk.StringVar(value="No saved calibration profile loaded.")
 
         self.window = tk.Toplevel(parent)
-        self.window.title(f"Developer Calibration - {self.dataset_name} / {self.burn_set_name}")
+        self.window.title(f"Developer Check - {self.dataset_name} / {self.burn_set_name}")
         self.window.geometry("2140x1240")
         self.window.minsize(1500, 920)
 
@@ -595,7 +595,7 @@ class CalibrationProfileWindow:
 
         ttk.Label(
             outer,
-            text=f"Developer Calibration: {self.dataset_name} / {self.burn_set_name}",
+            text=f"Developer Check: {self.dataset_name} / {self.burn_set_name}",
             font=("Segoe UI", 13, "bold"),
         ).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(
@@ -607,7 +607,7 @@ class CalibrationProfileWindow:
             wraplength=1500,
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 10))
 
-        controls = ttk.LabelFrame(outer, text="Calibration Controls", padding=10)
+        controls = ttk.LabelFrame(outer, text="Developer Check Controls", padding=10)
         controls.grid(row=2, column=0, sticky="nsw", padx=(0, 12))
         controls.columnconfigure(0, weight=1)
 
@@ -1041,7 +1041,7 @@ class CalibrationProfileWindow:
             profile_scope=self.scope_var.get(),
             baseline_crop_box=self.current_crop_debug["base_crop_box"],
             source_rgb_size=self.current_raw_rgb.size,
-            notes="Created with the Raw File Sorting GUI developer calibration tool.",
+            notes="Created with the Raw File Sorting GUI developer check tool.",
         )
         self._populate_model_tree(self.estimated_profile)
         self._populate_point_tree()
@@ -1086,7 +1086,7 @@ class CalibrationProfileWindow:
             outer,
             text=(
                 "Use this window for precise point picking. Click one source point and one matching thermal point "
-                "in either order. The control-point list and model estimates stay synced with the developer calibration window."
+                "in either order. The control-point list and model estimates stay synced with the developer check window."
             ),
             wraplength=1800,
         ).grid(row=0, column=1, sticky="e")
@@ -1246,6 +1246,8 @@ class PairPreviewWindow:
         self.current_filtered_pos = 0
         self.images = {}
         self.source_images = {}
+        self._suppress_pair_tree_event = False
+        self._refresh_after_id = None
         self.overlay_opacity_var = tk.DoubleVar(value=50.0)
         self.metrics_var = tk.StringVar(value="AUTO_ALIGN metrics will appear after a pair is loaded.")
 
@@ -1331,7 +1333,7 @@ class PairPreviewWindow:
         self.raw_overlay_canvas.bind("<Configure>", self._handle_resize)
         self.compare_canvas.bind("<Configure>", self._handle_resize)
 
-        ttk.Label(preview_area, text="Crop-Only Corrected FOV", font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky="w")
+        ttk.Label(preview_area, text="Final Corrected FOV", font=("Segoe UI", 10, "bold")).grid(row=3, column=0, sticky="w")
         ttk.Label(preview_area, text="Thermal", font=("Segoe UI", 10, "bold")).grid(row=3, column=1, sticky="w")
 
         actions = ttk.LabelFrame(preview_area, text="Viewer Actions", padding=8)
@@ -1346,13 +1348,13 @@ class PairPreviewWindow:
         self.open_output_button.grid(row=0, column=1, sticky="ew", padx=8)
         self.alignment_tool_button = ttk.Button(
             actions,
-            text="Validate Alignment Overlay",
+            text="Alignment Check",
             command=self._open_alignment_validation,
         )
         self.alignment_tool_button.grid(row=0, column=2, sticky="ew", padx=8)
         self.calibration_tool_button = ttk.Button(
             actions,
-            text="Developer Calibration",
+            text="Developer Check",
             command=self._open_calibration_tool,
         )
         self.calibration_tool_button.grid(row=0, column=3, sticky="ew", padx=(8, 0))
@@ -1367,8 +1369,8 @@ class PairPreviewWindow:
             command=lambda value: self._refresh_validation_overlays(),
         ).grid(row=1, column=1, columnspan=3, sticky="ew", pady=(8, 0))
 
-        ttk.Label(preview_area, text="Crop-Only vs Thermal Overlay", font=("Segoe UI", 10, "bold")).grid(row=6, column=0, sticky="w")
-        ttk.Label(preview_area, text="AUTO_ALIGN vs Thermal Overlay", font=("Segoe UI", 10, "bold")).grid(row=6, column=1, sticky="w")
+        ttk.Label(preview_area, text="Crop-Only FOV vs Thermal Overlay", font=("Segoe UI", 10, "bold")).grid(row=6, column=0, sticky="w")
+        ttk.Label(preview_area, text="Final FOV vs Thermal Overlay", font=("Segoe UI", 10, "bold")).grid(row=6, column=1, sticky="w")
         ttk.Label(
             preview_area,
             textvariable=self.metrics_var,
@@ -1404,14 +1406,15 @@ class PairPreviewWindow:
         canvas.create_image(width // 2, height // 2, image=fitted, anchor="center")
 
     def _refresh_canvases(self):
+        self._refresh_after_id = None
         self._draw_canvas_image(self.corrected_canvas, "corrected")
         self._draw_canvas_image(self.thermal_canvas, "thermal")
         self._draw_canvas_image(self.raw_overlay_canvas, "crop_overlay")
         self._draw_canvas_image(self.compare_canvas, "auto_overlay")
 
     def _handle_resize(self, event=None):
-        if self.source_images:
-            self._refresh_canvases()
+        if self.source_images and self._refresh_after_id is None:
+            self._refresh_after_id = self.window.after_idle(self._refresh_canvases)
 
     def _populate_pair_tree(self):
         self.pair_tree.delete(*self.pair_tree.get_children())
@@ -1458,10 +1461,16 @@ class PairPreviewWindow:
         if not self.filtered_indices:
             return
         iid = str(self.current_filtered_pos)
-        self.pair_tree.selection_set(iid)
-        self.pair_tree.see(iid)
+        self._suppress_pair_tree_event = True
+        try:
+            self.pair_tree.selection_set(iid)
+            self.pair_tree.see(iid)
+        finally:
+            self._suppress_pair_tree_event = False
 
     def _handle_pair_tree_selection(self, event=None):
+        if self._suppress_pair_tree_event:
+            return
         selection = self.pair_tree.selection()
         if not selection:
             return
@@ -1482,21 +1491,21 @@ class PairPreviewWindow:
         thermal_source, _ = self.sorter._select_corrected_fov_thermal_source(pair)
         self.current_thermal_source = thermal_source
         crop_only, crop_debug = self._load_corrected_with_mode(pair["rgb"]["filepath"], "CROP_ONLY")
-        auto_align, auto_debug = self._load_corrected_with_mode(pair["rgb"]["filepath"], "AUTO_ALIGN")
+        final_corrected, final_debug = self._load_final_corrected_fov(pair)
         thermal = self._load_preview_image(thermal_source, mode="thermal")
         self.current_crop_only_image = crop_only
-        self.current_auto_align_image = auto_align
+        self.current_final_corrected_image = final_corrected
         self.current_thermal_image = thermal
-        self.current_auto_align_debug = auto_debug
+        self.current_final_corrected_debug = final_debug
         self.current_crop_debug = crop_debug
         crop_overlay = self._build_thermal_overlay(crop_only, thermal)
-        auto_overlay = self._build_thermal_overlay(auto_align, thermal)
+        final_overlay = self._build_thermal_overlay(final_corrected, thermal)
 
-        self.source_images["corrected"] = crop_only
+        self.source_images["corrected"] = final_corrected
         self.source_images["thermal"] = thermal
         self.source_images["crop_overlay"] = crop_overlay
-        self.source_images["auto_overlay"] = auto_overlay
-        self._update_metrics_text(auto_debug)
+        self.source_images["auto_overlay"] = final_overlay
+        self._update_metrics_text(final_debug)
         self._refresh_canvases()
 
         self.position_label.configure(
@@ -1552,6 +1561,19 @@ class PairPreviewWindow:
             corrected = corrected.convert("RGB")
         return corrected.convert("RGB"), debug_info
 
+    def _load_final_corrected_fov(self, pair):
+        corrected_record = pair.get("corrected_rgb")
+        if corrected_record and corrected_record.get("filepath") and Path(corrected_record["filepath"]).exists():
+            final_image = self._load_preview_image(corrected_record["filepath"], mode="rgb")
+            debug_info = {
+                "display_source": "saved_corrected_fov",
+                "feature_alignment": pair.get("feature_alignment", {}),
+            }
+            return final_image.convert("RGB"), debug_info
+        final_image, debug_info = self._load_corrected_with_mode(pair["rgb"]["filepath"], "AUTO_ALIGN")
+        debug_info["display_source"] = "generated_auto_align"
+        return final_image.convert("RGB"), debug_info
+
     def _build_thermal_overlay(self, rgb_image, thermal_image):
         opacity = max(0.0, min(self.overlay_opacity_var.get() / 100.0, 1.0))
         thermal = ImageOps.autocontrast(thermal_image.convert("L")).convert("RGB").resize(rgb_image.size, Image.LANCZOS)
@@ -1560,7 +1582,7 @@ class PairPreviewWindow:
     def _refresh_validation_overlays(self):
         if not all(
             hasattr(self, attr)
-            for attr in ("current_crop_only_image", "current_auto_align_image", "current_thermal_image")
+            for attr in ("current_crop_only_image", "current_final_corrected_image", "current_thermal_image")
         ):
             return
         self.source_images["crop_overlay"] = self._build_thermal_overlay(
@@ -1568,7 +1590,7 @@ class PairPreviewWindow:
             self.current_thermal_image,
         )
         self.source_images["auto_overlay"] = self._build_thermal_overlay(
-            self.current_auto_align_image,
+            self.current_final_corrected_image,
             self.current_thermal_image,
         )
         self._refresh_canvases()
@@ -1578,7 +1600,7 @@ class PairPreviewWindow:
         reasons = " | ".join(alignment.get("reasons", [])) or "none"
         questionable = " | ".join(alignment.get("auto_align_questionable_reasons", [])) or "none"
         self.metrics_var.set(
-            "AUTO_ALIGN review: visually_better_unknown | "
+            f"Final Corrected FOV: {debug_info.get('display_source', 'generated_auto_align')} | "
             f"model={alignment.get('transform_type', '')} | "
             f"prep={alignment.get('representation', '')} | "
             f"confidence={alignment.get('confidence_level', '')} | "
@@ -1922,6 +1944,11 @@ class RawSortingGui:
                                 "filename": rgb_path.name,
                                 "filepath": str(rgb_source_path),
                                 "datetime": sorter._extract_capture_datetime(str(rgb_source_path)),
+                            },
+                            "corrected_rgb": {
+                                "filename": rgb_path.name,
+                                "filepath": str(rgb_path),
+                                "datetime": sorter._extract_capture_datetime(str(rgb_path)),
                             },
                             "thermal_jpg": {
                                 "filename": jpg_match.name,

@@ -18,6 +18,7 @@
 
 # import required dependencies
 import csv
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import datetime
 import gc
 import json
@@ -102,6 +103,11 @@ FEATURE_ALIGNMENT_EDGE_BLEND_WEIGHT = 0.35
 FEATURE_ALIGNMENT_MIN_GOOD_MATCHES = 20
 FEATURE_ALIGNMENT_MIN_INLIERS = 12
 FEATURE_ALIGNMENT_MIN_INLIER_RATIO = 0.35
+FEATURE_ALIGNMENT_RELAXED_MIN_INLIERS = 5
+FEATURE_ALIGNMENT_RELAXED_MIN_INLIER_RATIO = 0.20
+FEATURE_ALIGNMENT_RELAXED_MAX_MEAN_REPROJECTION_ERROR_PX = 1.5
+FEATURE_ALIGNMENT_RELAXED_MIN_SCALE_RATIO = 0.80
+FEATURE_ALIGNMENT_RELAXED_MAX_SCALE_RATIO = 1.25
 FEATURE_ALIGNMENT_GRID_SIZE = (4, 4)
 FEATURE_ALIGNMENT_MAX_MATCHES_PER_GRID_CELL = 8
 FEATURE_ALIGNMENT_MIN_MATCH_GRID_CELLS = 4
@@ -119,6 +125,16 @@ FEATURE_ALIGNMENT_ECC_EPSILON = 1e-5
 CORRECTION_VALIDATION_SAMPLE_COUNT = 20
 CORRECTION_VALIDATION_DIRNAME = "correction_validation"
 VISUAL_ALIGNMENT_REVIEW_DEFAULT = "visually_better_unknown"
+ALIGNMENT_DATASET_QA_ENABLED = True
+ALIGNMENT_QA_WEAK_ACCEPTED_INLIER_THRESHOLD = 6
+ALIGNMENT_QA_MIN_MEDIAN_SAMPLE_COUNT = 5
+ALIGNMENT_QA_MAD_MULTIPLIER = 6.0
+ALIGNMENT_QA_SCALE_OUTLIER_ABS = 0.18
+ALIGNMENT_QA_TRANSLATION_OUTLIER_PX = 45.0
+ALIGNMENT_QA_ROTATION_OUTLIER_DEG = 5.0
+ALIGNMENT_QA_SCALE_JUMP_ABS = 0.15
+ALIGNMENT_QA_TRANSLATION_JUMP_PX = 35.0
+ALIGNMENT_QA_ROTATION_JUMP_DEG = 4.0
 CALIBRATION_PROFILES_DIRNAME = "Calibration Profiles"
 INVALID_CALIBRATION_PROFILES_DIRNAME = "Invalid Calibration Profiles"
 QUARANTINE_INVALID_CALIBRATION_PROFILES = False
@@ -190,6 +206,11 @@ EXPERIMENTAL_THERMAL_SHIFT_ENABLED = False
 EXPORT_ALIGNMENT_DEBUG_SAMPLES = False
 ALIGNMENT_DEBUG_SAMPLE_COUNT = 5
 ALIGNMENT_DEBUG_DIRNAME = "alignment_debug"
+PARALLEL_CORRECTED_FOV_EXPORT = True
+PARALLEL_CORRECTED_FOV_WORKERS = "AUTO"
+PARALLEL_CORRECTED_FOV_MAX_WORKERS = 4
+PARALLEL_CORRECTED_FOV_MIN_FREE_RAM_GB = 6.0
+PARALLEL_CORRECTED_FOV_ESTIMATED_RAM_PER_WORKER_GB = 2.0
 
 
 def configure_runtime():
@@ -329,7 +350,7 @@ def _mode_uses_feature_alignment(mode=None):
 
 def _mode_allows_profile_fallback(mode=None):
     effective_mode = _get_fov_correction_mode() if mode is None else str(mode).upper()
-    return effective_mode in {"EXPERIMENTAL_SIFT", "AUTO_ALIGN", "AUTO_SIFT_CALIBRATED"}
+    return effective_mode in {"AUTO_SIFT_CALIBRATED"}
 
 
 def _get_baseline_crop_parameters(camera_used=None):
@@ -1007,25 +1028,30 @@ def _get_crop_debug_info(
     burn_set_name=None,
     calibration_profile=None,
     camera_used=None,
+    fov_correction_mode=None,
 ):
     with Image.open(rgb_source_path) as rgb_img:
         width, height = rgb_img.size
 
-    active_profile = _get_active_calibration_profile(
-        dataset_name=dataset_name,
-        burn_set_name=burn_set_name,
-        camera_used=camera_used,
-        calibration_profile=calibration_profile,
-    )
-    if active_profile is not None:
-        profile_valid, profile_reasons = validate_calibration_profile(active_profile)
-        if not profile_valid:
-            print(
-                "Ignoring invalid active calibration profile: "
-                + " | ".join(profile_reasons)
-            )
-            active_profile = None
-    fov_correction_mode = _get_fov_correction_mode()
+    fov_correction_mode = _get_fov_correction_mode() if fov_correction_mode is None else str(fov_correction_mode).upper()
+    if fov_correction_mode not in VALID_FOV_CORRECTION_MODES:
+        fov_correction_mode = "CROP_ONLY"
+    active_profile = None
+    if fov_correction_mode in {"CALIBRATION_PROFILE", "AUTO_SIFT_CALIBRATED"}:
+        active_profile = _get_active_calibration_profile(
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            camera_used=camera_used,
+            calibration_profile=calibration_profile,
+        )
+        if active_profile is not None:
+            profile_valid, profile_reasons = validate_calibration_profile(active_profile)
+            if not profile_valid:
+                print(
+                    "Ignoring invalid active calibration profile: "
+                    + " | ".join(profile_reasons)
+                )
+                active_profile = None
     base_crop_box = _rendered_baseline_crop_box(
         (width, height),
         camera_used=camera_used,
@@ -1478,15 +1504,41 @@ def _validate_feature_alignment_result(
     if geometry["determinant"] <= 0:
         reasons.append("orientation_flip")
 
+    disqualifying_reasons = {
+        "not_enough_good_matches",
+        "matches_not_spatially_distributed",
+        "inliers_not_spatially_distributed",
+        "high_reprojection_error",
+        "unrealistic_scale",
+        "unrealistic_skew",
+        "unrealistic_translation",
+        "orientation_flip",
+    }
+    relaxed_reasons = {"not_enough_ransac_inliers", "low_inlier_ratio"}
+    relaxed_accepted = (
+        bool(reasons)
+        and result.get("transform_type") == "affine"
+        and set(reasons).issubset(relaxed_reasons)
+        and inlier_count >= FEATURE_ALIGNMENT_RELAXED_MIN_INLIERS
+        and inlier_ratio >= FEATURE_ALIGNMENT_RELAXED_MIN_INLIER_RATIO
+        and inlier_grid_cells >= FEATURE_ALIGNMENT_MIN_INLIER_GRID_CELLS
+        and mean_error is not None
+        and mean_error <= FEATURE_ALIGNMENT_RELAXED_MAX_MEAN_REPROJECTION_ERROR_PX
+        and FEATURE_ALIGNMENT_RELAXED_MIN_SCALE_RATIO <= geometry["scale_ratio"] <= FEATURE_ALIGNMENT_RELAXED_MAX_SCALE_RATIO
+        and not any(reason in disqualifying_reasons for reason in reasons)
+    )
+
     confidence_level = "HIGH"
-    if reasons:
+    if relaxed_accepted:
+        confidence_level = "MEDIUM"
+    elif reasons:
         confidence_level = "LOW"
     elif mean_error is not None and mean_error > FEATURE_ALIGNMENT_MAX_HIGH_CONFIDENCE_REPROJECTION_ERROR_PX:
         confidence_level = "MEDIUM"
 
     result.update(
         {
-            "status": "ok" if confidence_level == "HIGH" else "alignment_low_confidence",
+            "status": "ok" if confidence_level in {"HIGH", "MEDIUM"} else "alignment_low_confidence",
             "confidence_level": confidence_level,
             "inliers": inlier_count,
             "inlier_ratio": round(inlier_ratio, 4),
@@ -1502,7 +1554,8 @@ def _validate_feature_alignment_result(
             "determinant": geometry["determinant"],
             "translation_x": geometry["translation_x"],
             "translation_y": geometry["translation_y"],
-            "accepted": confidence_level == "HIGH",
+            "accepted": confidence_level in {"HIGH", "MEDIUM"},
+            "relaxed_acceptance": bool(relaxed_accepted),
             "reasons": reasons,
         }
     )
@@ -1704,10 +1757,13 @@ def _select_best_alignment_candidate(candidates):
     model_rank = {"crop_only": 0, "similarity": 1, "affine": 2, "homography": 3}
     accepted = [candidate for candidate in candidates if candidate.get("accepted")]
     if accepted:
+        confidence_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
         return sorted(
             accepted,
             key=lambda candidate: (
                 model_rank.get(candidate.get("transform_type"), 99),
+                confidence_rank.get(candidate.get("confidence_level"), 99),
+                1 if candidate.get("relaxed_acceptance") else 0,
                 candidate.get("mean_reprojection_error_px") or float("inf"),
                 -candidate.get("inlier_grid_cells", 0),
                 -candidate.get("inliers", 0),
@@ -1811,6 +1867,7 @@ def _apply_rgb_fov_correction(
     burn_set_name=None,
     calibration_profile=None,
     camera_used=None,
+    fov_correction_mode=None,
     return_debug_info=False,
 ):
     debug_info = _get_crop_debug_info(
@@ -1821,6 +1878,7 @@ def _apply_rgb_fov_correction(
         burn_set_name=burn_set_name,
         calibration_profile=calibration_profile,
         camera_used=camera_used,
+        fov_correction_mode=fov_correction_mode,
     )
 
     with Image.open(rgb_source_path) as rgb_img:
@@ -1859,6 +1917,8 @@ def _apply_rgb_fov_correction(
                 model_name=debug_info["available_profile_model"],
             )
             if fallback_reasons:
+                final_image.close()
+                final_image = baseline_corrected.copy()
                 alignment_result["fallback_used"] = "crop_only"
                 alignment_result["reasons"] = _unique_reasons(
                     alignment_result.get("reasons", []) + fallback_reasons
@@ -1876,6 +1936,8 @@ def _apply_rgb_fov_correction(
                 debug_info["selected_model"] = "experimental_sift_fallback_calibration_profile"
                 debug_info["final_transform_matrix"] = fallback_matrix
         else:
+            final_image.close()
+            final_image = baseline_corrected.copy()
             alignment_result["fallback_used"] = "crop_only"
             debug_info["selected_model"] = "experimental_sift_fallback_crop_only"
             debug_info["final_transform_matrix"] = _matrix_to_list(_identity_transform_matrix())
@@ -1929,21 +1991,17 @@ def generate_corrected_fov(
     return_debug_info=False,
 ):
     thermal_source_path, thermal_source_name = _select_corrected_fov_thermal_source(pair)
-    previous_mode = FOV_CORRECTION_MODE
-    try:
-        globals()["FOV_CORRECTION_MODE"] = mode
-        corrected_rgb, debug_info = _apply_rgb_fov_correction(
-            pair["rgb"]["filepath"],
-            thermal_source_path=thermal_source_path,
-            use_experimental_shift=use_experimental_shift,
-            dataset_name=dataset_name if dataset_name is not None else pair.get("dataset_name"),
-            burn_set_name=burn_set_name if burn_set_name is not None else pair.get("burn_set_name"),
-            calibration_profile=calibration_profile,
-            camera_used=camera_used if camera_used is not None else pair.get("detected_camera"),
-            return_debug_info=True,
-        )
-    finally:
-        globals()["FOV_CORRECTION_MODE"] = previous_mode
+    corrected_rgb, debug_info = _apply_rgb_fov_correction(
+        pair["rgb"]["filepath"],
+        thermal_source_path=thermal_source_path,
+        use_experimental_shift=use_experimental_shift,
+        dataset_name=dataset_name if dataset_name is not None else pair.get("dataset_name"),
+        burn_set_name=burn_set_name if burn_set_name is not None else pair.get("burn_set_name"),
+        calibration_profile=calibration_profile,
+        camera_used=camera_used if camera_used is not None else pair.get("detected_camera"),
+        fov_correction_mode=mode,
+        return_debug_info=True,
+    )
 
     debug_info["correction_mode_used"] = debug_info.get("fov_correction_mode", mode)
     debug_info["thermal_source_used"] = thermal_source_name
@@ -1974,6 +2032,403 @@ def _save_thermal_heatmap_jpg(temperature_array, output_path):
 
     rgba = mpl_colormaps["inferno"](normalized, bytes=True)
     Image.fromarray(rgba[:, :, :3], mode="RGB").save(output_path)
+
+
+def _save_corrected_rgb(corrected_rgb, output_path):
+    if "exif" in corrected_rgb.info:
+        corrected_rgb.save(output_path, exif=corrected_rgb.info["exif"])
+    else:
+        corrected_rgb.save(output_path)
+
+
+def _load_psutil_for_memory_checks():
+    global psutil
+    if psutil is not None:
+        return psutil
+    try:
+        import psutil as imported_psutil
+    except ImportError:
+        return None
+    psutil = imported_psutil
+    return psutil
+
+
+def _available_memory_gb():
+    psutil_module = _load_psutil_for_memory_checks()
+    if psutil_module is not None:
+        try:
+            return psutil_module.virtual_memory().available / (1024 ** 3)
+        except Exception:
+            pass
+
+    try:
+        import ctypes
+
+        class MemoryStatusEx(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("sullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatusEx()
+        status.dwLength = ctypes.sizeof(MemoryStatusEx)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status)):
+            return status.ullAvailPhys / (1024 ** 3)
+    except Exception:
+        pass
+
+    return None
+
+
+def _recommended_corrected_fov_worker_count(total_pairs):
+    if not PARALLEL_CORRECTED_FOV_EXPORT or total_pairs <= 1:
+        return 1, "parallel_disabled_or_single_pair"
+
+    cpu_count = os.cpu_count() or 2
+    cpu_limit = max(1, cpu_count - 1)
+    configured_workers = PARALLEL_CORRECTED_FOV_WORKERS
+    if isinstance(configured_workers, str) and configured_workers.upper() == "AUTO":
+        configured_limit = PARALLEL_CORRECTED_FOV_MAX_WORKERS
+    else:
+        try:
+            configured_limit = int(configured_workers)
+        except (TypeError, ValueError):
+            configured_limit = 1
+
+    worker_limit = max(1, min(configured_limit, PARALLEL_CORRECTED_FOV_MAX_WORKERS, cpu_limit, total_pairs))
+    available_gb = _available_memory_gb()
+    if available_gb is None:
+        return worker_limit, f"cpu_limited_no_memory_probe cpu={cpu_count}"
+
+    memory_headroom = available_gb - PARALLEL_CORRECTED_FOV_MIN_FREE_RAM_GB
+    if memory_headroom <= PARALLEL_CORRECTED_FOV_ESTIMATED_RAM_PER_WORKER_GB:
+        return 1, f"memory_limited available_gb={available_gb:.1f}"
+
+    memory_limit = int(memory_headroom // PARALLEL_CORRECTED_FOV_ESTIMATED_RAM_PER_WORKER_GB)
+    worker_count = max(1, min(worker_limit, memory_limit))
+    return worker_count, (
+        f"auto cpu={cpu_count} available_gb={available_gb:.1f} "
+        f"reserve_gb={PARALLEL_CORRECTED_FOV_MIN_FREE_RAM_GB:.1f} "
+        f"estimated_per_worker_gb={PARALLEL_CORRECTED_FOV_ESTIMATED_RAM_PER_WORKER_GB:.1f}"
+    )
+
+
+def _export_presorted_pair_outputs(
+    pair,
+    pair_index,
+    dataset_name,
+    burn_set_name,
+    active_profile,
+    camera_name,
+    rgb_corrected_output_dir,
+    rgb_raw_output_dir,
+    thermal_jpg_output_dir,
+    thermal_tiff_output_dir,
+):
+    rgb_output_name = f"{pair['output_stem']}.JPG"
+    thermal_jpg_output_name = f"{pair['output_stem']}.JPG"
+    thermal_tiff_output_name = f"{pair['output_stem']}.TIFF"
+
+    shutil.copy(pair["rgb"]["filepath"], os.path.join(rgb_raw_output_dir, rgb_output_name))
+
+    corrected_rgb, correction_debug = generate_corrected_fov(
+        pair,
+        mode="AUTO_ALIGN",
+        dataset_name=dataset_name,
+        burn_set_name=burn_set_name,
+        calibration_profile=active_profile,
+        camera_used=camera_name,
+        return_debug_info=True,
+    )
+    try:
+        _save_corrected_rgb(
+            corrected_rgb,
+            os.path.join(rgb_corrected_output_dir, rgb_output_name),
+        )
+    finally:
+        corrected_rgb.close()
+
+    _copy_if_exists(
+        pair["thermal_jpg"]["filepath"] if pair["thermal_jpg"] is not None else None,
+        os.path.join(thermal_jpg_output_dir, thermal_jpg_output_name),
+    )
+    selected_tiff_source = (
+        pair["cal_tiff"]["filepath"]
+        if pair["cal_tiff"] is not None
+        else pair["thermal_tiff"]["filepath"]
+    )
+    shutil.copy(
+        selected_tiff_source,
+        os.path.join(thermal_tiff_output_dir, thermal_tiff_output_name),
+    )
+
+    return {
+        "pair_index": pair_index,
+        "fov_correction_mode": correction_debug["fov_correction_mode"],
+        "final_crop_box": correction_debug["final_crop_box"],
+        "crop_shrink": correction_debug["crop_shrink"],
+        "feature_alignment": correction_debug["feature_alignment"],
+        "thermal_source_used": correction_debug["thermal_source_used"],
+        "thermal_source_path": correction_debug["thermal_source_path"],
+        "final_transform_matrix": correction_debug["final_transform_matrix"],
+        "fallback_occurred": correction_debug["fallback_occurred"],
+    }
+
+
+def _alignment_value(alignment, key):
+    value = alignment.get(key)
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _median_and_mad(values):
+    numeric_values = [float(value) for value in values if value is not None and np.isfinite(value)]
+    if not numeric_values:
+        return None, None
+    values_array = np.asarray(numeric_values, dtype=np.float32)
+    median = float(np.median(values_array))
+    mad = float(np.median(np.abs(values_array - median)))
+    return median, mad
+
+
+def _robust_scalar_outlier(value, median, mad, absolute_threshold):
+    if value is None or median is None:
+        return False
+    robust_threshold = absolute_threshold
+    if mad is not None and mad > 0:
+        robust_threshold = max(absolute_threshold, ALIGNMENT_QA_MAD_MULTIPLIER * mad)
+    return abs(float(value) - float(median)) > robust_threshold
+
+
+def _translation_distance(alignment, median_x=None, median_y=None):
+    tx = _alignment_value(alignment, "translation_x")
+    ty = _alignment_value(alignment, "translation_y")
+    if tx is None or ty is None:
+        return None
+    if median_x is None:
+        median_x = 0.0
+    if median_y is None:
+        median_y = 0.0
+    return float(np.hypot(tx - median_x, ty - median_y))
+
+
+def _alignment_jump(current_alignment, neighbor_alignment):
+    return {
+        "scale_x": abs(
+            (_alignment_value(current_alignment, "scale_x") or 1.0)
+            - (_alignment_value(neighbor_alignment, "scale_x") or 1.0)
+        ),
+        "scale_y": abs(
+            (_alignment_value(current_alignment, "scale_y") or 1.0)
+            - (_alignment_value(neighbor_alignment, "scale_y") or 1.0)
+        ),
+        "rotation_degrees": abs(
+            (_alignment_value(current_alignment, "rotation_degrees") or 0.0)
+            - (_alignment_value(neighbor_alignment, "rotation_degrees") or 0.0)
+        ),
+        "translation": float(
+            np.hypot(
+                ((_alignment_value(current_alignment, "translation_x") or 0.0) - (_alignment_value(neighbor_alignment, "translation_x") or 0.0)),
+                ((_alignment_value(current_alignment, "translation_y") or 0.0) - (_alignment_value(neighbor_alignment, "translation_y") or 0.0)),
+            )
+        ),
+    }
+
+
+def _accepted_alignment_entries(pairs):
+    entries = []
+    for pair_index, pair in enumerate(pairs, start=1):
+        alignment = pair.get("feature_alignment", {})
+        if alignment.get("accepted") and alignment.get("fallback_used", "none") == "none":
+            entries.append((pair_index, pair, alignment))
+    return entries
+
+
+def _qa_reasons_for_alignment(pair, medians):
+    alignment = pair.get("feature_alignment", {})
+    reasons = []
+
+    inliers = alignment.get("inliers")
+    try:
+        inliers = int(inliers)
+    except (TypeError, ValueError):
+        inliers = 0
+    if alignment.get("accepted") and inliers <= ALIGNMENT_QA_WEAK_ACCEPTED_INLIER_THRESHOLD:
+        reasons.append("qa_weak_accepted_transform_inliers")
+
+    if medians:
+        scale_x = _alignment_value(alignment, "scale_x")
+        scale_y = _alignment_value(alignment, "scale_y")
+        rotation = _alignment_value(alignment, "rotation_degrees")
+        if _robust_scalar_outlier(
+            scale_x,
+            medians["scale_x"][0],
+            medians["scale_x"][1],
+            ALIGNMENT_QA_SCALE_OUTLIER_ABS,
+        ):
+            reasons.append("qa_scale_x_outlier_vs_dataset_median")
+        if _robust_scalar_outlier(
+            scale_y,
+            medians["scale_y"][0],
+            medians["scale_y"][1],
+            ALIGNMENT_QA_SCALE_OUTLIER_ABS,
+        ):
+            reasons.append("qa_scale_y_outlier_vs_dataset_median")
+        if _robust_scalar_outlier(
+            rotation,
+            medians["rotation_degrees"][0],
+            medians["rotation_degrees"][1],
+            ALIGNMENT_QA_ROTATION_OUTLIER_DEG,
+        ):
+            reasons.append("qa_rotation_outlier_vs_dataset_median")
+
+        translation_delta = _translation_distance(
+            alignment,
+            medians["translation_x"][0],
+            medians["translation_y"][0],
+        )
+        if translation_delta is not None and translation_delta > ALIGNMENT_QA_TRANSLATION_OUTLIER_PX:
+            reasons.append("qa_translation_outlier_vs_dataset_median")
+
+    return reasons
+
+
+def _add_neighbor_jump_reasons(qa_reasons_by_index, accepted_entries):
+    by_index = {pair_index: alignment for pair_index, _, alignment in accepted_entries}
+    accepted_indices = sorted(by_index)
+    for pair_index in accepted_indices:
+        previous_alignment = by_index.get(pair_index - 1)
+        current_alignment = by_index[pair_index]
+        next_alignment = by_index.get(pair_index + 1)
+        if previous_alignment is None or next_alignment is None:
+            continue
+
+        previous_jump = _alignment_jump(current_alignment, previous_alignment)
+        next_jump = _alignment_jump(current_alignment, next_alignment)
+        neighbor_jump = _alignment_jump(previous_alignment, next_alignment)
+
+        if (
+            previous_jump["translation"] > ALIGNMENT_QA_TRANSLATION_JUMP_PX
+            and next_jump["translation"] > ALIGNMENT_QA_TRANSLATION_JUMP_PX
+            and neighbor_jump["translation"] <= ALIGNMENT_QA_TRANSLATION_JUMP_PX
+        ):
+            qa_reasons_by_index.setdefault(pair_index, []).append("qa_sudden_translation_jump")
+        if (
+            max(previous_jump["scale_x"], previous_jump["scale_y"]) > ALIGNMENT_QA_SCALE_JUMP_ABS
+            and max(next_jump["scale_x"], next_jump["scale_y"]) > ALIGNMENT_QA_SCALE_JUMP_ABS
+            and max(neighbor_jump["scale_x"], neighbor_jump["scale_y"]) <= ALIGNMENT_QA_SCALE_JUMP_ABS
+        ):
+            qa_reasons_by_index.setdefault(pair_index, []).append("qa_sudden_scale_jump")
+        if (
+            previous_jump["rotation_degrees"] > ALIGNMENT_QA_ROTATION_JUMP_DEG
+            and next_jump["rotation_degrees"] > ALIGNMENT_QA_ROTATION_JUMP_DEG
+            and neighbor_jump["rotation_degrees"] <= ALIGNMENT_QA_ROTATION_JUMP_DEG
+        ):
+            qa_reasons_by_index.setdefault(pair_index, []).append("qa_sudden_rotation_jump")
+
+
+def _fallback_saved_corrected_fov_to_crop_only(
+    pair,
+    dataset_name,
+    burn_set_name,
+    active_profile,
+    camera_name,
+    rgb_corrected_output_dir,
+):
+    crop_only_image, crop_debug = generate_corrected_fov(
+        pair,
+        mode="CROP_ONLY",
+        dataset_name=dataset_name,
+        burn_set_name=burn_set_name,
+        calibration_profile=active_profile,
+        camera_used=camera_name,
+        return_debug_info=True,
+    )
+    try:
+        _save_corrected_rgb(
+            crop_only_image,
+            os.path.join(rgb_corrected_output_dir, f"{pair['output_stem']}.JPG"),
+        )
+    finally:
+        crop_only_image.close()
+    pair["final_transform_matrix"] = crop_debug["final_transform_matrix"]
+    pair["fallback_occurred"] = True
+
+
+def _run_alignment_dataset_qa(
+    pairs,
+    dataset_name,
+    burn_set_name,
+    active_profile,
+    camera_name,
+    rgb_corrected_output_dir,
+):
+    if not ALIGNMENT_DATASET_QA_ENABLED:
+        return 0
+
+    accepted_entries = _accepted_alignment_entries(pairs)
+    medians = None
+    if len(accepted_entries) >= ALIGNMENT_QA_MIN_MEDIAN_SAMPLE_COUNT:
+        alignments = [alignment for _, _, alignment in accepted_entries]
+        medians = {
+            "scale_x": _median_and_mad(_alignment_value(alignment, "scale_x") for alignment in alignments),
+            "scale_y": _median_and_mad(_alignment_value(alignment, "scale_y") for alignment in alignments),
+            "translation_x": _median_and_mad(_alignment_value(alignment, "translation_x") for alignment in alignments),
+            "translation_y": _median_and_mad(_alignment_value(alignment, "translation_y") for alignment in alignments),
+            "rotation_degrees": _median_and_mad(_alignment_value(alignment, "rotation_degrees") for alignment in alignments),
+        }
+
+    qa_reasons_by_index = {}
+    for pair_index, pair, _alignment in accepted_entries:
+        reasons = _qa_reasons_for_alignment(pair, medians)
+        if reasons:
+            qa_reasons_by_index[pair_index] = reasons
+    _add_neighbor_jump_reasons(qa_reasons_by_index, accepted_entries)
+
+    fallback_count = 0
+    for pair_index, reasons in sorted(qa_reasons_by_index.items()):
+        pair = pairs[pair_index - 1]
+        reasons = _unique_reasons(reasons)
+        alignment = dict(pair.get("feature_alignment", {}))
+        alignment["qa_review_required"] = True
+        alignment["qa_review_reasons"] = reasons
+        alignment["qa_action"] = "fallback_crop_only"
+        alignment["accepted_before_qa"] = alignment.get("accepted")
+        alignment["accepted"] = False
+        alignment["fallback_used"] = "qa_crop_only"
+        alignment["reasons"] = _unique_reasons(alignment.get("reasons", []) + reasons)
+        pair["feature_alignment"] = alignment
+        pair["alignment_review_required"] = True
+        pair["alignment_review_reasons"] = reasons
+        pair["alignment_qa_action"] = "fallback_crop_only"
+        pair["review_required"] = True
+        _fallback_saved_corrected_fov_to_crop_only(
+            pair,
+            dataset_name,
+            burn_set_name,
+            active_profile,
+            camera_name,
+            rgb_corrected_output_dir,
+        )
+        fallback_count += 1
+
+    for pair in pairs:
+        pair.setdefault("alignment_review_required", False)
+        pair.setdefault("alignment_review_reasons", [])
+        pair.setdefault("alignment_qa_action", "")
+
+    return fallback_count
 
 
 def _fit_image_to_panel(image, panel_size=(640, 512), background=(245, 245, 245)):
@@ -3237,6 +3692,10 @@ def _pair_log_row(decision):
         "camera_dimension_summary": decision.get("camera_dimension_summary", ""),
         "camera_detection_reason": decision.get("camera_detection_reason", ""),
         "fov_correction_mode": decision.get("fov_correction_mode", _get_fov_correction_mode()),
+        "pairing_review_required": str(decision.get("review_required", "")),
+        "alignment_review_required": str(decision.get("alignment_review_required", "")),
+        "alignment_review_reasons": " | ".join(decision.get("alignment_review_reasons", [])),
+        "alignment_qa_action": decision.get("alignment_qa_action", ""),
         "thermal_source_used": decision.get("thermal_source_used", ""),
         "thermal_source_path": decision.get("thermal_source_path", ""),
         "final_transform_matrix": json.dumps(decision.get("final_transform_matrix", "")),
@@ -3311,7 +3770,11 @@ def _write_pairing_logs(output_root, decisions):
     review_rows = [
         row
         for row in log_rows
-        if row["confidence_level"] in {"MEDIUM", "LOW"} or row["status"].startswith("skipped")
+        if (
+            row["confidence_level"] in {"MEDIUM", "LOW"}
+            or row["alignment_review_required"] == "True"
+            or row["status"].startswith("skipped")
+        )
     ]
 
     with open(
@@ -3704,66 +4167,140 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                 pair["camera_image_size"] = camera_detection["image_size"]
                 output_stem = f'{"0" * (OUTPUT_FILENAME_DIGITS - len(str(pair_index))) + str(pair_index)}'
                 pair["output_stem"] = output_stem
-                rgb_output_name = f"{output_stem}.JPG"
-                thermal_jpg_output_name = f"{output_stem}.JPG"
-                thermal_tiff_output_name = f"{output_stem}.TIFF"
 
-                shutil.copy(pair["rgb"]["filepath"], os.path.join(rgb_raw_output_dir, rgb_output_name))
+            worker_count, worker_reason = _recommended_corrected_fov_worker_count(total_pairs)
+            print(f"    Corrected FOV export workers: {worker_count} ({worker_reason})")
 
-                corrected_rgb, correction_debug = generate_corrected_fov(
-                    pair,
-                    mode="AUTO_ALIGN",
-                    dataset_name=dataset["name"],
-                    burn_set_name=burn_set_name,
-                    calibration_profile=active_profile,
-                    camera_used=camera_detection["camera"],
-                    return_debug_info=True,
-                )
-                pair["fov_correction_mode"] = correction_debug["fov_correction_mode"]
-                pair["final_crop_box"] = correction_debug["final_crop_box"]
-                pair["crop_shrink"] = correction_debug["crop_shrink"]
-                pair["feature_alignment"] = correction_debug["feature_alignment"]
-                pair["thermal_source_used"] = correction_debug["thermal_source_used"]
-                pair["thermal_source_path"] = correction_debug["thermal_source_path"]
-                pair["final_transform_matrix"] = correction_debug["final_transform_matrix"]
-                pair["fallback_occurred"] = correction_debug["fallback_occurred"]
-                if "exif" in corrected_rgb.info:
-                    corrected_rgb.save(
-                        os.path.join(rgb_corrected_output_dir, rgb_output_name),
-                        exif=corrected_rgb.info["exif"],
+            completed_pairs = 0
+
+            def handle_export_result(result):
+                result_pair = pairs[result["pair_index"] - 1]
+                result_pair["fov_correction_mode"] = result["fov_correction_mode"]
+                result_pair["final_crop_box"] = result["final_crop_box"]
+                result_pair["crop_shrink"] = result["crop_shrink"]
+                result_pair["feature_alignment"] = result["feature_alignment"]
+                result_pair["thermal_source_used"] = result["thermal_source_used"]
+                result_pair["thermal_source_path"] = result["thermal_source_path"]
+                result_pair["final_transform_matrix"] = result["final_transform_matrix"]
+                result_pair["fallback_occurred"] = result["fallback_occurred"]
+
+            if worker_count == 1:
+                for pair_index, pair in enumerate(pairs, start=1):
+                    handle_export_result(
+                        _export_presorted_pair_outputs(
+                            pair,
+                            pair_index,
+                            dataset["name"],
+                            burn_set_name,
+                            active_profile,
+                            camera_detection["camera"],
+                            rgb_corrected_output_dir,
+                            rgb_raw_output_dir,
+                            thermal_jpg_output_dir,
+                            thermal_tiff_output_dir,
+                        )
                     )
-                else:
-                    corrected_rgb.save(os.path.join(rgb_corrected_output_dir, rgb_output_name))
-                corrected_rgb.close()
+                    completed_pairs += 1
+                    if progress_callback and (
+                        completed_pairs == total_pairs
+                        or completed_pairs == 1
+                        or completed_pairs % progress_step == 0
+                    ):
+                        progress_callback(
+                            {
+                                "dataset": dataset["name"],
+                                "burn_set": burn_set_name,
+                                "current": completed_pairs,
+                                "total": total_pairs,
+                                "message": f"Processing {dataset['name']} / {burn_set_name}: {completed_pairs}/{total_pairs}",
+                            }
+                        )
+            else:
+                with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    pair_iterator = iter(enumerate(pairs, start=1))
+                    future_to_pair_index = {}
 
-                _copy_if_exists(
-                    pair["thermal_jpg"]["filepath"] if pair["thermal_jpg"] is not None else None,
-                    os.path.join(thermal_jpg_output_dir, thermal_jpg_output_name),
-                )
-                selected_tiff_source = (
-                    pair["cal_tiff"]["filepath"]
-                    if pair["cal_tiff"] is not None
-                    else pair["thermal_tiff"]["filepath"]
-                )
-                shutil.copy(
-                    selected_tiff_source,
-                    os.path.join(thermal_tiff_output_dir, thermal_tiff_output_name),
-                )
+                    def submit_next_pair():
+                        try:
+                            pair_index, pair = next(pair_iterator)
+                        except StopIteration:
+                            return False
+                        future = executor.submit(
+                            _export_presorted_pair_outputs,
+                            pair,
+                            pair_index,
+                            dataset["name"],
+                            burn_set_name,
+                            active_profile,
+                            camera_detection["camera"],
+                            rgb_corrected_output_dir,
+                            rgb_raw_output_dir,
+                            thermal_jpg_output_dir,
+                            thermal_tiff_output_dir,
+                        )
+                        future_to_pair_index[future] = pair_index
+                        return True
 
-                if progress_callback and (
-                    pair_index == total_pairs
-                    or pair_index == 1
-                    or pair_index % progress_step == 0
-                ):
-                    progress_callback(
-                        {
-                            "dataset": dataset["name"],
-                            "burn_set": burn_set_name,
-                            "current": pair_index,
-                            "total": total_pairs,
-                            "message": f"Processing {dataset['name']} / {burn_set_name}: {pair_index}/{total_pairs}",
-                        }
-                    )
+                    for _ in range(worker_count):
+                        if not submit_next_pair():
+                            break
+
+                    while future_to_pair_index:
+                        done_futures, _ = wait(
+                            future_to_pair_index.keys(),
+                            return_when=FIRST_COMPLETED,
+                        )
+                        for future in done_futures:
+                            pair_index = future_to_pair_index.pop(future)
+                            try:
+                                handle_export_result(future.result())
+                            except Exception as exc:
+                                pair = pairs[pair_index - 1]
+                                raise RuntimeError(
+                                    "Failed exporting pair "
+                                    f"{pair_index}/{total_pairs}: {pair['rgb']['filename']}"
+                                ) from exc
+
+                            completed_pairs += 1
+                            if progress_callback and (
+                                completed_pairs == total_pairs
+                                or completed_pairs == 1
+                                or completed_pairs % progress_step == 0
+                            ):
+                                progress_callback(
+                                    {
+                                        "dataset": dataset["name"],
+                                        "burn_set": burn_set_name,
+                                        "current": completed_pairs,
+                                        "total": total_pairs,
+                                        "message": f"Processing {dataset['name']} / {burn_set_name}: {completed_pairs}/{total_pairs}",
+                                    }
+                                )
+
+                        while len(future_to_pair_index) < worker_count:
+                            available_gb = _available_memory_gb()
+                            if (
+                                available_gb is not None
+                                and available_gb < PARALLEL_CORRECTED_FOV_MIN_FREE_RAM_GB
+                                and future_to_pair_index
+                            ):
+                                gc.collect()
+                                break
+                            if not submit_next_pair():
+                                break
+
+            qa_fallback_count = _run_alignment_dataset_qa(
+                pairs,
+                dataset["name"],
+                burn_set_name,
+                active_profile,
+                camera_detection["camera"],
+                rgb_corrected_output_dir,
+            )
+            if qa_fallback_count:
+                print(
+                    f"    Alignment QA fell back {qa_fallback_count} Corrected FOV image(s) to crop-only."
+                )
 
             for decision in pairing_result["decisions"]:
                 decision["detected_camera"] = camera_detection["camera"]
