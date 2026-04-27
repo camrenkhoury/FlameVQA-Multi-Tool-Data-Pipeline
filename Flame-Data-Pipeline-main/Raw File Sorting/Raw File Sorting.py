@@ -215,8 +215,7 @@ except ImportError:
 
 DJI = None
 rjpeg_to_heatmap = None
-plt = None
-sns = None
+mpl_colormaps = None
 get_video_properties = None
 psutil = None
 
@@ -224,16 +223,14 @@ psutil = None
 def _load_dji_dependencies():
     global DJI
     global rjpeg_to_heatmap
-    global plt
-    global sns
+    global mpl_colormaps
     global get_video_properties
     global psutil
 
     if (
         DJI is not None
         and rjpeg_to_heatmap is not None
-        and plt is not None
-        and sns is not None
+        and mpl_colormaps is not None
         and get_video_properties is not None
     ):
         return
@@ -241,8 +238,7 @@ def _load_dji_dependencies():
     try:
         from dji_thermal_sdk.utility import rjpeg_to_heatmap as imported_rjpeg_to_heatmap
         import dji_thermal_sdk.dji_sdk as imported_dji
-        import matplotlib.pyplot as imported_plt
-        import seaborn as imported_sns
+        from matplotlib import colormaps as imported_colormaps
         from videoprops import get_video_properties as imported_get_video_properties
         import psutil as imported_psutil
     except ImportError as exc:
@@ -254,8 +250,7 @@ def _load_dji_dependencies():
 
     DJI = imported_dji
     rjpeg_to_heatmap = imported_rjpeg_to_heatmap
-    plt = imported_plt
-    sns = imported_sns
+    mpl_colormaps = imported_colormaps
     get_video_properties = imported_get_video_properties
     psutil = imported_psutil
 
@@ -1959,6 +1954,26 @@ def generate_corrected_fov(
     if return_debug_info:
         return corrected_rgb, debug_info
     return corrected_rgb
+
+
+def _save_thermal_heatmap_jpg(temperature_array, output_path):
+    finite_mask = np.isfinite(temperature_array)
+    if finite_mask.any():
+        min_value = float(np.nanmin(temperature_array[finite_mask]))
+        max_value = float(np.nanmax(temperature_array[finite_mask]))
+    else:
+        min_value = 0.0
+        max_value = 1.0
+
+    if max_value <= min_value:
+        normalized = np.zeros_like(temperature_array, dtype=np.float32)
+    else:
+        normalized = (temperature_array.astype(np.float32) - min_value) / (max_value - min_value)
+    normalized = np.nan_to_num(normalized, nan=0.0, posinf=1.0, neginf=0.0)
+    normalized = np.clip(normalized, 0.0, 1.0)
+
+    rgba = mpl_colormaps["inferno"](normalized, bytes=True)
+    Image.fromarray(rgba[:, :, :3], mode="RGB").save(output_path)
 
 
 def _fit_image_to_panel(image, panel_size=(640, 512), background=(245, 245, 245)):
@@ -4004,20 +4019,10 @@ def raw_file_sorting():
                 temp_arr = rjpeg_to_heatmap(
                     f'{INPUT_FOLDER}{subfolder}/{ir_filename}', dtype='float32')
                 # recreate thermal jpg from heatmap. This gets rid of any DJI superresolution or digital zoom. Also removes watermark and changes color mapping.
-                fig = plt.figure(dpi=72, figsize=(
-                    640/72, 512/72), frameon=False)
-                fig.add_axes([0, 0, 1, 1])
-                ax = sns.heatmap(temp_arr, cmap='inferno', cbar=False)  # NOTE: this appears to have a minor memory leak! ax.cla + gc.collect appears to help, though isnt perfect
-                ax.set_xticks([])
-                ax.set_yticks([])
-                plt.savefig(
-                    f'{OUTPUT_FOLDER}{subfolder}/Images/Thermal/JPG/{rgb_filename_n}', dpi=72)
-                ax.cla()
-                del ax
-                plt.cla()
-                plt.clf()
-                plt.close('all')
-                del fig
+                _save_thermal_heatmap_jpg(
+                    temp_arr,
+                    f'{OUTPUT_FOLDER}{subfolder}/Images/Thermal/JPG/{rgb_filename_n}',
+                )
 
                 # grab exif from original thermal image.
                 original_ir_img = Image.open(

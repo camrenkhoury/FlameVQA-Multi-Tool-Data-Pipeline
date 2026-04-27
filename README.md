@@ -107,6 +107,7 @@ FlameVQA Dataset Builder is a **GUI-based system** for transforming raw wildfire
 - Camera detection for M30T and M2EA-style RGB resolutions
 - Safe crop-only FOV correction baseline
 - Experimental and reviewable SIFT-based AUTO_ALIGN workflow
+- Shared Corrected FOV generation path used by both GUI AUTO_ALIGN preview and production export
 - Visual validation exports for comparing crop-only vs AUTO_ALIGN
 - GUI viewer for side-by-side RGB/thermal overlay review
 - Strict validation for saved calibration profiles
@@ -205,7 +206,6 @@ python -m pip install numpy==1.26.4 opencv-python==4.9.0.80 pillow==10.2.0 pyasn
 - `opencv-python`
 - `pillow`
 - `matplotlib`
-- `seaborn`
 - `pandas`
 - `psutil`
 - `exif`
@@ -217,7 +217,7 @@ python -m pip install numpy==1.26.4 opencv-python==4.9.0.80 pillow==10.2.0 pyasn
 - `opencv-python` is required for SIFT, affine estimation, homography estimation, and optional ECC refinement.
 - `pillow` is used for image loading, RGB crops, overlays, EXIF preservation, and debug image exports.
 - `exif` is required by DJI raw-style processing and GPS tracing.
-- `matplotlib` and `seaborn` are still used by legacy DJI thermal JPG rendering.
+- `matplotlib` is used for the legacy DJI thermal JPG `inferno` colormap. The thermal JPG render path no longer uses `seaborn` or `matplotlib.pyplot`.
 - DJI thermal SDK DLLs remain in `Raw File Sorting/dji_thermal_sdk` for legacy DJI raw workflows.
 
 ---
@@ -267,22 +267,23 @@ Pair confidence levels:
 
 ## FOV Correction and Alignment
 
-### Current Safe Default
+### Current Production Default
 
 The production default is:
 
 ```
-FOV_CORRECTION_MODE = "CROP_ONLY"
+FOV_CORRECTION_MODE = "AUTO_ALIGN"
 ```
 
-`CROP_ONLY` means:
+`AUTO_ALIGN` means:
 
 - Use the camera's fixed coarse RGB crop
 - Resize that crop to the thermal output size, usually `640x512`
-- Do not apply saved calibration profiles
-- Do not apply SIFT transforms
+- Estimate a guarded SIFT/RANSAC transform against the selected thermal source
+- Apply the accepted transform to the original color RGB crop
+- Fall back to crop-only if AUTO_ALIGN fails validation
 
-This is the safe baseline. It prevents bad transforms from distorting the dataset.
+The saved `Images/RGB/Corrected FOV/<number>.JPG` is generated through the same `generate_corrected_fov(..., mode="AUTO_ALIGN")` path used by the GUI AUTO_ALIGN preview. When thermal opacity is set to 0%, the RGB shown in the AUTO_ALIGN overlay is the same Corrected FOV image source used for production export, aside from JPG compression.
 
 ### Why Crop-Only Is Not the Final Goal
 
@@ -307,7 +308,7 @@ Available FOV correction modes in `Raw File Sorting.py`:
 - `AUTO_ALIGN`: improved SIFT-based candidate alignment mode
 - `AUTO_SIFT_CALIBRATED`: AUTO_ALIGN-style mode that can use validated calibration fallback
 
-The GUI currently keeps production behavior safe unless the code configuration is changed.
+The GUI preview and production export now share one Corrected FOV generation function. Thermal source selection follows this priority: calibrated TIFF, thermal TIFF, then thermal JPG.
 
 ### AUTO_ALIGN Pipeline
 
@@ -326,6 +327,8 @@ AUTO_ALIGN does the following:
 11. Fall back to crop-only if validation fails
 
 The final saved RGB output is never grayscale. Grayscale/edge images are temporary working images only.
+
+AUTO_ALIGN is slower than crop-only because each exported pair runs feature extraction, feature matching, RANSAC validation, and image warping. Crop-only only crops and resizes.
 
 ### Crop Tightening
 
@@ -454,7 +457,7 @@ The default visual review flag is:
 visual_review_status = visually_better_unknown
 ```
 
-AUTO_ALIGN should not replace crop-only production output until visual review confirms that it improves full-image alignment without adding scaling or edge artifacts.
+AUTO_ALIGN is now the production Corrected FOV path. If AUTO_ALIGN fails validation, the pipeline falls back to crop-only and records the fallback in the pairing log.
 
 ### GUI Review
 
@@ -471,7 +474,7 @@ It also includes:
 - AUTO_ALIGN metrics for the selected pair
 - Confidence, transform, scale, translation, skew, rotation, inlier, grid-cell, RMSE, fallback, and questionable-reason display
 
-This is for review. It does not automatically promote AUTO_ALIGN to production.
+This is for review and for validating the same AUTO_ALIGN RGB image source used by production export.
 
 ---
 
@@ -515,7 +518,7 @@ The RGB image cropped and/or transformed to better correspond to the thermal fie
 Safe baseline FOV correction. Uses only fixed camera crop and resize.
 
 **AUTO_ALIGN**
-Experimental guarded alignment mode. Tests SIFT-based transform candidates and falls back if validation fails.
+Production guarded alignment mode. Tests SIFT-based transform candidates and falls back if validation fails.
 
 **SIFT**
 Scale-Invariant Feature Transform. Used here only on temporary grayscale/edge images to estimate RGB-to-thermal alignment.
@@ -551,8 +554,8 @@ Default validation status meaning AUTO_ALIGN has not been visually confirmed as 
 
 ## Known Issues
 
-- Original DJI raw workflow may still have high memory usage due to legacy thermal JPG rendering
-- Large batches above roughly 3000 image pairs may cause high memory use
+- The previously documented `seaborn` heatmap memory leak in legacy DJI thermal JPG rendering may be fixed. That path now renders thermal JPGs directly with NumPy, the matplotlib `inferno` colormap, and PIL instead of `sns.heatmap(...)` / `matplotlib.pyplot` figures.
+- Large batches should still be monitored for memory use because AUTO_ALIGN and DJI thermal extraction create temporary image arrays per pair.
 - AUTO_ALIGN can produce numerically strong candidates that still need visual review
 - Center landmarks may align while edges remain scaled or offset
 - Crop shrink settings may need camera-specific tuning
