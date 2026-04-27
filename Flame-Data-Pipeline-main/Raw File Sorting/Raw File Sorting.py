@@ -235,7 +235,8 @@ ALIGNMENT_DEBUG_DIRNAME = "alignment_debug"
 EXPORT_ALIGNMENT_DECISION_DEBUG_SAMPLES = True
 ALIGNMENT_DECISION_DEBUG_DIRNAME = "alignment_decision_debug"
 SEQUENCE_ALIGNMENT_ASSIST_ENABLED = True
-SEQUENCE_ALIGNMENT_MAX_NEIGHBOR_GAP = 30
+SEQUENCE_ALIGNMENT_MAX_NEIGHBOR_GAP = 5
+DATASET_MEDIAN_ALIGNMENT_FALLBACK_ENABLED = False
 PARALLEL_CORRECTED_FOV_EXPORT = True
 PARALLEL_CORRECTED_FOV_WORKERS = "AUTO"
 PARALLEL_CORRECTED_FOV_MAX_WORKERS = 4
@@ -3241,7 +3242,7 @@ def _run_alignment_dataset_qa(
     _add_neighbor_jump_reasons(qa_reasons_by_index, accepted_entries)
 
     anchor_entries = _sequence_anchor_entries(accepted_entries, qa_reasons_by_index)
-    median_matrix = _median_transform_matrix(anchor_entries)
+    median_matrix = _median_transform_matrix(anchor_entries) if DATASET_MEDIAN_ALIGNMENT_FALLBACK_ENABLED else None
     counts = {"sequence_assisted": 0, "dataset_median": 0, "crop_only_last_resort": 0}
     output_size = _get_output_size()
 
@@ -3360,6 +3361,8 @@ def _run_alignment_dataset_qa(
                 )
                 counts["dataset_median"] += 1
                 continue
+        elif not DATASET_MEDIAN_ALIGNMENT_FALLBACK_ENABLED:
+            pair["median_transform_candidate_reasons"] = ["dataset_median_fallback_disabled_no_blind_global_reuse"]
 
         crop_reasons = _unique_reasons(
             review_reasons
