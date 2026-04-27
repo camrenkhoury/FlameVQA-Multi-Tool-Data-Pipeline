@@ -132,9 +132,12 @@ ALIGNMENT_QA_MAD_MULTIPLIER = 6.0
 ALIGNMENT_QA_SCALE_OUTLIER_ABS = 0.18
 ALIGNMENT_QA_TRANSLATION_OUTLIER_PX = 45.0
 ALIGNMENT_QA_ROTATION_OUTLIER_DEG = 5.0
+ALIGNMENT_QA_SOURCE_MARGIN_OUTLIER_PX = 35.0
+ALIGNMENT_QA_SOURCE_BORDER_EXTENSION_PX = 8.0
 ALIGNMENT_QA_SCALE_JUMP_ABS = 0.15
 ALIGNMENT_QA_TRANSLATION_JUMP_PX = 35.0
 ALIGNMENT_QA_ROTATION_JUMP_DEG = 4.0
+ALIGNMENT_QA_SOURCE_MARGIN_JUMP_PX = 30.0
 CALIBRATION_PROFILES_DIRNAME = "Calibration Profiles"
 INVALID_CALIBRATION_PROFILES_DIRNAME = "Invalid Calibration Profiles"
 QUARANTINE_INVALID_CALIBRATION_PROFILES = False
@@ -206,6 +209,10 @@ EXPERIMENTAL_THERMAL_SHIFT_ENABLED = False
 EXPORT_ALIGNMENT_DEBUG_SAMPLES = False
 ALIGNMENT_DEBUG_SAMPLE_COUNT = 5
 ALIGNMENT_DEBUG_DIRNAME = "alignment_debug"
+EXPORT_ALIGNMENT_DECISION_DEBUG_SAMPLES = True
+ALIGNMENT_DECISION_DEBUG_DIRNAME = "alignment_decision_debug"
+SEQUENCE_ALIGNMENT_ASSIST_ENABLED = True
+SEQUENCE_ALIGNMENT_MAX_NEIGHBOR_GAP = 30
 PARALLEL_CORRECTED_FOV_EXPORT = True
 PARALLEL_CORRECTED_FOV_WORKERS = "AUTO"
 PARALLEL_CORRECTED_FOV_MAX_WORKERS = 4
@@ -1254,6 +1261,16 @@ def _default_feature_alignment_result(status="not_run"):
         "determinant": 1.0,
         "translation_x": 0.0,
         "translation_y": 0.0,
+        "source_footprint_valid": True,
+        "source_footprint_min_x": 0.0,
+        "source_footprint_min_y": 0.0,
+        "source_footprint_max_x": float(_get_output_size()[0]),
+        "source_footprint_max_y": float(_get_output_size()[1]),
+        "source_margin_left": 0.0,
+        "source_margin_top": 0.0,
+        "source_margin_right": 0.0,
+        "source_margin_bottom": 0.0,
+        "source_border_extension_px": 0.0,
         "accepted": False,
         "reasons": [],
     }
@@ -1377,6 +1394,61 @@ def _transform_geometry_summary(matrix, output_size):
     }
 
 
+def _source_footprint_summary(matrix, output_size):
+    matrix = np.asarray(matrix, dtype=np.float32)
+    width, height = output_size
+    default_summary = {
+        "source_footprint_valid": False,
+        "source_footprint_min_x": 0.0,
+        "source_footprint_min_y": 0.0,
+        "source_footprint_max_x": float(width),
+        "source_footprint_max_y": float(height),
+        "source_margin_left": 0.0,
+        "source_margin_top": 0.0,
+        "source_margin_right": 0.0,
+        "source_margin_bottom": 0.0,
+        "source_border_extension_px": 0.0,
+    }
+
+    try:
+        inverse_matrix = np.linalg.inv(matrix)
+    except np.linalg.LinAlgError:
+        return default_summary
+
+    source_corners = _project_output_corners(inverse_matrix, output_size)
+    if not np.all(np.isfinite(source_corners)):
+        return default_summary
+
+    min_x = float(np.min(source_corners[:, 0]))
+    min_y = float(np.min(source_corners[:, 1]))
+    max_x = float(np.max(source_corners[:, 0]))
+    max_y = float(np.max(source_corners[:, 1]))
+    margin_left = min_x
+    margin_top = min_y
+    margin_right = float(width) - max_x
+    margin_bottom = float(height) - max_y
+    border_extension = max(
+        0.0,
+        -margin_left,
+        -margin_top,
+        -margin_right,
+        -margin_bottom,
+    )
+
+    return {
+        "source_footprint_valid": True,
+        "source_footprint_min_x": min_x,
+        "source_footprint_min_y": min_y,
+        "source_footprint_max_x": max_x,
+        "source_footprint_max_y": max_y,
+        "source_margin_left": margin_left,
+        "source_margin_top": margin_top,
+        "source_margin_right": margin_right,
+        "source_margin_bottom": margin_bottom,
+        "source_border_extension_px": border_extension,
+    }
+
+
 def _signed_polygon_area(points):
     points = np.asarray(points, dtype=np.float32)
     if len(points) < 3:
@@ -1474,6 +1546,7 @@ def _validate_feature_alignment_result(
     mean_error = None if not len(inlier_errors) else float(inlier_errors.mean())
     max_error = None if not len(inlier_errors) else float(inlier_errors.max())
     geometry = _transform_geometry_summary(matrix, output_size)
+    source_footprint = _source_footprint_summary(matrix, output_size)
     inlier_grid_cells = _occupied_grid_cell_count(
         source_points[inlier_mask] if inlier_count else [],
         source_image_size or output_size,
@@ -1503,6 +1576,10 @@ def _validate_feature_alignment_result(
         reasons.append("unrealistic_translation")
     if geometry["determinant"] <= 0:
         reasons.append("orientation_flip")
+    if not source_footprint["source_footprint_valid"]:
+        reasons.append("invalid_source_footprint")
+    if source_footprint["source_border_extension_px"] > ALIGNMENT_QA_SOURCE_BORDER_EXTENSION_PX:
+        reasons.append("source_border_expansion")
 
     disqualifying_reasons = {
         "not_enough_good_matches",
@@ -1513,6 +1590,8 @@ def _validate_feature_alignment_result(
         "unrealistic_skew",
         "unrealistic_translation",
         "orientation_flip",
+        "invalid_source_footprint",
+        "source_border_expansion",
     }
     relaxed_reasons = {"not_enough_ransac_inliers", "low_inlier_ratio"}
     relaxed_accepted = (
@@ -1554,6 +1633,16 @@ def _validate_feature_alignment_result(
             "determinant": geometry["determinant"],
             "translation_x": geometry["translation_x"],
             "translation_y": geometry["translation_y"],
+            "source_footprint_valid": source_footprint["source_footprint_valid"],
+            "source_footprint_min_x": source_footprint["source_footprint_min_x"],
+            "source_footprint_min_y": source_footprint["source_footprint_min_y"],
+            "source_footprint_max_x": source_footprint["source_footprint_max_x"],
+            "source_footprint_max_y": source_footprint["source_footprint_max_y"],
+            "source_margin_left": source_footprint["source_margin_left"],
+            "source_margin_top": source_footprint["source_margin_top"],
+            "source_margin_right": source_footprint["source_margin_right"],
+            "source_margin_bottom": source_footprint["source_margin_bottom"],
+            "source_border_extension_px": source_footprint["source_border_extension_px"],
             "accepted": confidence_level in {"HIGH", "MEDIUM"},
             "relaxed_acceptance": bool(relaxed_accepted),
             "reasons": reasons,
@@ -2224,6 +2313,18 @@ def _translation_distance(alignment, median_x=None, median_y=None):
 
 
 def _alignment_jump(current_alignment, neighbor_alignment):
+    source_margin_jump = max(
+        abs(
+            (_alignment_value(current_alignment, margin_key) or 0.0)
+            - (_alignment_value(neighbor_alignment, margin_key) or 0.0)
+        )
+        for margin_key in (
+            "source_margin_left",
+            "source_margin_top",
+            "source_margin_right",
+            "source_margin_bottom",
+        )
+    )
     return {
         "scale_x": abs(
             (_alignment_value(current_alignment, "scale_x") or 1.0)
@@ -2243,6 +2344,7 @@ def _alignment_jump(current_alignment, neighbor_alignment):
                 ((_alignment_value(current_alignment, "translation_y") or 0.0) - (_alignment_value(neighbor_alignment, "translation_y") or 0.0)),
             )
         ),
+        "source_margin": source_margin_jump,
     }
 
 
@@ -2301,6 +2403,24 @@ def _qa_reasons_for_alignment(pair, medians):
         if translation_delta is not None and translation_delta > ALIGNMENT_QA_TRANSLATION_OUTLIER_PX:
             reasons.append("qa_translation_outlier_vs_dataset_median")
 
+        for margin_key, reason_name in (
+            ("source_margin_left", "qa_source_left_margin_outlier_vs_dataset_median"),
+            ("source_margin_top", "qa_source_top_margin_outlier_vs_dataset_median"),
+            ("source_margin_right", "qa_source_right_margin_outlier_vs_dataset_median"),
+            ("source_margin_bottom", "qa_source_bottom_margin_outlier_vs_dataset_median"),
+        ):
+            if _robust_scalar_outlier(
+                _alignment_value(alignment, margin_key),
+                medians[margin_key][0],
+                medians[margin_key][1],
+                ALIGNMENT_QA_SOURCE_MARGIN_OUTLIER_PX,
+            ):
+                reasons.append(reason_name)
+
+    border_extension = _alignment_value(alignment, "source_border_extension_px")
+    if border_extension is not None and border_extension > ALIGNMENT_QA_SOURCE_BORDER_EXTENSION_PX:
+        reasons.append("qa_source_border_expansion")
+
     return reasons
 
 
@@ -2336,6 +2456,267 @@ def _add_neighbor_jump_reasons(qa_reasons_by_index, accepted_entries):
             and neighbor_jump["rotation_degrees"] <= ALIGNMENT_QA_ROTATION_JUMP_DEG
         ):
             qa_reasons_by_index.setdefault(pair_index, []).append("qa_sudden_rotation_jump")
+        if (
+            previous_jump["source_margin"] > ALIGNMENT_QA_SOURCE_MARGIN_JUMP_PX
+            and next_jump["source_margin"] > ALIGNMENT_QA_SOURCE_MARGIN_JUMP_PX
+            and neighbor_jump["source_margin"] <= ALIGNMENT_QA_SOURCE_MARGIN_JUMP_PX
+        ):
+            qa_reasons_by_index.setdefault(pair_index, []).append("qa_sudden_source_margin_jump")
+
+
+def _compute_alignment_medians(accepted_entries):
+    if len(accepted_entries) < ALIGNMENT_QA_MIN_MEDIAN_SAMPLE_COUNT:
+        return None
+    alignments = [alignment for _, _, alignment in accepted_entries]
+    return {
+        "scale_x": _median_and_mad(_alignment_value(alignment, "scale_x") for alignment in alignments),
+        "scale_y": _median_and_mad(_alignment_value(alignment, "scale_y") for alignment in alignments),
+        "translation_x": _median_and_mad(_alignment_value(alignment, "translation_x") for alignment in alignments),
+        "translation_y": _median_and_mad(_alignment_value(alignment, "translation_y") for alignment in alignments),
+        "rotation_degrees": _median_and_mad(_alignment_value(alignment, "rotation_degrees") for alignment in alignments),
+        "source_margin_left": _median_and_mad(_alignment_value(alignment, "source_margin_left") for alignment in alignments),
+        "source_margin_top": _median_and_mad(_alignment_value(alignment, "source_margin_top") for alignment in alignments),
+        "source_margin_right": _median_and_mad(_alignment_value(alignment, "source_margin_right") for alignment in alignments),
+        "source_margin_bottom": _median_and_mad(_alignment_value(alignment, "source_margin_bottom") for alignment in alignments),
+    }
+
+
+def _alignment_matrix_or_none(alignment):
+    matrix = alignment.get("matrix") if alignment else None
+    if matrix is None:
+        return None
+    try:
+        matrix_array = np.asarray(matrix, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+    if matrix_array.shape != (3, 3) or not np.all(np.isfinite(matrix_array)):
+        return None
+    return matrix_array
+
+
+def _alignment_from_transform_matrix(
+    matrix,
+    output_size,
+    decision_source,
+    transform_type="affine",
+    confidence_level="MEDIUM",
+    accepted=True,
+    fallback_used="none",
+    reasons=None,
+    source_alignment=None,
+):
+    matrix_array = np.asarray(matrix, dtype=np.float32)
+    alignment = _default_feature_alignment_result("ok" if accepted else decision_source)
+    geometry = _transform_geometry_summary(matrix_array, output_size)
+    source_footprint = _source_footprint_summary(matrix_array, output_size)
+    alignment.update(
+        {
+            "status": "ok" if accepted else decision_source,
+            "confidence_level": confidence_level,
+            "fallback_used": fallback_used,
+            "matrix": _matrix_to_list(matrix_array),
+            "transform_type": transform_type,
+            "accepted": bool(accepted),
+            "reasons": list(reasons or []),
+            "alignment_decision_source": decision_source,
+            "mean_reprojection_error_px": None,
+            "max_reprojection_error_px": None,
+            "inliers": 0,
+            "inlier_ratio": 0.0,
+            "good_matches": 0,
+            "raw_good_matches": 0,
+        }
+    )
+    if source_alignment is not None:
+        alignment["source_alignment_confidence_level"] = source_alignment.get("confidence_level", "")
+        alignment["source_alignment_inliers"] = source_alignment.get("inliers", "")
+        alignment["source_alignment_status"] = source_alignment.get("status", "")
+    alignment.update(geometry)
+    alignment.update(source_footprint)
+    return alignment
+
+
+def _predicted_alignment_validation_reasons(alignment, medians=None):
+    reasons = _profile_transform_sanity_reasons(
+        alignment.get("matrix"),
+        _get_output_size(),
+        model_name=alignment.get("transform_type", "affine"),
+    )
+    if not alignment.get("source_footprint_valid", False):
+        reasons.append("predicted_invalid_source_footprint")
+    border_extension = _alignment_value(alignment, "source_border_extension_px")
+    if border_extension is not None and border_extension > ALIGNMENT_QA_SOURCE_BORDER_EXTENSION_PX:
+        reasons.append("predicted_source_border_expansion")
+
+    if medians:
+        for key, reason_name, threshold in (
+            ("scale_x", "predicted_scale_x_outlier_vs_dataset_median", ALIGNMENT_QA_SCALE_OUTLIER_ABS),
+            ("scale_y", "predicted_scale_y_outlier_vs_dataset_median", ALIGNMENT_QA_SCALE_OUTLIER_ABS),
+            ("rotation_degrees", "predicted_rotation_outlier_vs_dataset_median", ALIGNMENT_QA_ROTATION_OUTLIER_DEG),
+            ("source_margin_left", "predicted_source_left_margin_outlier_vs_dataset_median", ALIGNMENT_QA_SOURCE_MARGIN_OUTLIER_PX),
+            ("source_margin_top", "predicted_source_top_margin_outlier_vs_dataset_median", ALIGNMENT_QA_SOURCE_MARGIN_OUTLIER_PX),
+            ("source_margin_right", "predicted_source_right_margin_outlier_vs_dataset_median", ALIGNMENT_QA_SOURCE_MARGIN_OUTLIER_PX),
+            ("source_margin_bottom", "predicted_source_bottom_margin_outlier_vs_dataset_median", ALIGNMENT_QA_SOURCE_MARGIN_OUTLIER_PX),
+        ):
+            if _robust_scalar_outlier(
+                _alignment_value(alignment, key),
+                medians[key][0],
+                medians[key][1],
+                threshold,
+            ):
+                reasons.append(reason_name)
+
+        translation_delta = _translation_distance(
+            alignment,
+            medians["translation_x"][0],
+            medians["translation_y"][0],
+        )
+        if translation_delta is not None and translation_delta > ALIGNMENT_QA_TRANSLATION_OUTLIER_PX:
+            reasons.append("predicted_translation_outlier_vs_dataset_median")
+
+    return _unique_reasons(reasons)
+
+
+def _sequence_anchor_entries(accepted_entries, qa_reasons_by_index):
+    anchors = []
+    for pair_index, pair, alignment in accepted_entries:
+        if qa_reasons_by_index.get(pair_index):
+            continue
+        matrix = _alignment_matrix_or_none(alignment)
+        if matrix is None:
+            continue
+        anchors.append((pair_index, pair, alignment))
+    return anchors
+
+
+def _interpolate_matrices(previous_entry, next_entry, pair_index):
+    previous_index, _, previous_alignment = previous_entry
+    next_index, _, next_alignment = next_entry
+    previous_matrix = _alignment_matrix_or_none(previous_alignment)
+    next_matrix = _alignment_matrix_or_none(next_alignment)
+    if previous_matrix is None or next_matrix is None:
+        return None
+    if next_index == previous_index:
+        return previous_matrix
+    weight = (pair_index - previous_index) / float(next_index - previous_index)
+    matrix = previous_matrix + ((next_matrix - previous_matrix) * weight)
+    matrix[2, :] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return matrix
+
+
+def _predict_sequence_transform(pair_index, anchor_entries):
+    if not SEQUENCE_ALIGNMENT_ASSIST_ENABLED or not anchor_entries:
+        return None, "sequence_assist_disabled_or_no_anchors", []
+
+    previous_entry = None
+    next_entry = None
+    for anchor_entry in anchor_entries:
+        anchor_index = anchor_entry[0]
+        if anchor_index < pair_index:
+            previous_entry = anchor_entry
+        elif anchor_index > pair_index and next_entry is None:
+            next_entry = anchor_entry
+            break
+
+    references = []
+    if previous_entry is not None and pair_index - previous_entry[0] <= SEQUENCE_ALIGNMENT_MAX_NEIGHBOR_GAP:
+        references.append(previous_entry[2])
+    else:
+        previous_entry = None
+    if next_entry is not None and next_entry[0] - pair_index <= SEQUENCE_ALIGNMENT_MAX_NEIGHBOR_GAP:
+        references.append(next_entry[2])
+    else:
+        next_entry = None
+
+    if previous_entry is not None and next_entry is not None:
+        return _interpolate_matrices(previous_entry, next_entry, pair_index), "interpolated_neighbor_transforms", references
+    if previous_entry is not None:
+        return _alignment_matrix_or_none(previous_entry[2]), "previous_neighbor_transform", references
+    if next_entry is not None:
+        return _alignment_matrix_or_none(next_entry[2]), "next_neighbor_transform", references
+    return None, "no_nearby_sequence_anchor", []
+
+
+def _median_transform_matrix(anchor_entries):
+    matrices = []
+    for _, _, alignment in anchor_entries:
+        matrix = _alignment_matrix_or_none(alignment)
+        if matrix is not None:
+            matrices.append(matrix)
+    if not matrices:
+        return None
+    median_matrix = np.median(np.stack(matrices, axis=0), axis=0).astype(np.float32)
+    median_matrix[2, :] = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+    return median_matrix
+
+
+def _save_corrected_fov_with_transform(
+    pair,
+    dataset_name,
+    burn_set_name,
+    active_profile,
+    camera_name,
+    rgb_corrected_output_dir,
+    transform_matrix,
+):
+    crop_only_image, crop_debug = generate_corrected_fov(
+        pair,
+        mode="CROP_ONLY",
+        dataset_name=dataset_name,
+        burn_set_name=burn_set_name,
+        calibration_profile=active_profile,
+        camera_used=camera_name,
+        return_debug_info=True,
+    )
+    try:
+        transformed_image = _warp_corrected_image(
+            crop_only_image,
+            transform_matrix,
+            crop_debug["output_size"],
+        )
+        try:
+            if "exif" in crop_only_image.info:
+                transformed_image.info["exif"] = crop_only_image.info["exif"]
+            _save_corrected_rgb(
+                transformed_image,
+                os.path.join(rgb_corrected_output_dir, f"{pair['output_stem']}.JPG"),
+            )
+        finally:
+            transformed_image.close()
+    finally:
+        crop_only_image.close()
+    return crop_debug
+
+
+def _set_final_alignment_decision(
+    pair,
+    final_status,
+    final_alignment,
+    transform_matrix,
+    review_required=False,
+    review_reasons=None,
+    qa_action="",
+    sequence_used=False,
+    median_used=False,
+    crop_only_used=False,
+):
+    review_reasons = _unique_reasons(review_reasons or [])
+    pair["feature_alignment"] = final_alignment
+    pair["alignment_final_status"] = final_status
+    pair["final_model_used"] = final_status
+    pair["final_model_after_dataset_qa"] = final_status
+    pair["selected_transform_matrix"] = _matrix_to_list(transform_matrix)
+    pair["final_transform_matrix"] = _matrix_to_list(transform_matrix)
+    pair["fallback_occurred"] = bool(crop_only_used)
+    pair["sequence_assisted_used"] = bool(sequence_used)
+    pair["median_transform_fallback_used"] = bool(median_used)
+    pair["crop_only_used"] = bool(crop_only_used)
+    pair["alignment_review_required"] = bool(review_required)
+    pair["alignment_review_status"] = "review_required" if review_required else ""
+    pair["alignment_review_reasons"] = review_reasons
+    pair["alignment_qa_action"] = qa_action
+    if review_required:
+        pair["review_required"] = True
 
 
 def _fallback_saved_corrected_fov_to_crop_only(
@@ -2375,19 +2756,15 @@ def _run_alignment_dataset_qa(
     rgb_corrected_output_dir,
 ):
     if not ALIGNMENT_DATASET_QA_ENABLED:
-        return 0
+        return {"sequence_assisted": 0, "dataset_median": 0, "crop_only_last_resort": 0}
+
+    for pair in pairs:
+        pair["per_image_feature_alignment"] = dict(
+            pair.get("feature_alignment", _default_feature_alignment_result())
+        )
 
     accepted_entries = _accepted_alignment_entries(pairs)
-    medians = None
-    if len(accepted_entries) >= ALIGNMENT_QA_MIN_MEDIAN_SAMPLE_COUNT:
-        alignments = [alignment for _, _, alignment in accepted_entries]
-        medians = {
-            "scale_x": _median_and_mad(_alignment_value(alignment, "scale_x") for alignment in alignments),
-            "scale_y": _median_and_mad(_alignment_value(alignment, "scale_y") for alignment in alignments),
-            "translation_x": _median_and_mad(_alignment_value(alignment, "translation_x") for alignment in alignments),
-            "translation_y": _median_and_mad(_alignment_value(alignment, "translation_y") for alignment in alignments),
-            "rotation_degrees": _median_and_mad(_alignment_value(alignment, "rotation_degrees") for alignment in alignments),
-        }
+    medians = _compute_alignment_medians(accepted_entries)
 
     qa_reasons_by_index = {}
     for pair_index, pair, _alignment in accepted_entries:
@@ -2396,39 +2773,176 @@ def _run_alignment_dataset_qa(
             qa_reasons_by_index[pair_index] = reasons
     _add_neighbor_jump_reasons(qa_reasons_by_index, accepted_entries)
 
-    fallback_count = 0
-    for pair_index, reasons in sorted(qa_reasons_by_index.items()):
-        pair = pairs[pair_index - 1]
-        reasons = _unique_reasons(reasons)
-        alignment = dict(pair.get("feature_alignment", {}))
-        alignment["qa_review_required"] = True
-        alignment["qa_review_reasons"] = reasons
-        alignment["qa_action"] = "fallback_crop_only"
-        alignment["accepted_before_qa"] = alignment.get("accepted")
-        alignment["accepted"] = False
-        alignment["fallback_used"] = "qa_crop_only"
-        alignment["reasons"] = _unique_reasons(alignment.get("reasons", []) + reasons)
-        pair["feature_alignment"] = alignment
-        pair["alignment_review_required"] = True
-        pair["alignment_review_reasons"] = reasons
-        pair["alignment_qa_action"] = "fallback_crop_only"
-        pair["review_required"] = True
-        _fallback_saved_corrected_fov_to_crop_only(
+    anchor_entries = _sequence_anchor_entries(accepted_entries, qa_reasons_by_index)
+    median_matrix = _median_transform_matrix(anchor_entries)
+    counts = {"sequence_assisted": 0, "dataset_median": 0, "crop_only_last_resort": 0}
+    output_size = _get_output_size()
+
+    for pair_index, pair in enumerate(pairs, start=1):
+        per_image_alignment = pair["per_image_feature_alignment"]
+        per_image_matrix = _alignment_matrix_or_none(per_image_alignment)
+        per_image_accepted = bool(
+            per_image_alignment.get("accepted")
+            and per_image_alignment.get("fallback_used", "none") == "none"
+            and per_image_matrix is not None
+        )
+        per_image_qa_reasons = _unique_reasons(qa_reasons_by_index.get(pair_index, []))
+        pair["per_image_sift_accepted"] = per_image_accepted
+        pair["per_image_sift_qa_reasons"] = per_image_qa_reasons
+        pair["sequence_assisted_candidate_reasons"] = []
+        pair["median_transform_candidate_reasons"] = []
+
+        if per_image_accepted and not per_image_qa_reasons:
+            final_alignment = dict(per_image_alignment)
+            final_alignment["alignment_decision_source"] = "per_image_sift"
+            final_status = (
+                "aligned_sift_high"
+                if final_alignment.get("confidence_level") == "HIGH"
+                else "aligned_sift_medium"
+            )
+            _set_final_alignment_decision(
+                pair,
+                final_status,
+                final_alignment,
+                per_image_matrix,
+            )
+            continue
+
+        review_reasons = _unique_reasons(
+            per_image_qa_reasons
+            + per_image_alignment.get("reasons", [])
+            + (["per_image_sift_not_accepted"] if not per_image_accepted else [])
+        )
+
+        sequence_matrix, sequence_source, _sequence_references = _predict_sequence_transform(
+            pair_index,
+            anchor_entries,
+        )
+        pair["sequence_assisted_source"] = sequence_source
+        if sequence_matrix is not None:
+            sequence_alignment = _alignment_from_transform_matrix(
+                sequence_matrix,
+                output_size,
+                decision_source="sequence_assisted_align",
+                transform_type="affine",
+                confidence_level="MEDIUM",
+                accepted=True,
+                reasons=review_reasons,
+                source_alignment=per_image_alignment,
+            )
+            sequence_reasons = _predicted_alignment_validation_reasons(sequence_alignment, medians)
+            pair["sequence_assisted_candidate_matrix"] = _matrix_to_list(sequence_matrix)
+            pair["sequence_assisted_candidate_reasons"] = sequence_reasons
+            if not sequence_reasons:
+                _save_corrected_fov_with_transform(
+                    pair,
+                    dataset_name,
+                    burn_set_name,
+                    active_profile,
+                    camera_name,
+                    rgb_corrected_output_dir,
+                    sequence_matrix,
+                )
+                _set_final_alignment_decision(
+                    pair,
+                    "aligned_sequence_assisted",
+                    sequence_alignment,
+                    sequence_matrix,
+                    sequence_used=True,
+                    qa_action="sequence_assisted_align",
+                )
+                counts["sequence_assisted"] += 1
+                continue
+
+        if median_matrix is not None:
+            median_alignment = _alignment_from_transform_matrix(
+                median_matrix,
+                output_size,
+                decision_source="dataset_median_transform",
+                transform_type="affine",
+                confidence_level="MEDIUM",
+                accepted=True,
+                reasons=review_reasons,
+                source_alignment=per_image_alignment,
+            )
+            median_reasons = _predicted_alignment_validation_reasons(median_alignment, medians)
+            pair["median_transform_candidate_matrix"] = _matrix_to_list(median_matrix)
+            pair["median_transform_candidate_reasons"] = median_reasons
+            if not median_reasons:
+                _save_corrected_fov_with_transform(
+                    pair,
+                    dataset_name,
+                    burn_set_name,
+                    active_profile,
+                    camera_name,
+                    rgb_corrected_output_dir,
+                    median_matrix,
+                )
+                _set_final_alignment_decision(
+                    pair,
+                    "aligned_dataset_median",
+                    median_alignment,
+                    median_matrix,
+                    median_used=True,
+                    qa_action="dataset_median_transform",
+                )
+                counts["dataset_median"] += 1
+                continue
+
+        crop_reasons = _unique_reasons(
+            review_reasons
+            + pair.get("sequence_assisted_candidate_reasons", [])
+            + pair.get("median_transform_candidate_reasons", [])
+            + ["crop_only_last_resort"]
+        )
+        identity_matrix = _identity_transform_matrix()
+        _save_corrected_fov_with_transform(
             pair,
             dataset_name,
             burn_set_name,
             active_profile,
             camera_name,
             rgb_corrected_output_dir,
+            identity_matrix,
         )
-        fallback_count += 1
+        crop_alignment = _alignment_from_transform_matrix(
+            identity_matrix,
+            output_size,
+            decision_source="crop_only_last_resort",
+            transform_type="crop_only",
+            confidence_level="LOW",
+            accepted=False,
+            fallback_used="crop_only_last_resort",
+            reasons=crop_reasons,
+            source_alignment=per_image_alignment,
+        )
+        _set_final_alignment_decision(
+            pair,
+            "crop_only_last_resort",
+            crop_alignment,
+            identity_matrix,
+            review_required=True,
+            review_reasons=crop_reasons,
+            qa_action="crop_only_last_resort",
+            crop_only_used=True,
+        )
+        counts["crop_only_last_resort"] += 1
 
     for pair in pairs:
         pair.setdefault("alignment_review_required", False)
+        pair.setdefault("alignment_review_status", "")
         pair.setdefault("alignment_review_reasons", [])
         pair.setdefault("alignment_qa_action", "")
+        pair.setdefault("alignment_final_status", "")
+        pair.setdefault("final_model_used", "")
+        pair.setdefault("final_model_after_dataset_qa", "")
+        pair.setdefault("per_image_sift_accepted", False)
+        pair.setdefault("per_image_sift_qa_reasons", [])
+        pair.setdefault("sequence_assisted_used", False)
+        pair.setdefault("median_transform_fallback_used", False)
+        pair.setdefault("crop_only_used", False)
 
-    return fallback_count
+    return counts
 
 
 def _fit_image_to_panel(image, panel_size=(640, 512), background=(245, 245, 245)):
@@ -2600,6 +3114,162 @@ def _build_validation_comparison_grid(items):
         canvas.paste(_fit_image_to_panel(image, panel_size=panel_size), (x, y + label_height))
 
     return canvas
+
+
+def _select_alignment_decision_debug_samples(pairs):
+    sample_specs = [
+        (
+            "good_sift",
+            lambda pair: pair.get("alignment_final_status") in {"aligned_sift_high", "aligned_sift_medium"},
+        ),
+        (
+            "weak_sift",
+            lambda pair: bool(pair.get("per_image_sift_qa_reasons")),
+        ),
+        (
+            "sequence_assisted",
+            lambda pair: pair.get("alignment_final_status") == "aligned_sequence_assisted",
+        ),
+        (
+            "crop_only_last_resort",
+            lambda pair: pair.get("alignment_final_status") == "crop_only_last_resort",
+        ),
+    ]
+
+    selected = []
+    selected_paths = set()
+    for label, predicate in sample_specs:
+        for pair in pairs:
+            if not predicate(pair):
+                continue
+            rgb_path = pair["rgb"]["filepath"]
+            if rgb_path in selected_paths:
+                continue
+            selected.append((label, pair))
+            selected_paths.add(rgb_path)
+            break
+    return selected
+
+
+def _debug_image_from_transform(crop_only_image, transform_matrix):
+    matrix = _alignment_matrix_or_none({"matrix": transform_matrix})
+    if matrix is None:
+        return None
+    return _warp_corrected_image(crop_only_image, matrix, crop_only_image.size)
+
+
+def export_alignment_decision_debug_samples(
+    output_root,
+    dataset_name,
+    burn_set_name,
+    pairs,
+    active_profile,
+    camera_name,
+    rgb_corrected_output_dir,
+):
+    samples = _select_alignment_decision_debug_samples(pairs)
+    if not samples:
+        return None
+
+    debug_root = os.path.join(output_root, ALIGNMENT_DECISION_DEBUG_DIRNAME)
+    os.makedirs(debug_root, exist_ok=True)
+    summary_rows = []
+    summary_path = os.path.join(debug_root, "alignment_decision_debug_summary.csv")
+
+    for sample_number, (sample_label, pair) in enumerate(samples, start=1):
+        sample_prefix = _sanitize_identifier(
+            f"sample_{sample_number:02d}_{sample_label}_{pair.get('output_stem', '')}_{pair['rgb']['filename']}"
+        )
+        thermal_source_path, _thermal_source_name = _select_corrected_fov_thermal_source(pair)
+        crop_only_image, _crop_debug = generate_corrected_fov(
+            pair,
+            mode="CROP_ONLY",
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            calibration_profile=active_profile,
+            camera_used=camera_name,
+            return_debug_info=True,
+        )
+        crop_only_image = crop_only_image.convert("RGB")
+        per_image_alignment = pair.get("per_image_feature_alignment", {})
+        per_image_candidate = _debug_image_from_transform(
+            crop_only_image,
+            per_image_alignment.get("matrix", _identity_transform_matrix()),
+        )
+        sequence_candidate = None
+        if pair.get("sequence_assisted_candidate_matrix") is not None:
+            sequence_candidate = _debug_image_from_transform(
+                crop_only_image,
+                pair.get("sequence_assisted_candidate_matrix"),
+            )
+
+        final_path = os.path.join(rgb_corrected_output_dir, f"{pair['output_stem']}.JPG")
+        final_saved = _load_debug_preview_image(final_path) if os.path.exists(final_path) else None
+        thermal_image = _load_debug_preview_image(thermal_source_path) if thermal_source_path else None
+        final_overlay = (
+            _blend_rgb_thermal_overlay(final_saved, thermal_image)
+            if final_saved is not None and thermal_image is not None
+            else None
+        )
+
+        crop_only_image.save(os.path.join(debug_root, f"{sample_prefix}_crop_only.png"))
+        if per_image_candidate is not None:
+            per_image_candidate.save(os.path.join(debug_root, f"{sample_prefix}_per_image_auto_align_candidate.png"))
+        if sequence_candidate is not None:
+            sequence_candidate.save(os.path.join(debug_root, f"{sample_prefix}_sequence_assisted_result.png"))
+        if final_saved is not None:
+            final_saved.save(os.path.join(debug_root, f"{sample_prefix}_final_saved_corrected_fov.png"))
+        if thermal_image is not None:
+            thermal_image.save(os.path.join(debug_root, f"{sample_prefix}_thermal.png"))
+        if final_overlay is not None:
+            final_overlay.save(os.path.join(debug_root, f"{sample_prefix}_final_overlay.png"))
+
+        comparison_grid = _build_validation_comparison_grid(
+            [
+                ("Crop-Only", crop_only_image),
+                ("Per-Image AUTO_ALIGN Candidate", per_image_candidate),
+                ("Sequence-Assisted Result", sequence_candidate),
+                ("Final Saved Corrected FOV", final_saved),
+                ("Thermal", thermal_image),
+                ("Final Overlay", final_overlay),
+            ]
+        )
+        comparison_grid.save(os.path.join(debug_root, f"{sample_prefix}_comparison.png"))
+        comparison_grid.close()
+
+        summary_rows.append(
+            {
+                "sample_label": sample_label,
+                "output_stem": pair.get("output_stem", ""),
+                "rgb_filename": pair["rgb"]["filename"],
+                "alignment_final_status": pair.get("alignment_final_status", ""),
+                "per_image_sift_accepted": str(pair.get("per_image_sift_accepted", "")),
+                "per_image_sift_qa_reasons": " | ".join(pair.get("per_image_sift_qa_reasons", [])),
+                "sequence_assisted_source": pair.get("sequence_assisted_source", ""),
+                "sequence_assisted_candidate_reasons": " | ".join(pair.get("sequence_assisted_candidate_reasons", [])),
+                "median_transform_candidate_reasons": " | ".join(pair.get("median_transform_candidate_reasons", [])),
+                "alignment_review_required": str(pair.get("alignment_review_required", "")),
+                "alignment_review_reasons": " | ".join(pair.get("alignment_review_reasons", [])),
+            }
+        )
+
+        for image in (
+            crop_only_image,
+            per_image_candidate,
+            sequence_candidate,
+            final_saved,
+            thermal_image,
+            final_overlay,
+        ):
+            if image is not None:
+                image.close()
+
+    if summary_rows:
+        with open(summary_path, "w", newline="", encoding="utf-8") as summary_file:
+            writer = csv.DictWriter(summary_file, fieldnames=list(summary_rows[0].keys()))
+            writer.writeheader()
+            writer.writerows(summary_rows)
+    return debug_root
 
 
 def _write_manual_calibration_model_metrics(debug_root, calibration_profile):
@@ -3683,6 +4353,7 @@ def _format_time_delta_for_csv(time_delta):
 
 def _pair_log_row(decision):
     alignment = decision.get("feature_alignment", _default_feature_alignment_result())
+    sift_alignment = decision.get("per_image_feature_alignment", alignment)
     return {
         "output_stem": decision.get("output_stem", ""),
         "status": decision["status"],
@@ -3692,12 +4363,38 @@ def _pair_log_row(decision):
         "camera_dimension_summary": decision.get("camera_dimension_summary", ""),
         "camera_detection_reason": decision.get("camera_detection_reason", ""),
         "fov_correction_mode": decision.get("fov_correction_mode", _get_fov_correction_mode()),
+        "alignment_final_status": decision.get("alignment_final_status", ""),
+        "final_model_used": decision.get("final_model_used", ""),
+        "final_model_after_dataset_qa": decision.get("final_model_after_dataset_qa", ""),
+        "alignment_review_status": decision.get("alignment_review_status", ""),
+        "per_image_sift_accepted": str(decision.get("per_image_sift_accepted", "")),
+        "per_image_sift_confidence_level": sift_alignment.get("confidence_level", ""),
+        "per_image_sift_inliers": sift_alignment.get("inliers", ""),
+        "per_image_sift_inlier_ratio": sift_alignment.get("inlier_ratio", ""),
+        "per_image_sift_rmse_px": (
+            ""
+            if sift_alignment.get("mean_reprojection_error_px") is None
+            else f"{sift_alignment['mean_reprojection_error_px']:.4f}"
+        ),
+        "per_image_sift_scale_x": f"{sift_alignment.get('scale_x', 1.0):.6f}",
+        "per_image_sift_scale_y": f"{sift_alignment.get('scale_y', 1.0):.6f}",
+        "per_image_sift_translation_x": f"{sift_alignment.get('translation_x', 0.0):.4f}",
+        "per_image_sift_translation_y": f"{sift_alignment.get('translation_y', 0.0):.4f}",
+        "per_image_sift_rotation_degrees": f"{sift_alignment.get('rotation_degrees', 0.0):.4f}",
+        "per_image_sift_qa_reasons": " | ".join(decision.get("per_image_sift_qa_reasons", [])),
+        "sequence_assisted_used": str(decision.get("sequence_assisted_used", "")),
+        "sequence_assisted_source": decision.get("sequence_assisted_source", ""),
+        "sequence_assisted_candidate_reasons": " | ".join(decision.get("sequence_assisted_candidate_reasons", [])),
+        "median_transform_fallback_used": str(decision.get("median_transform_fallback_used", "")),
+        "median_transform_candidate_reasons": " | ".join(decision.get("median_transform_candidate_reasons", [])),
+        "crop_only_used": str(decision.get("crop_only_used", "")),
         "pairing_review_required": str(decision.get("review_required", "")),
         "alignment_review_required": str(decision.get("alignment_review_required", "")),
         "alignment_review_reasons": " | ".join(decision.get("alignment_review_reasons", [])),
         "alignment_qa_action": decision.get("alignment_qa_action", ""),
         "thermal_source_used": decision.get("thermal_source_used", ""),
         "thermal_source_path": decision.get("thermal_source_path", ""),
+        "selected_transform_matrix": json.dumps(decision.get("selected_transform_matrix", "")),
         "final_transform_matrix": json.dumps(decision.get("final_transform_matrix", "")),
         "fallback_occurred": str(decision.get("fallback_occurred", "")),
         "final_crop_box": str(decision.get("final_crop_box", "")),
@@ -3733,6 +4430,11 @@ def _pair_log_row(decision):
         "alignment_determinant": f"{alignment.get('determinant', 1.0):.6f}",
         "alignment_translation_x": f"{alignment.get('translation_x', 0.0):.4f}",
         "alignment_translation_y": f"{alignment.get('translation_y', 0.0):.4f}",
+        "alignment_source_margin_left": f"{alignment.get('source_margin_left', 0.0):.4f}",
+        "alignment_source_margin_top": f"{alignment.get('source_margin_top', 0.0):.4f}",
+        "alignment_source_margin_right": f"{alignment.get('source_margin_right', 0.0):.4f}",
+        "alignment_source_margin_bottom": f"{alignment.get('source_margin_bottom', 0.0):.4f}",
+        "alignment_source_border_extension_px": f"{alignment.get('source_border_extension_px', 0.0):.4f}",
         "alignment_reasons": " | ".join(alignment.get("reasons", [])),
         "auto_align_questionable_reasons": " | ".join(
             alignment.get("auto_align_questionable_reasons", [])
@@ -4289,7 +4991,7 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                             if not submit_next_pair():
                                 break
 
-            qa_fallback_count = _run_alignment_dataset_qa(
+            alignment_decision_counts = _run_alignment_dataset_qa(
                 pairs,
                 dataset["name"],
                 burn_set_name,
@@ -4297,9 +4999,22 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                 camera_detection["camera"],
                 rgb_corrected_output_dir,
             )
-            if qa_fallback_count:
+            if any(alignment_decision_counts.values()):
                 print(
-                    f"    Alignment QA fell back {qa_fallback_count} Corrected FOV image(s) to crop-only."
+                    "    Alignment finalization: "
+                    f"sequence_assisted={alignment_decision_counts['sequence_assisted']} "
+                    f"dataset_median={alignment_decision_counts['dataset_median']} "
+                    f"crop_only_last_resort={alignment_decision_counts['crop_only_last_resort']}"
+                )
+            if EXPORT_ALIGNMENT_DECISION_DEBUG_SAMPLES:
+                export_alignment_decision_debug_samples(
+                    burn_output_root,
+                    dataset["name"],
+                    burn_set_name,
+                    pairs,
+                    active_profile,
+                    camera_detection["camera"],
+                    rgb_corrected_output_dir,
                 )
 
             for decision in pairing_result["decisions"]:

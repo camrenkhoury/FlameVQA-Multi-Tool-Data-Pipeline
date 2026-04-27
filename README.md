@@ -324,13 +324,14 @@ AUTO_ALIGN does the following:
 8. Test multiple transform models
 9. Validate the selected transform
 10. Apply the final transform to the original color RGB crop
-11. Fall back to crop-only if validation fails
+11. Use sequence-assisted or dataset-median fallback if per-image validation fails
+12. Fall back to crop-only only as the last resort
 
 The final saved RGB output is never grayscale. Grayscale/edge images are temporary working images only.
 
-AUTO_ALIGN uses per-image SIFT/RANSAC transforms. It does not reuse developer calibration points or a dataset-level calibration profile for normal AUTO_ALIGN output. If strict high-confidence validation is not met, a guarded medium-confidence affine transform may still be accepted when it has low reprojection error, spatial coverage, sane geometry, and a reasonable scale ratio. Otherwise the image falls back to crop-only.
+AUTO_ALIGN uses per-image SIFT/RANSAC transforms. It does not reuse developer calibration points or a dataset-level calibration profile for normal AUTO_ALIGN output. If strict high-confidence validation is not met, a guarded medium-confidence affine transform may still be accepted when it has low reprojection error, spatial coverage, sane geometry, source-footprint bounds, and a reasonable scale ratio.
 
-After per-image export, the pipeline runs dataset-wide alignment QA before writing the pairing logs. The QA logs each transform's model, confidence, inliers, RMSE, scale, translation, rotation, and fallback state. It flags accepted transforms with weak support, scale/translation/rotation outliers compared with the dataset median, and sudden transform jumps between neighboring frames. Flagged transforms are marked review-required and the saved Final Corrected FOV is overwritten with crop-only to avoid silently corrupting unseen datasets.
+After per-image export, the pipeline runs dataset-wide alignment finalization before writing the pairing logs. The finalizer logs each transform's model, confidence, inliers, RMSE, scale, translation, rotation, source-footprint margins, border expansion, and fallback state. It keeps high-confidence SIFT results, keeps guarded medium SIFT results when they are plausible, otherwise tries a sequence-assisted transform from nearby accepted frames in the same dataset/burn-set. If no nearby transform is available, it tries the dataset/burn-set median transform from successful frames. Crop-only is used only when SIFT, sequence-assisted, and median-transform options are unavailable or invalid. Final labels include `aligned_sift_high`, `aligned_sift_medium`, `aligned_sequence_assisted`, `aligned_dataset_median`, `crop_only_last_resort`, and `review_required`.
 
 AUTO_ALIGN is slower than crop-only because each exported pair runs feature extraction, feature matching, RANSAC validation, and image warping. Crop-only only crops and resizes.
 
