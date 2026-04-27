@@ -89,7 +89,7 @@ CROP_SHRINK_RIGHT = 0.02
 CROP_SHRINK_TOP = 0.00
 CROP_SHRINK_BOTTOM = 0.00
 FEATURE_ALIGNMENT_MODEL = "auto"
-FEATURE_ALIGNMENT_MODEL_ORDER = ["similarity", "affine"]
+FEATURE_ALIGNMENT_MODEL_ORDER = ["affine"]
 FEATURE_ALIGNMENT_ENABLE_HOMOGRAPHY = False
 FEATURE_ALIGNMENT_PREPROCESSING_VARIANTS = [
     "clahe",
@@ -98,6 +98,10 @@ FEATURE_ALIGNMENT_PREPROCESSING_VARIANTS = [
     "canny",
     "thermal_inverted_clahe",
 ]
+FEATURE_ALIGNMENT_PRIMARY_PREPROCESSING_VARIANTS = ["edge_blend", "clahe"]
+FEATURE_ALIGNMENT_SMOKE_PREPROCESSING_VARIANTS = ["edge_blend", "sobel"]
+FEATURE_ALIGNMENT_BORDER_PREPROCESSING_VARIANTS = ["edge_blend"]
+FEATURE_ALIGNMENT_AKAZE_PREPROCESSING_VARIANTS = ["edge_blend"]
 FEATURE_ALIGNMENT_USE_EDGE_BLEND = True
 FEATURE_ALIGNMENT_EDGE_BLEND_WEIGHT = 0.35
 FEATURE_ALIGNMENT_MIN_GOOD_MATCHES = 20
@@ -119,7 +123,26 @@ FEATURE_ALIGNMENT_MAX_SCALE = 1.90
 FEATURE_ALIGNMENT_MAX_TRANSLATION_FRACTION = 0.45
 FEATURE_ALIGNMENT_MAX_SKEW_DOT = 0.55
 FEATURE_ALIGNMENT_RATIO_TEST = 0.75
+FEATURE_ALIGNMENT_SMOKE_RETRY_ENABLED = True
+FEATURE_ALIGNMENT_AKAZE_RETRY_ENABLED = True
+FEATURE_ALIGNMENT_BORDER_GUIDED_RETRY_ENABLED = True
+FEATURE_ALIGNMENT_SMOKE_LOW_SATURATION_THRESHOLD = 58
+FEATURE_ALIGNMENT_SMOKE_LOW_GRADIENT_THRESHOLD = 22.0
+FEATURE_ALIGNMENT_SMOKE_MIN_VALUE_THRESHOLD = 55
+FEATURE_ALIGNMENT_SMOKE_RETRY_TRIGGER_PERCENTAGE = 0.18
+FEATURE_ALIGNMENT_SMOKE_MATCH_DOMINANCE_THRESHOLD = 0.45
+FEATURE_ALIGNMENT_THERMAL_EDGE_SUPPORT_WARNING_RATIO = 0.15
+FEATURE_ALIGNMENT_LOW_GRADIENT_RETRY_THRESHOLD = 18.0
+FEATURE_ALIGNMENT_MIN_USABLE_MASK_PERCENTAGE = 0.08
+FEATURE_ALIGNMENT_BORDER_BAND_FRACTION = 0.15
+FEATURE_ALIGNMENT_THERMAL_EDGE_PERCENTILE = 70
 FEATURE_ALIGNMENT_USE_ECC_REFINEMENT = False
+FEATURE_ALIGNMENT_THERMAL_JPG_RETRY_ENABLED = True
+FEATURE_ALIGNMENT_THERMAL_JPG_RETRY_FAILURE_REASONS = {
+    "descriptors_unavailable",
+    "not_enough_good_matches",
+    "thermal_unavailable",
+}
 FEATURE_ALIGNMENT_ECC_MAX_ITERATIONS = 80
 FEATURE_ALIGNMENT_ECC_EPSILON = 1e-5
 CORRECTION_VALIDATION_SAMPLE_COUNT = 20
@@ -1237,6 +1260,130 @@ def _normalize_feature_array(image, variant="edge_blend", invert=False):
     return normalized
 
 
+def _gradient_magnitude(image_array):
+    array = np.asarray(image_array)
+    if array.ndim == 3:
+        if cv2 is not None:
+            array = cv2.cvtColor(array[:, :, :3], cv2.COLOR_RGB2GRAY)
+        else:
+            array = np.asarray(Image.fromarray(array[:, :, :3]).convert("L"))
+    array = array.astype(np.uint8)
+    if cv2 is None:
+        grad_x = np.diff(array.astype(np.float32), axis=1, prepend=array[:, :1])
+        grad_y = np.diff(array.astype(np.float32), axis=0, prepend=array[:1, :])
+        return np.hypot(grad_x, grad_y).astype(np.float32)
+    sobel_x = cv2.Sobel(array, cv2.CV_32F, 1, 0, ksize=3)
+    sobel_y = cv2.Sobel(array, cv2.CV_32F, 0, 1, ksize=3)
+    return cv2.magnitude(sobel_x, sobel_y)
+
+
+def _mask_usable_fraction(mask):
+    if mask is None:
+        return 1.0
+    return float(np.count_nonzero(mask) / max(mask.size, 1))
+
+
+def _valid_feature_mask(mask):
+    if mask is None:
+        return None
+    mask = np.asarray(mask, dtype=np.uint8)
+    if _mask_usable_fraction(mask) < FEATURE_ALIGNMENT_MIN_USABLE_MASK_PERCENTAGE:
+        return None
+    return mask
+
+
+def _combine_feature_masks(*masks):
+    combined = None
+    for mask in masks:
+        if mask is None:
+            continue
+        mask = np.asarray(mask, dtype=np.uint8)
+        if combined is None:
+            combined = mask.copy()
+        else:
+            combined = cv2.bitwise_and(combined, mask) if cv2 is not None else np.minimum(combined, mask)
+    return _valid_feature_mask(combined)
+
+
+def _point_in_mask(mask, point):
+    if mask is None:
+        return False
+    x, y = point
+    mask_array = np.asarray(mask)
+    height, width = mask_array.shape[:2]
+    px = int(round(float(x)))
+    py = int(round(float(y)))
+    if px < 0 or py < 0 or px >= width or py >= height:
+        return False
+    return bool(mask_array[py, px])
+
+
+def _border_band_mask(image_size, band_fraction=None):
+    width, height = image_size
+    band_fraction = FEATURE_ALIGNMENT_BORDER_BAND_FRACTION if band_fraction is None else band_fraction
+    band_x = max(1, int(round(width * band_fraction)))
+    band_y = max(1, int(round(height * band_fraction)))
+    mask = np.zeros((height, width), dtype=np.uint8)
+    mask[:, :band_x] = 255
+    mask[:, width - band_x:] = 255
+    mask[:band_y, :] = 255
+    mask[height - band_y:, :] = 255
+    return mask
+
+
+def _rgb_low_information_mask(rgb_image):
+    rgb = np.asarray(rgb_image.convert("RGB"))
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY) if cv2 is not None else np.asarray(rgb_image.convert("L"))
+    gradient = _gradient_magnitude(gray)
+    if cv2 is not None:
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        saturation = hsv[:, :, 1]
+        value = hsv[:, :, 2]
+    else:
+        saturation = np.max(rgb, axis=2) - np.min(rgb, axis=2)
+        value = np.max(rgb, axis=2)
+    low_information = (
+        (saturation < FEATURE_ALIGNMENT_SMOKE_LOW_SATURATION_THRESHOLD)
+        & (value > FEATURE_ALIGNMENT_SMOKE_MIN_VALUE_THRESHOLD)
+        & (gradient < FEATURE_ALIGNMENT_SMOKE_LOW_GRADIENT_THRESHOLD)
+    )
+    low_information_mask = np.where(low_information, 255, 0).astype(np.uint8)
+    usable = np.where(low_information, 0, 255).astype(np.uint8)
+    usable = _valid_feature_mask(usable)
+    return {
+        "mask": usable,
+        "low_information_mask": low_information_mask,
+        "low_information_pct": float(np.mean(low_information)),
+        "gradient_mean": float(np.mean(gradient)),
+        "gradient_median": float(np.median(gradient)),
+    }
+
+
+def _thermal_edge_mask(thermal_feature):
+    gradient = _gradient_magnitude(thermal_feature)
+    finite_gradient = gradient[np.isfinite(gradient)]
+    if finite_gradient.size == 0:
+        return {
+            "mask": None,
+            "support_mask": None,
+            "gradient_mean": 0.0,
+            "gradient_median": 0.0,
+            "edge_fraction": 0.0,
+        }
+    threshold = np.percentile(finite_gradient, FEATURE_ALIGNMENT_THERMAL_EDGE_PERCENTILE)
+    threshold = max(float(threshold), 1.0)
+    raw_mask = np.where(gradient >= threshold, 255, 0).astype(np.uint8)
+    edge_fraction = float(np.count_nonzero(raw_mask) / max(raw_mask.size, 1))
+    mask = _valid_feature_mask(raw_mask)
+    return {
+        "mask": mask,
+        "support_mask": raw_mask,
+        "gradient_mean": float(np.mean(finite_gradient)),
+        "gradient_median": float(np.median(finite_gradient)),
+        "edge_fraction": edge_fraction,
+    }
+
+
 def _default_feature_alignment_result(status="not_run"):
     return {
         "status": status,
@@ -1253,6 +1400,22 @@ def _default_feature_alignment_result(status="not_run"):
         "mean_reprojection_error_px": None,
         "max_reprojection_error_px": None,
         "transform_type": FEATURE_ALIGNMENT_MODEL,
+        "candidate_stage": "not_run",
+        "detector_type": "sift",
+        "rgb_low_information_pct": 0.0,
+        "rgb_gradient_mean": 0.0,
+        "thermal_gradient_mean": 0.0,
+        "thermal_edge_fraction": 0.0,
+        "rgb_mask_usable_fraction": 1.0,
+        "thermal_mask_usable_fraction": 1.0,
+        "keypoints_rgb_unmasked": 0,
+        "keypoints_thermal_unmasked": 0,
+        "good_matches_in_rgb_low_information": 0,
+        "inliers_in_rgb_low_information": 0,
+        "good_match_rgb_low_information_ratio": 0.0,
+        "good_matches_on_thermal_edges": 0,
+        "inliers_on_thermal_edges": 0,
+        "good_match_thermal_edge_support_ratio": 0.0,
         "scale_x": 1.0,
         "scale_y": 1.0,
         "scale_ratio": 1.0,
@@ -1295,9 +1458,26 @@ def _load_thermal_feature_image(thermal_source_path, output_size, variant="edge_
     )
 
 
-def _build_alignment_representation_pairs(corrected_crop_image, thermal_source_path, output_size):
+def _build_alignment_representation_pairs(
+    corrected_crop_image,
+    thermal_source_path,
+    output_size,
+    enabled_stages=None,
+    variants=None,
+):
     representation_pairs = []
-    for variant in FEATURE_ALIGNMENT_PREPROCESSING_VARIANTS:
+    enabled_stages = set(enabled_stages or {"sift_standard", "sift_smoke_masked", "border_guided"})
+    variants = list(variants or FEATURE_ALIGNMENT_PREPROCESSING_VARIANTS)
+    rgb_diagnostics = _rgb_low_information_mask(corrected_crop_image)
+    border_mask = _border_band_mask(output_size)
+    should_try_low_information_retry = (
+        FEATURE_ALIGNMENT_SMOKE_RETRY_ENABLED
+        and (
+            rgb_diagnostics["low_information_pct"] >= FEATURE_ALIGNMENT_SMOKE_RETRY_TRIGGER_PERCENTAGE
+            or rgb_diagnostics["gradient_mean"] <= FEATURE_ALIGNMENT_LOW_GRADIENT_RETRY_THRESHOLD
+        )
+    )
+    for variant in variants:
         thermal_invert = variant == "thermal_inverted_clahe"
         representation_variant = "clahe" if thermal_invert else variant
         rgb_feature = _normalize_feature_array(
@@ -1313,13 +1493,58 @@ def _build_alignment_representation_pairs(corrected_crop_image, thermal_source_p
         )
         if thermal_feature is None:
             continue
-        representation_pairs.append(
-            {
-                "name": variant,
-                "rgb": rgb_feature,
-                "thermal": thermal_feature,
-            }
-        )
+        thermal_diagnostics = _thermal_edge_mask(thermal_feature)
+        base_diagnostics = {
+            "rgb_low_information_pct": rgb_diagnostics["low_information_pct"],
+            "rgb_gradient_mean": rgb_diagnostics["gradient_mean"],
+            "thermal_gradient_mean": thermal_diagnostics["gradient_mean"],
+            "thermal_edge_fraction": thermal_diagnostics["edge_fraction"],
+        }
+        if "sift_standard" in enabled_stages:
+            representation_pairs.append(
+                {
+                    "name": variant,
+                    "rgb": rgb_feature,
+                    "thermal": thermal_feature,
+                    "candidate_stage": "sift_standard",
+                    "detector_type": "sift",
+                    "rgb_mask": None,
+                    "thermal_mask": None,
+                    "rgb_low_information_mask": rgb_diagnostics["low_information_mask"],
+                    "thermal_edge_mask": thermal_diagnostics.get("support_mask"),
+                    "diagnostics": base_diagnostics,
+                }
+            )
+        if "sift_smoke_masked" in enabled_stages and should_try_low_information_retry:
+            representation_pairs.append(
+                {
+                    "name": f"smoke_masked_{variant}",
+                    "rgb": rgb_feature,
+                    "thermal": thermal_feature,
+                    "candidate_stage": "sift_smoke_masked",
+                    "detector_type": "sift",
+                    "rgb_mask": rgb_diagnostics["mask"],
+                    "thermal_mask": thermal_diagnostics["mask"],
+                    "rgb_low_information_mask": rgb_diagnostics["low_information_mask"],
+                    "thermal_edge_mask": thermal_diagnostics.get("support_mask"),
+                    "diagnostics": base_diagnostics,
+                }
+            )
+        if "border_guided" in enabled_stages and FEATURE_ALIGNMENT_BORDER_GUIDED_RETRY_ENABLED:
+            representation_pairs.append(
+                {
+                    "name": f"border_guided_{variant}",
+                    "rgb": rgb_feature,
+                    "thermal": thermal_feature,
+                    "candidate_stage": "border_guided",
+                    "detector_type": "sift",
+                    "rgb_mask": border_mask,
+                    "thermal_mask": _combine_feature_masks(border_mask, thermal_diagnostics["mask"]),
+                    "rgb_low_information_mask": rgb_diagnostics["low_information_mask"],
+                    "thermal_edge_mask": thermal_diagnostics.get("support_mask"),
+                    "diagnostics": base_diagnostics,
+                }
+            )
     return representation_pairs
 
 
@@ -1580,6 +1805,16 @@ def _validate_feature_alignment_result(
         reasons.append("invalid_source_footprint")
     if source_footprint["source_border_extension_px"] > ALIGNMENT_QA_SOURCE_BORDER_EXTENSION_PX:
         reasons.append("source_border_expansion")
+    low_information_inlier_ratio = result.get("inliers_in_rgb_low_information", 0) / max(inlier_count, 1)
+    low_information_match_ratio = max(
+        float(result.get("good_match_rgb_low_information_ratio", 0.0)),
+        float(low_information_inlier_ratio),
+    )
+    if (
+        float(result.get("rgb_low_information_pct", 0.0)) >= FEATURE_ALIGNMENT_SMOKE_RETRY_TRIGGER_PERCENTAGE
+        and low_information_match_ratio >= FEATURE_ALIGNMENT_SMOKE_MATCH_DOMINANCE_THRESHOLD
+    ):
+        reasons.append("smoke_or_low_information_dominated_matches")
 
     disqualifying_reasons = {
         "not_enough_good_matches",
@@ -1592,6 +1827,7 @@ def _validate_feature_alignment_result(
         "orientation_flip",
         "invalid_source_footprint",
         "source_border_expansion",
+        "smoke_or_low_information_dominated_matches",
     }
     relaxed_reasons = {"not_enough_ransac_inliers", "low_inlier_ratio"}
     relaxed_accepted = (
@@ -1755,27 +1991,63 @@ def _refine_candidate_with_ecc(candidate, rgb_feature, thermal_feature, source_p
     return rejected
 
 
-def _run_sift_alignment_candidate(rgb_feature, thermal_feature, representation_name, model_name, output_size):
+def _run_sift_alignment_candidate(
+    rgb_feature,
+    thermal_feature,
+    representation_name,
+    model_name,
+    output_size,
+    detector_type="sift",
+    candidate_stage="sift_standard",
+    rgb_mask=None,
+    thermal_mask=None,
+    rgb_low_information_mask=None,
+    thermal_edge_mask=None,
+    diagnostics=None,
+):
     result = _default_feature_alignment_result("not_run")
     result["representation"] = representation_name
     result["transform_type"] = model_name
+    result["candidate_stage"] = candidate_stage
+    result["detector_type"] = detector_type
+    result["rgb_mask_usable_fraction"] = _mask_usable_fraction(rgb_mask)
+    result["thermal_mask_usable_fraction"] = _mask_usable_fraction(thermal_mask)
+    if diagnostics:
+        result.update(diagnostics)
 
     if cv2 is None:
         result["status"] = "opencv_unavailable"
         result["reasons"] = ["opencv_unavailable"]
         return result
 
-    sift = cv2.SIFT_create()
-    rgb_keypoints, rgb_descriptors = sift.detectAndCompute(rgb_feature, None)
-    thermal_keypoints, thermal_descriptors = sift.detectAndCompute(thermal_feature, None)
+    if detector_type == "akaze":
+        detector = cv2.AKAZE_create()
+        matcher_norm = cv2.NORM_HAMMING
+    else:
+        detector = cv2.SIFT_create()
+        matcher_norm = cv2.NORM_L2
+
+    if rgb_mask is not None:
+        rgb_unmasked_keypoints = detector.detect(rgb_feature, None)
+        result["keypoints_rgb_unmasked"] = len(rgb_unmasked_keypoints or [])
+    if thermal_mask is not None:
+        thermal_unmasked_keypoints = detector.detect(thermal_feature, None)
+        result["keypoints_thermal_unmasked"] = len(thermal_unmasked_keypoints or [])
+
+    rgb_keypoints, rgb_descriptors = detector.detectAndCompute(rgb_feature, rgb_mask)
+    thermal_keypoints, thermal_descriptors = detector.detectAndCompute(thermal_feature, thermal_mask)
     result["keypoints_rgb"] = len(rgb_keypoints or [])
     result["keypoints_thermal"] = len(thermal_keypoints or [])
+    if rgb_mask is None:
+        result["keypoints_rgb_unmasked"] = result["keypoints_rgb"]
+    if thermal_mask is None:
+        result["keypoints_thermal_unmasked"] = result["keypoints_thermal"]
     if rgb_descriptors is None or thermal_descriptors is None:
         result["status"] = "descriptors_unavailable"
         result["reasons"] = ["descriptors_unavailable"]
         return result
 
-    matcher = cv2.BFMatcher(cv2.NORM_L2)
+    matcher = cv2.BFMatcher(matcher_norm)
     raw_matches = matcher.knnMatch(rgb_descriptors, thermal_descriptors, k=2)
     good_matches = []
     for match_group in raw_matches:
@@ -1793,6 +2065,27 @@ def _run_sift_alignment_candidate(rgb_feature, thermal_feature, representation_n
     )
     result["good_matches"] = len(balanced_matches)
     result["match_grid_cells"] = match_grid_cells
+    if balanced_matches:
+        low_information_match_count = sum(
+            1
+            for match in balanced_matches
+            if _point_in_mask(rgb_low_information_mask, rgb_keypoints[match.queryIdx].pt)
+        )
+        thermal_edge_match_count = sum(
+            1
+            for match in balanced_matches
+            if _point_in_mask(thermal_edge_mask, thermal_keypoints[match.trainIdx].pt)
+        )
+        result["good_matches_in_rgb_low_information"] = int(low_information_match_count)
+        result["good_matches_on_thermal_edges"] = int(thermal_edge_match_count)
+        result["good_match_rgb_low_information_ratio"] = round(
+            low_information_match_count / max(len(balanced_matches), 1),
+            4,
+        )
+        result["good_match_thermal_edge_support_ratio"] = round(
+            thermal_edge_match_count / max(len(balanced_matches), 1),
+            4,
+        )
     if len(balanced_matches) < FEATURE_ALIGNMENT_MIN_GOOD_MATCHES:
         result["status"] = "not_enough_good_matches"
         result["reasons"] = ["not_enough_good_matches"]
@@ -1808,6 +2101,25 @@ def _run_sift_alignment_candidate(rgb_feature, thermal_feature, representation_n
 
     result["status"] = "ok"
     result["matrix"] = _matrix_to_list(matrix)
+    inlier_mask = np.asarray(inliers, dtype=bool).reshape(-1) if inliers is not None else np.zeros(
+        len(balanced_matches),
+        dtype=bool,
+    )
+    if len(balanced_matches):
+        result["inliers_in_rgb_low_information"] = int(
+            sum(
+                1
+                for match, is_inlier in zip(balanced_matches, inlier_mask)
+                if is_inlier and _point_in_mask(rgb_low_information_mask, rgb_keypoints[match.queryIdx].pt)
+            )
+        )
+        result["inliers_on_thermal_edges"] = int(
+            sum(
+                1
+                for match, is_inlier in zip(balanced_matches, inlier_mask)
+                if is_inlier and _point_in_mask(thermal_edge_mask, thermal_keypoints[match.trainIdx].pt)
+            )
+        )
     result = _validate_feature_alignment_result(
         result,
         source_points,
@@ -1844,14 +2156,21 @@ def _select_best_alignment_candidate(candidates):
         return _default_feature_alignment_result("no_candidates")
 
     model_rank = {"crop_only": 0, "similarity": 1, "affine": 2, "homography": 3}
+    stage_rank = {
+        "sift_standard": 0,
+        "sift_smoke_masked": 1,
+        "border_guided": 2,
+        "akaze_retry": 3,
+    }
     accepted = [candidate for candidate in candidates if candidate.get("accepted")]
     if accepted:
         confidence_rank = {"HIGH": 0, "MEDIUM": 1, "LOW": 2}
         return sorted(
             accepted,
             key=lambda candidate: (
-                model_rank.get(candidate.get("transform_type"), 99),
                 confidence_rank.get(candidate.get("confidence_level"), 99),
+                stage_rank.get(candidate.get("candidate_stage"), 99),
+                model_rank.get(candidate.get("transform_type"), 99),
                 1 if candidate.get("relaxed_acceptance") else 0,
                 candidate.get("mean_reprojection_error_px") or float("inf"),
                 -candidate.get("inlier_grid_cells", 0),
@@ -1890,7 +2209,64 @@ def _auto_align_questionable_reasons(alignment_result):
         reasons.append("nonuniform_scale_questionable")
     if abs(float(alignment_result.get("skew_dot", 0.0))) > 0.15:
         reasons.append("skew_questionable")
+    if float(alignment_result.get("rgb_low_information_pct", 0.0)) >= FEATURE_ALIGNMENT_SMOKE_RETRY_TRIGGER_PERCENTAGE:
+        reasons.append("smoke_or_low_information_present")
+    if float(alignment_result.get("thermal_gradient_mean", 0.0)) <= FEATURE_ALIGNMENT_LOW_GRADIENT_RETRY_THRESHOLD:
+        reasons.append("weak_thermal_structure")
+    if (
+        int(alignment_result.get("good_matches", 0) or 0) > 0
+        and float(alignment_result.get("good_match_thermal_edge_support_ratio", 0.0))
+        < FEATURE_ALIGNMENT_THERMAL_EDGE_SUPPORT_WARNING_RATIO
+    ):
+        reasons.append("weak_thermal_edge_match_support")
     return _unique_reasons(reasons)
+
+
+def _alignment_candidate_is_strong_enough_to_stop(candidate):
+    if not candidate.get("accepted"):
+        return False
+    if candidate.get("confidence_level") != "HIGH":
+        return False
+    return not _auto_align_questionable_reasons(candidate)
+
+
+def _append_alignment_candidates(candidates, representation_pairs, output_size, detector_type=None):
+    for representation in representation_pairs:
+        for model_name in _alignment_model_order():
+            current_detector_type = detector_type or representation.get("detector_type", "sift")
+            candidate_stage = "akaze_retry" if current_detector_type == "akaze" else representation.get(
+                "candidate_stage",
+                "sift_standard",
+            )
+            representation_name = representation["name"]
+            if current_detector_type == "akaze" and not representation_name.startswith("akaze_"):
+                representation_name = f"akaze_{representation_name}"
+            candidates.append(
+                _run_sift_alignment_candidate(
+                    representation["rgb"],
+                    representation["thermal"],
+                    representation_name,
+                    model_name,
+                    output_size,
+                    detector_type=current_detector_type,
+                    candidate_stage=candidate_stage,
+                    rgb_mask=representation.get("rgb_mask"),
+                    thermal_mask=representation.get("thermal_mask"),
+                    rgb_low_information_mask=representation.get("rgb_low_information_mask"),
+                    thermal_edge_mask=representation.get("thermal_edge_mask"),
+                    diagnostics=representation.get("diagnostics"),
+                )
+            )
+
+
+def _finalize_alignment_selection(candidates):
+    selected = dict(_select_best_alignment_candidate(candidates))
+    selected["candidate_count"] = len(candidates)
+    selected["alignment_candidates"] = [
+        _summarize_alignment_candidate(candidate) for candidate in candidates
+    ]
+    selected["auto_align_questionable_reasons"] = _auto_align_questionable_reasons(selected)
+    return selected
 
 
 def _estimate_sift_alignment_matrix(corrected_crop_image, thermal_source_path, output_size):
@@ -1899,36 +2275,59 @@ def _estimate_sift_alignment_matrix(corrected_crop_image, thermal_source_path, o
         result["reasons"] = ["opencv_unavailable"]
         return result
 
-    representation_pairs = _build_alignment_representation_pairs(
+    candidates = []
+    primary_pairs = _build_alignment_representation_pairs(
         corrected_crop_image,
         thermal_source_path,
         output_size,
+        enabled_stages={"sift_standard"},
+        variants=FEATURE_ALIGNMENT_PRIMARY_PREPROCESSING_VARIANTS,
     )
-    if not representation_pairs:
+    if not primary_pairs:
         result = _default_feature_alignment_result("thermal_unavailable")
         result["reasons"] = ["thermal_unavailable"]
         return result
 
-    candidates = []
-    for representation in representation_pairs:
-        for model_name in _alignment_model_order():
-            candidates.append(
-                _run_sift_alignment_candidate(
-                    representation["rgb"],
-                    representation["thermal"],
-                    representation["name"],
-                    model_name,
-                    output_size,
-                )
-            )
+    _append_alignment_candidates(candidates, primary_pairs, output_size)
+    selected = _select_best_alignment_candidate(candidates)
+    if _alignment_candidate_is_strong_enough_to_stop(selected):
+        return _finalize_alignment_selection(candidates)
 
-    selected = dict(_select_best_alignment_candidate(candidates))
-    selected["candidate_count"] = len(candidates)
-    selected["alignment_candidates"] = [
-        _summarize_alignment_candidate(candidate) for candidate in candidates
-    ]
-    selected["auto_align_questionable_reasons"] = _auto_align_questionable_reasons(selected)
-    return selected
+    smoke_pairs = _build_alignment_representation_pairs(
+        corrected_crop_image,
+        thermal_source_path,
+        output_size,
+        enabled_stages={"sift_smoke_masked"},
+        variants=FEATURE_ALIGNMENT_SMOKE_PREPROCESSING_VARIANTS,
+    )
+    _append_alignment_candidates(candidates, smoke_pairs, output_size)
+    selected = _select_best_alignment_candidate(candidates)
+    if _alignment_candidate_is_strong_enough_to_stop(selected):
+        return _finalize_alignment_selection(candidates)
+
+    border_pairs = _build_alignment_representation_pairs(
+        corrected_crop_image,
+        thermal_source_path,
+        output_size,
+        enabled_stages={"border_guided"},
+        variants=FEATURE_ALIGNMENT_BORDER_PREPROCESSING_VARIANTS,
+    )
+    _append_alignment_candidates(candidates, border_pairs, output_size)
+    selected = _select_best_alignment_candidate(candidates)
+    if _alignment_candidate_is_strong_enough_to_stop(selected):
+        return _finalize_alignment_selection(candidates)
+
+    if FEATURE_ALIGNMENT_AKAZE_RETRY_ENABLED and not any(candidate.get("accepted") for candidate in candidates):
+        akaze_pairs = _build_alignment_representation_pairs(
+            corrected_crop_image,
+            thermal_source_path,
+            output_size,
+            enabled_stages={"sift_standard"},
+            variants=FEATURE_ALIGNMENT_AKAZE_PREPROCESSING_VARIANTS,
+        )
+        _append_alignment_candidates(candidates, akaze_pairs, output_size, detector_type="akaze")
+
+    return _finalize_alignment_selection(candidates)
 
 
 def _apply_sift_alignment_to_color(corrected_crop_image, thermal_source_path, output_size):
@@ -2052,15 +2451,23 @@ def _pair_record_path(pair, key):
 
 
 def _select_corrected_fov_thermal_source(pair):
+    candidates = _corrected_fov_thermal_source_candidates(pair)
+    if candidates:
+        return candidates[0]
+    return None, "none"
+
+
+def _corrected_fov_thermal_source_candidates(pair):
+    candidates = []
     for source_name, key in (
-        ("CalTIFF", "cal_tiff"),
-        ("TIFF", "thermal_tiff"),
-        ("thermal JPG", "thermal_jpg"),
+        ("cal_tiff", "cal_tiff"),
+        ("thermal_tiff", "thermal_tiff"),
+        ("thermal_jpg", "thermal_jpg"),
     ):
         source_path = _pair_record_path(pair, key)
         if source_path:
-            return source_path, source_name
-    return None, "none"
+            candidates.append((source_path, source_name))
+    return candidates
 
 
 def _debug_fallback_used(debug_info):
@@ -2079,7 +2486,10 @@ def generate_corrected_fov(
     use_experimental_shift=False,
     return_debug_info=False,
 ):
-    thermal_source_path, thermal_source_name = _select_corrected_fov_thermal_source(pair)
+    thermal_source_candidates = _corrected_fov_thermal_source_candidates(pair)
+    if not thermal_source_candidates:
+        thermal_source_candidates = [(None, "none")]
+    thermal_source_path, thermal_source_name = thermal_source_candidates[0]
     corrected_rgb, debug_info = _apply_rgb_fov_correction(
         pair["rgb"]["filepath"],
         thermal_source_path=thermal_source_path,
@@ -2091,10 +2501,64 @@ def generate_corrected_fov(
         fov_correction_mode=mode,
         return_debug_info=True,
     )
+    thermal_source_retry_attempts = [
+        {
+            "source": thermal_source_name,
+            "accepted": bool(debug_info.get("feature_alignment", {}).get("accepted")),
+            "status": debug_info.get("feature_alignment", {}).get("status", ""),
+            "fallback_used": debug_info.get("feature_alignment", {}).get("fallback_used", ""),
+        }
+    ]
+
+    if (
+        FEATURE_ALIGNMENT_THERMAL_JPG_RETRY_ENABLED
+        and set(debug_info.get("feature_alignment", {}).get("reasons", [])).intersection(
+            FEATURE_ALIGNMENT_THERMAL_JPG_RETRY_FAILURE_REASONS
+        )
+        and _mode_uses_feature_alignment(debug_info.get("fov_correction_mode", mode))
+        and not debug_info.get("feature_alignment", {}).get("accepted")
+        and thermal_source_name in {"cal_tiff", "thermal_tiff"}
+    ):
+        for retry_source_path, retry_source_name in thermal_source_candidates[1:]:
+            if retry_source_name != "thermal_jpg":
+                continue
+            retry_rgb, retry_debug = _apply_rgb_fov_correction(
+                pair["rgb"]["filepath"],
+                thermal_source_path=retry_source_path,
+                use_experimental_shift=use_experimental_shift,
+                dataset_name=dataset_name if dataset_name is not None else pair.get("dataset_name"),
+                burn_set_name=burn_set_name if burn_set_name is not None else pair.get("burn_set_name"),
+                calibration_profile=calibration_profile,
+                camera_used=camera_used if camera_used is not None else pair.get("detected_camera"),
+                fov_correction_mode=mode,
+                return_debug_info=True,
+            )
+            retry_alignment = retry_debug.get("feature_alignment", {})
+            thermal_source_retry_attempts.append(
+                {
+                    "source": retry_source_name,
+                    "accepted": bool(retry_alignment.get("accepted")),
+                    "status": retry_alignment.get("status", ""),
+                    "fallback_used": retry_alignment.get("fallback_used", ""),
+                }
+            )
+            if retry_alignment.get("accepted"):
+                corrected_rgb.close()
+                corrected_rgb = retry_rgb
+                debug_info = retry_debug
+                thermal_source_name = retry_source_name
+                thermal_source_path = retry_source_path
+                debug_info["thermal_source_retry_used"] = True
+                debug_info["thermal_source_retry_from"] = thermal_source_retry_attempts[0]["source"]
+                break
+            retry_rgb.close()
 
     debug_info["correction_mode_used"] = debug_info.get("fov_correction_mode", mode)
     debug_info["thermal_source_used"] = thermal_source_name
     debug_info["thermal_source_path"] = thermal_source_path or ""
+    debug_info["thermal_source_retry_attempts"] = thermal_source_retry_attempts
+    debug_info.setdefault("thermal_source_retry_used", False)
+    debug_info.setdefault("thermal_source_retry_from", "")
     debug_info["fallback_occurred"] = _debug_fallback_used(debug_info)
     debug_info["transform_matrix"] = debug_info.get("final_transform_matrix")
 
@@ -2251,9 +2715,9 @@ def _export_presorted_pair_outputs(
     selected_tiff_source = (
         pair["cal_tiff"]["filepath"]
         if pair["cal_tiff"] is not None
-        else pair["thermal_tiff"]["filepath"]
+        else pair["thermal_tiff"]["filepath"] if pair["thermal_tiff"] is not None else None
     )
-    shutil.copy(
+    _copy_if_exists(
         selected_tiff_source,
         os.path.join(thermal_tiff_output_dir, thermal_tiff_output_name),
     )
@@ -2266,6 +2730,9 @@ def _export_presorted_pair_outputs(
         "feature_alignment": correction_debug["feature_alignment"],
         "thermal_source_used": correction_debug["thermal_source_used"],
         "thermal_source_path": correction_debug["thermal_source_path"],
+        "thermal_source_retry_used": correction_debug.get("thermal_source_retry_used", False),
+        "thermal_source_retry_from": correction_debug.get("thermal_source_retry_from", ""),
+        "thermal_source_retry_attempts": correction_debug.get("thermal_source_retry_attempts", []),
         "final_transform_matrix": correction_debug["final_transform_matrix"],
         "fallback_occurred": correction_debug["fallback_occurred"],
     }
@@ -2794,12 +3261,17 @@ def _run_alignment_dataset_qa(
 
         if per_image_accepted and not per_image_qa_reasons:
             final_alignment = dict(per_image_alignment)
-            final_alignment["alignment_decision_source"] = "per_image_sift"
-            final_status = (
-                "aligned_sift_high"
-                if final_alignment.get("confidence_level") == "HIGH"
-                else "aligned_sift_medium"
-            )
+            candidate_stage = final_alignment.get("candidate_stage", "sift_standard")
+            detector_type = final_alignment.get("detector_type", "sift")
+            final_alignment["alignment_decision_source"] = candidate_stage
+            if detector_type == "akaze":
+                final_status = "aligned_akaze"
+            elif candidate_stage == "sift_smoke_masked":
+                final_status = "aligned_sift_smoke_masked"
+            elif candidate_stage == "border_guided":
+                final_status = "aligned_border_guided"
+            else:
+                final_status = "aligned_sift_standard"
             _set_final_alignment_decision(
                 pair,
                 final_status,
@@ -3076,7 +3548,7 @@ def _save_alignment_candidate_debug_images(debug_root, sample_number, rgb_path, 
             continue
         candidate_image = _warp_corrected_image(crop_only, matrix, output_size)
         label = _sanitize_identifier(
-            f"{candidate_index:02d}_{candidate.get('representation', 'unknown')}_{candidate.get('transform_type', 'unknown')}_{candidate.get('confidence_level', 'low')}"
+            f"{candidate_index:02d}_{candidate.get('candidate_stage', 'stage')}_{candidate.get('detector_type', 'detector')}_{candidate.get('representation', 'unknown')}_{candidate.get('transform_type', 'unknown')}_{candidate.get('confidence_level', 'low')}"
         )
         candidate_image.save(os.path.join(debug_root, f"{sample_prefix}_{label}.png"))
         candidate_image.close()
@@ -3119,8 +3591,20 @@ def _build_validation_comparison_grid(items):
 def _select_alignment_decision_debug_samples(pairs):
     sample_specs = [
         (
-            "good_sift",
-            lambda pair: pair.get("alignment_final_status") in {"aligned_sift_high", "aligned_sift_medium"},
+            "good_standard_sift",
+            lambda pair: pair.get("alignment_final_status") == "aligned_sift_standard",
+        ),
+        (
+            "smoke_masked_sift",
+            lambda pair: pair.get("alignment_final_status") == "aligned_sift_smoke_masked",
+        ),
+        (
+            "border_guided",
+            lambda pair: pair.get("alignment_final_status") == "aligned_border_guided",
+        ),
+        (
+            "akaze_retry",
+            lambda pair: pair.get("alignment_final_status") == "aligned_akaze",
         ),
         (
             "weak_sift",
@@ -3244,6 +3728,40 @@ def export_alignment_decision_debug_samples(
                 "rgb_filename": pair["rgb"]["filename"],
                 "alignment_final_status": pair.get("alignment_final_status", ""),
                 "per_image_sift_accepted": str(pair.get("per_image_sift_accepted", "")),
+                "per_image_candidate_stage": per_image_alignment.get("candidate_stage", ""),
+                "per_image_detector_type": per_image_alignment.get("detector_type", ""),
+                "per_image_rgb_low_information_pct": f"{per_image_alignment.get('rgb_low_information_pct', 0.0):.4f}",
+                "per_image_rgb_gradient_mean": f"{per_image_alignment.get('rgb_gradient_mean', 0.0):.4f}",
+                "per_image_thermal_gradient_mean": f"{per_image_alignment.get('thermal_gradient_mean', 0.0):.4f}",
+                "per_image_thermal_edge_fraction": f"{per_image_alignment.get('thermal_edge_fraction', 0.0):.4f}",
+                "per_image_good_matches_in_rgb_low_information": per_image_alignment.get(
+                    "good_matches_in_rgb_low_information",
+                    "",
+                ),
+                "per_image_inliers_in_rgb_low_information": per_image_alignment.get(
+                    "inliers_in_rgb_low_information",
+                    "",
+                ),
+                "per_image_good_match_rgb_low_information_ratio": per_image_alignment.get(
+                    "good_match_rgb_low_information_ratio",
+                    "",
+                ),
+                "per_image_good_matches_on_thermal_edges": per_image_alignment.get(
+                    "good_matches_on_thermal_edges",
+                    "",
+                ),
+                "per_image_inliers_on_thermal_edges": per_image_alignment.get("inliers_on_thermal_edges", ""),
+                "per_image_good_match_thermal_edge_support_ratio": per_image_alignment.get(
+                    "good_match_thermal_edge_support_ratio",
+                    "",
+                ),
+                "per_image_ecc_status": per_image_alignment.get("ecc_status", ""),
+                "per_image_ecc_score": (
+                    ""
+                    if per_image_alignment.get("ecc_score") is None
+                    else f"{per_image_alignment.get('ecc_score', 0.0):.6f}"
+                ),
+                "per_image_inlier_grid_cells": per_image_alignment.get("inlier_grid_cells", ""),
                 "per_image_sift_qa_reasons": " | ".join(pair.get("per_image_sift_qa_reasons", [])),
                 "sequence_assisted_source": pair.get("sequence_assisted_source", ""),
                 "sequence_assisted_candidate_reasons": " | ".join(pair.get("sequence_assisted_candidate_reasons", [])),
@@ -3382,6 +3900,10 @@ def export_alignment_debug_samples(
         "detected_camera",
         "rgb_filename",
         "thermal_preview_filename",
+        "thermal_source_used",
+        "thermal_source_retry_used",
+        "thermal_source_retry_from",
+        "thermal_source_retry_attempts",
         "visual_review_status",
         "base_crop_box",
         "crop_only_shift",
@@ -3398,8 +3920,25 @@ def export_alignment_debug_samples(
         "alignment_status",
         "alignment_confidence_level",
         "alignment_fallback_used",
+        "alignment_candidate_stage",
+        "alignment_detector_type",
+        "alignment_rgb_low_information_pct",
+        "alignment_rgb_gradient_mean",
+        "alignment_thermal_gradient_mean",
+        "alignment_thermal_edge_fraction",
+        "alignment_rgb_mask_usable_fraction",
+        "alignment_thermal_mask_usable_fraction",
+        "alignment_good_matches_in_rgb_low_information",
+        "alignment_inliers_in_rgb_low_information",
+        "alignment_good_match_rgb_low_information_ratio",
+        "alignment_good_matches_on_thermal_edges",
+        "alignment_inliers_on_thermal_edges",
+        "alignment_good_match_thermal_edge_support_ratio",
+        "alignment_ecc_status",
+        "alignment_ecc_score",
         "alignment_good_matches",
         "alignment_inliers",
+        "alignment_inlier_grid_cells",
         "alignment_inlier_ratio",
         "alignment_mean_reprojection_error_px",
         "alignment_reasons",
@@ -3415,10 +3954,30 @@ def export_alignment_debug_samples(
         "rgb_filename",
         "candidate_index",
         "representation",
+        "candidate_stage",
+        "detector_type",
         "transform_type",
         "status",
         "confidence_level",
         "accepted",
+        "rgb_low_information_pct",
+        "rgb_gradient_mean",
+        "thermal_gradient_mean",
+        "thermal_edge_fraction",
+        "rgb_mask_usable_fraction",
+        "thermal_mask_usable_fraction",
+        "keypoints_rgb",
+        "keypoints_thermal",
+        "keypoints_rgb_unmasked",
+        "keypoints_thermal_unmasked",
+        "good_matches_in_rgb_low_information",
+        "inliers_in_rgb_low_information",
+        "good_match_rgb_low_information_ratio",
+        "good_matches_on_thermal_edges",
+        "inliers_on_thermal_edges",
+        "good_match_thermal_edge_support_ratio",
+        "ecc_status",
+        "ecc_score",
         "raw_good_matches",
         "good_matches",
         "match_grid_cells",
@@ -3549,10 +4108,43 @@ def export_alignment_debug_samples(
                     "rgb_filename": pair["rgb"]["filename"],
                     "candidate_index": candidate_index,
                     "representation": candidate.get("representation", ""),
+                    "candidate_stage": candidate.get("candidate_stage", ""),
+                    "detector_type": candidate.get("detector_type", ""),
                     "transform_type": candidate.get("transform_type", ""),
                     "status": candidate.get("status", ""),
                     "confidence_level": candidate.get("confidence_level", ""),
                     "accepted": str(candidate.get("accepted", False)),
+                    "rgb_low_information_pct": f"{candidate.get('rgb_low_information_pct', 0.0):.4f}",
+                    "rgb_gradient_mean": f"{candidate.get('rgb_gradient_mean', 0.0):.4f}",
+                    "thermal_gradient_mean": f"{candidate.get('thermal_gradient_mean', 0.0):.4f}",
+                    "thermal_edge_fraction": f"{candidate.get('thermal_edge_fraction', 0.0):.4f}",
+                    "rgb_mask_usable_fraction": f"{candidate.get('rgb_mask_usable_fraction', 1.0):.4f}",
+                    "thermal_mask_usable_fraction": f"{candidate.get('thermal_mask_usable_fraction', 1.0):.4f}",
+                    "keypoints_rgb": candidate.get("keypoints_rgb", ""),
+                    "keypoints_thermal": candidate.get("keypoints_thermal", ""),
+                    "keypoints_rgb_unmasked": candidate.get("keypoints_rgb_unmasked", ""),
+                    "keypoints_thermal_unmasked": candidate.get("keypoints_thermal_unmasked", ""),
+                    "good_matches_in_rgb_low_information": candidate.get(
+                        "good_matches_in_rgb_low_information",
+                        "",
+                    ),
+                    "inliers_in_rgb_low_information": candidate.get("inliers_in_rgb_low_information", ""),
+                    "good_match_rgb_low_information_ratio": candidate.get(
+                        "good_match_rgb_low_information_ratio",
+                        "",
+                    ),
+                    "good_matches_on_thermal_edges": candidate.get("good_matches_on_thermal_edges", ""),
+                    "inliers_on_thermal_edges": candidate.get("inliers_on_thermal_edges", ""),
+                    "good_match_thermal_edge_support_ratio": candidate.get(
+                        "good_match_thermal_edge_support_ratio",
+                        "",
+                    ),
+                    "ecc_status": candidate.get("ecc_status", ""),
+                    "ecc_score": (
+                        ""
+                        if candidate.get("ecc_score") is None
+                        else f"{candidate.get('ecc_score', 0.0):.6f}"
+                    ),
                     "raw_good_matches": candidate.get("raw_good_matches", ""),
                     "good_matches": candidate.get("good_matches", ""),
                     "match_grid_cells": candidate.get("match_grid_cells", ""),
@@ -3585,6 +4177,10 @@ def export_alignment_debug_samples(
             "detected_camera": pair.get("detected_camera", ""),
             "rgb_filename": pair["rgb"]["filename"],
             "thermal_preview_filename": os.path.basename(thermal_preview_path),
+            "thermal_source_used": auto_align_debug.get("thermal_source_used", ""),
+            "thermal_source_retry_used": str(auto_align_debug.get("thermal_source_retry_used", "")),
+            "thermal_source_retry_from": auto_align_debug.get("thermal_source_retry_from", ""),
+            "thermal_source_retry_attempts": json.dumps(auto_align_debug.get("thermal_source_retry_attempts", [])),
             "visual_review_status": VISUAL_ALIGNMENT_REVIEW_DEFAULT,
             "base_crop_box": str(crop_only_debug["base_crop_box"]),
             "crop_only_shift": str(crop_only_debug["applied_shift"]),
@@ -3605,8 +4201,38 @@ def export_alignment_debug_samples(
             "alignment_status": alignment.get("status", ""),
             "alignment_confidence_level": alignment.get("confidence_level", ""),
             "alignment_fallback_used": alignment.get("fallback_used", ""),
+            "alignment_candidate_stage": alignment.get("candidate_stage", ""),
+            "alignment_detector_type": alignment.get("detector_type", ""),
+            "alignment_rgb_low_information_pct": f"{alignment.get('rgb_low_information_pct', 0.0):.4f}",
+            "alignment_rgb_gradient_mean": f"{alignment.get('rgb_gradient_mean', 0.0):.4f}",
+            "alignment_thermal_gradient_mean": f"{alignment.get('thermal_gradient_mean', 0.0):.4f}",
+            "alignment_thermal_edge_fraction": f"{alignment.get('thermal_edge_fraction', 0.0):.4f}",
+            "alignment_rgb_mask_usable_fraction": f"{alignment.get('rgb_mask_usable_fraction', 1.0):.4f}",
+            "alignment_thermal_mask_usable_fraction": f"{alignment.get('thermal_mask_usable_fraction', 1.0):.4f}",
+            "alignment_good_matches_in_rgb_low_information": alignment.get(
+                "good_matches_in_rgb_low_information",
+                "",
+            ),
+            "alignment_inliers_in_rgb_low_information": alignment.get("inliers_in_rgb_low_information", ""),
+            "alignment_good_match_rgb_low_information_ratio": alignment.get(
+                "good_match_rgb_low_information_ratio",
+                "",
+            ),
+            "alignment_good_matches_on_thermal_edges": alignment.get("good_matches_on_thermal_edges", ""),
+            "alignment_inliers_on_thermal_edges": alignment.get("inliers_on_thermal_edges", ""),
+            "alignment_good_match_thermal_edge_support_ratio": alignment.get(
+                "good_match_thermal_edge_support_ratio",
+                "",
+            ),
+            "alignment_ecc_status": alignment.get("ecc_status", ""),
+            "alignment_ecc_score": (
+                ""
+                if alignment.get("ecc_score") is None
+                else f"{alignment.get('ecc_score', 0.0):.6f}"
+            ),
             "alignment_good_matches": alignment.get("good_matches", ""),
             "alignment_inliers": alignment.get("inliers", ""),
+            "alignment_inlier_grid_cells": alignment.get("inlier_grid_cells", ""),
             "alignment_inlier_ratio": alignment.get("inlier_ratio", ""),
             "alignment_mean_reprojection_error_px": (
                 ""
@@ -3669,16 +4295,18 @@ def _discover_presorted_sets(root_folder):
 
         rgb_dir = os.path.join(current_root, PRESORTED_RGB_DIRNAME)
         thermal_tiff_dir = os.path.join(current_root, PRESORTED_THERMAL_TIFF_DIRNAME)
-        if not os.path.isdir(thermal_tiff_dir):
+        thermal_jpg_dir = os.path.join(current_root, PRESORTED_THERMAL_JPG_DIRNAME)
+        cal_tiff_dir = os.path.join(current_root, PRESORTED_CAL_TIFF_DIRNAME)
+        if not any(os.path.isdir(path) for path in (thermal_jpg_dir, thermal_tiff_dir, cal_tiff_dir)):
             continue
 
         burn_sets.append(
             {
                 "source_root": current_root,
                 "rgb_dir": rgb_dir,
-                "thermal_jpg_dir": os.path.join(current_root, PRESORTED_THERMAL_JPG_DIRNAME),
+                "thermal_jpg_dir": thermal_jpg_dir,
                 "thermal_tiff_dir": thermal_tiff_dir,
-                "cal_tiff_dir": os.path.join(current_root, PRESORTED_CAL_TIFF_DIRNAME),
+                "cal_tiff_dir": cal_tiff_dir,
             }
         )
 
@@ -3941,7 +4569,7 @@ def _collect_flat_dataset_records(folder):
         elif modality == "thermal_jpg":
             thermal_jpg_records.append(record)
 
-    if not rgb_records or not thermal_tiff_records:
+    if not rgb_records or not (thermal_jpg_records or thermal_tiff_records or cal_tiff_records):
         return None
 
     return {
@@ -4331,8 +4959,8 @@ def _apply_neighbor_consistency(decisions, thermal_tiff_nearest_map):
 
 
 def _finalize_pair_status(decision):
-    if decision["thermal_tiff"] is None:
-        decision["status"] = "skipped_missing_thermal_tiff"
+    if decision["cal_tiff"] is None and decision["thermal_tiff"] is None and decision["thermal_jpg"] is None:
+        decision["status"] = "skipped_missing_thermal_source"
     elif decision["confidence"]["level"] == "HIGH":
         decision["status"] = "accepted_high"
     elif decision["confidence"]["level"] == "MEDIUM":
@@ -4394,6 +5022,9 @@ def _pair_log_row(decision):
         "alignment_qa_action": decision.get("alignment_qa_action", ""),
         "thermal_source_used": decision.get("thermal_source_used", ""),
         "thermal_source_path": decision.get("thermal_source_path", ""),
+        "thermal_source_retry_used": str(decision.get("thermal_source_retry_used", "")),
+        "thermal_source_retry_from": decision.get("thermal_source_retry_from", ""),
+        "thermal_source_retry_attempts": json.dumps(decision.get("thermal_source_retry_attempts", [])),
         "selected_transform_matrix": json.dumps(decision.get("selected_transform_matrix", "")),
         "final_transform_matrix": json.dumps(decision.get("final_transform_matrix", "")),
         "fallback_occurred": str(decision.get("fallback_occurred", "")),
@@ -4403,9 +5034,34 @@ def _pair_log_row(decision):
         "alignment_status": alignment.get("status", ""),
         "alignment_confidence_level": alignment.get("confidence_level", ""),
         "alignment_fallback_used": alignment.get("fallback_used", ""),
+        "alignment_candidate_stage": alignment.get("candidate_stage", ""),
+        "alignment_detector_type": alignment.get("detector_type", ""),
         "alignment_representation": alignment.get("representation", ""),
         "alignment_candidate_count": alignment.get("candidate_count", ""),
         "alignment_transform_type": alignment.get("transform_type", ""),
+        "alignment_rgb_low_information_pct": f"{alignment.get('rgb_low_information_pct', 0.0):.4f}",
+        "alignment_rgb_gradient_mean": f"{alignment.get('rgb_gradient_mean', 0.0):.4f}",
+        "alignment_thermal_gradient_mean": f"{alignment.get('thermal_gradient_mean', 0.0):.4f}",
+        "alignment_thermal_edge_fraction": f"{alignment.get('thermal_edge_fraction', 0.0):.4f}",
+        "alignment_rgb_mask_usable_fraction": f"{alignment.get('rgb_mask_usable_fraction', 1.0):.4f}",
+        "alignment_thermal_mask_usable_fraction": f"{alignment.get('thermal_mask_usable_fraction', 1.0):.4f}",
+        "alignment_keypoints_rgb_unmasked": alignment.get("keypoints_rgb_unmasked", ""),
+        "alignment_keypoints_thermal_unmasked": alignment.get("keypoints_thermal_unmasked", ""),
+        "alignment_good_matches_in_rgb_low_information": alignment.get("good_matches_in_rgb_low_information", ""),
+        "alignment_inliers_in_rgb_low_information": alignment.get("inliers_in_rgb_low_information", ""),
+        "alignment_good_match_rgb_low_information_ratio": alignment.get("good_match_rgb_low_information_ratio", ""),
+        "alignment_good_matches_on_thermal_edges": alignment.get("good_matches_on_thermal_edges", ""),
+        "alignment_inliers_on_thermal_edges": alignment.get("inliers_on_thermal_edges", ""),
+        "alignment_good_match_thermal_edge_support_ratio": alignment.get(
+            "good_match_thermal_edge_support_ratio",
+            "",
+        ),
+        "alignment_ecc_status": alignment.get("ecc_status", ""),
+        "alignment_ecc_score": (
+            ""
+            if alignment.get("ecc_score") is None
+            else f"{alignment.get('ecc_score', 0.0):.6f}"
+        ),
         "alignment_raw_good_matches": alignment.get("raw_good_matches", ""),
         "alignment_good_matches": alignment.get("good_matches", ""),
         "alignment_inliers": alignment.get("inliers", ""),
@@ -4883,6 +5539,9 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                 result_pair["feature_alignment"] = result["feature_alignment"]
                 result_pair["thermal_source_used"] = result["thermal_source_used"]
                 result_pair["thermal_source_path"] = result["thermal_source_path"]
+                result_pair["thermal_source_retry_used"] = result.get("thermal_source_retry_used", False)
+                result_pair["thermal_source_retry_from"] = result.get("thermal_source_retry_from", "")
+                result_pair["thermal_source_retry_attempts"] = result.get("thermal_source_retry_attempts", [])
                 result_pair["final_transform_matrix"] = result["final_transform_matrix"]
                 result_pair["fallback_occurred"] = result["fallback_occurred"]
 
