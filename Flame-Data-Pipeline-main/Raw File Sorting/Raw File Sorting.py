@@ -1898,6 +1898,69 @@ def _apply_rgb_fov_correction(
     return final_image
 
 
+def _pair_record_path(pair, key):
+    record = pair.get(key) if pair is not None else None
+    if not record:
+        return None
+    return record.get("filepath")
+
+
+def _select_corrected_fov_thermal_source(pair):
+    for source_name, key in (
+        ("CalTIFF", "cal_tiff"),
+        ("TIFF", "thermal_tiff"),
+        ("thermal JPG", "thermal_jpg"),
+    ):
+        source_path = _pair_record_path(pair, key)
+        if source_path:
+            return source_path, source_name
+    return None, "none"
+
+
+def _debug_fallback_used(debug_info):
+    alignment = debug_info.get("feature_alignment", {})
+    fallback = alignment.get("fallback_used")
+    return bool(fallback and fallback != "none")
+
+
+def generate_corrected_fov(
+    pair,
+    mode="AUTO_ALIGN",
+    dataset_name=None,
+    burn_set_name=None,
+    calibration_profile=None,
+    camera_used=None,
+    use_experimental_shift=False,
+    return_debug_info=False,
+):
+    thermal_source_path, thermal_source_name = _select_corrected_fov_thermal_source(pair)
+    previous_mode = FOV_CORRECTION_MODE
+    try:
+        globals()["FOV_CORRECTION_MODE"] = mode
+        corrected_rgb, debug_info = _apply_rgb_fov_correction(
+            pair["rgb"]["filepath"],
+            thermal_source_path=thermal_source_path,
+            use_experimental_shift=use_experimental_shift,
+            dataset_name=dataset_name if dataset_name is not None else pair.get("dataset_name"),
+            burn_set_name=burn_set_name if burn_set_name is not None else pair.get("burn_set_name"),
+            calibration_profile=calibration_profile,
+            camera_used=camera_used if camera_used is not None else pair.get("detected_camera"),
+            return_debug_info=True,
+        )
+    finally:
+        globals()["FOV_CORRECTION_MODE"] = previous_mode
+
+    debug_info["correction_mode_used"] = debug_info.get("fov_correction_mode", mode)
+    debug_info["thermal_source_used"] = thermal_source_name
+    debug_info["thermal_source_path"] = thermal_source_path or ""
+    debug_info["fallback_occurred"] = _debug_fallback_used(debug_info)
+    debug_info["transform_matrix"] = debug_info.get("final_transform_matrix")
+
+    if return_debug_info:
+        return corrected_rgb, debug_info
+    return corrected_rgb
+
+
 def _fit_image_to_panel(image, panel_size=(640, 512), background=(245, 245, 245)):
     panel = Image.new("RGB", panel_size, color=background)
     image_copy = image.copy()
@@ -1925,20 +1988,33 @@ def _build_alignment_debug_image(
     camera_used=None,
 ):
     raw_rgb = _load_debug_preview_image(rgb_path)
-    crop_only_corrected, crop_only_debug = _apply_rgb_fov_correction(
-        rgb_path,
-        thermal_source_path=thermal_shift_source_path,
-        use_experimental_shift=False,
+    debug_pair = {
+        "rgb": {"filepath": rgb_path, "filename": os.path.basename(rgb_path)},
+        "cal_tiff": None,
+        "thermal_tiff": {
+            "filepath": thermal_shift_source_path,
+            "filename": os.path.basename(thermal_shift_source_path) if thermal_shift_source_path else "",
+        },
+        "thermal_jpg": {
+            "filepath": thermal_preview_path,
+            "filename": os.path.basename(thermal_preview_path) if thermal_preview_path else "",
+        },
+        "dataset_name": dataset_name,
+        "burn_set_name": burn_set_name,
+        "detected_camera": camera_used,
+    }
+    crop_only_corrected, crop_only_debug = generate_corrected_fov(
+        debug_pair,
+        mode="CROP_ONLY",
         dataset_name=dataset_name,
         burn_set_name=burn_set_name,
         calibration_profile=None,
         camera_used=camera_used,
         return_debug_info=True,
     )
-    final_corrected, final_debug = _apply_rgb_fov_correction(
-        rgb_path,
-        thermal_source_path=thermal_shift_source_path,
-        use_experimental_shift=False,
+    final_corrected, final_debug = generate_corrected_fov(
+        debug_pair,
+        mode=_get_fov_correction_mode(),
         dataset_name=dataset_name,
         burn_set_name=burn_set_name,
         calibration_profile=calibration_profile,
@@ -2226,56 +2302,38 @@ def export_alignment_debug_samples(
     candidate_rows = []
     for sample_number, pair_index in enumerate(_sample_pair_indices(len(pairs), sample_count), start=1):
         pair = pairs[pair_index]
-        thermal_preview_path = (
-            pair["thermal_jpg"]["filepath"]
-            if pair["thermal_jpg"] is not None
-            else pair["thermal_tiff"]["filepath"]
-        )
-        thermal_shift_source_path = (
-            pair["cal_tiff"]["filepath"]
-            if pair["cal_tiff"] is not None
-            else pair["thermal_tiff"]["filepath"]
-        )
-        previous_mode = FOV_CORRECTION_MODE
+        thermal_preview_path, _ = _select_corrected_fov_thermal_source(pair)
+        thermal_shift_source_path = thermal_preview_path
         manual_image = None
         manual_debug = None
-        try:
-            globals()["FOV_CORRECTION_MODE"] = "CROP_ONLY"
-            crop_only_image, crop_only_debug = _apply_rgb_fov_correction(
-                pair["rgb"]["filepath"],
-                thermal_source_path=thermal_shift_source_path,
-                use_experimental_shift=False,
-                dataset_name=dataset_name,
-                burn_set_name=burn_set_name,
-                calibration_profile=None,
-                camera_used=pair.get("detected_camera"),
-                return_debug_info=True,
-            )
-            globals()["FOV_CORRECTION_MODE"] = "AUTO_ALIGN"
-            auto_align_image, auto_align_debug = _apply_rgb_fov_correction(
-                pair["rgb"]["filepath"],
-                thermal_source_path=thermal_shift_source_path,
-                use_experimental_shift=False,
+        crop_only_image, crop_only_debug = generate_corrected_fov(
+            pair,
+            mode="CROP_ONLY",
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            calibration_profile=None,
+            camera_used=pair.get("detected_camera"),
+            return_debug_info=True,
+        )
+        auto_align_image, auto_align_debug = generate_corrected_fov(
+            pair,
+            mode="AUTO_ALIGN",
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            calibration_profile=calibration_profile,
+            camera_used=pair.get("detected_camera"),
+            return_debug_info=True,
+        )
+        if calibration_profile is not None:
+            manual_image, manual_debug = generate_corrected_fov(
+                pair,
+                mode="CALIBRATION_PROFILE",
                 dataset_name=dataset_name,
                 burn_set_name=burn_set_name,
                 calibration_profile=calibration_profile,
                 camera_used=pair.get("detected_camera"),
                 return_debug_info=True,
             )
-            if calibration_profile is not None:
-                globals()["FOV_CORRECTION_MODE"] = "CALIBRATION_PROFILE"
-                manual_image, manual_debug = _apply_rgb_fov_correction(
-                    pair["rgb"]["filepath"],
-                    thermal_source_path=thermal_shift_source_path,
-                    use_experimental_shift=False,
-                    dataset_name=dataset_name,
-                    burn_set_name=burn_set_name,
-                    calibration_profile=calibration_profile,
-                    camera_used=pair.get("detected_camera"),
-                    return_debug_info=True,
-                )
-        finally:
-            globals()["FOV_CORRECTION_MODE"] = previous_mode
 
         thermal_overlay_source = _load_debug_preview_image(thermal_preview_path)
         debug_image, _, _ = _build_alignment_debug_image(
@@ -3164,6 +3222,10 @@ def _pair_log_row(decision):
         "camera_dimension_summary": decision.get("camera_dimension_summary", ""),
         "camera_detection_reason": decision.get("camera_detection_reason", ""),
         "fov_correction_mode": decision.get("fov_correction_mode", _get_fov_correction_mode()),
+        "thermal_source_used": decision.get("thermal_source_used", ""),
+        "thermal_source_path": decision.get("thermal_source_path", ""),
+        "final_transform_matrix": json.dumps(decision.get("final_transform_matrix", "")),
+        "fallback_occurred": str(decision.get("fallback_occurred", "")),
         "final_crop_box": str(decision.get("final_crop_box", "")),
         "crop_shrink": str(decision.get("crop_shrink", "")),
         "calibration_profile_available": decision.get("calibration_profile_path", ""),
@@ -3633,15 +3695,9 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
 
                 shutil.copy(pair["rgb"]["filepath"], os.path.join(rgb_raw_output_dir, rgb_output_name))
 
-                thermal_alignment_source = (
-                    pair["cal_tiff"]["filepath"]
-                    if pair["cal_tiff"] is not None
-                    else pair["thermal_tiff"]["filepath"]
-                )
-                corrected_rgb, correction_debug = _apply_rgb_fov_correction(
-                    pair["rgb"]["filepath"],
-                    thermal_source_path=thermal_alignment_source,
-                    use_experimental_shift=False,
+                corrected_rgb, correction_debug = generate_corrected_fov(
+                    pair,
+                    mode="AUTO_ALIGN",
                     dataset_name=dataset["name"],
                     burn_set_name=burn_set_name,
                     calibration_profile=active_profile,
@@ -3652,6 +3708,10 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                 pair["final_crop_box"] = correction_debug["final_crop_box"]
                 pair["crop_shrink"] = correction_debug["crop_shrink"]
                 pair["feature_alignment"] = correction_debug["feature_alignment"]
+                pair["thermal_source_used"] = correction_debug["thermal_source_used"]
+                pair["thermal_source_path"] = correction_debug["thermal_source_path"]
+                pair["final_transform_matrix"] = correction_debug["final_transform_matrix"]
+                pair["fallback_occurred"] = correction_debug["fallback_occurred"]
                 if "exif" in corrected_rgb.info:
                     corrected_rgb.save(
                         os.path.join(rgb_corrected_output_dir, rgb_output_name),
@@ -3978,15 +4038,41 @@ def raw_file_sorting():
                 del temp_arr
 
                 thermal_alignment_source = f'{OUTPUT_FOLDER}{subfolder}/Images/Thermal/Celsius TIFF/{rgb_filename_n.split(".")[0]}.TIFF'
-                corrected_rgb = _apply_rgb_fov_correction(
-                    f'{INPUT_FOLDER}{subfolder}/{rgb_filename}',
-                    thermal_source_path=thermal_alignment_source,
-                    use_experimental_shift=False,
+                production_pair = {
+                    "rgb": {
+                        "filepath": f'{INPUT_FOLDER}{subfolder}/{rgb_filename}',
+                        "filename": rgb_filename,
+                    },
+                    "cal_tiff": None,
+                    "thermal_tiff": {
+                        "filepath": thermal_alignment_source,
+                        "filename": f'{rgb_filename_n.split(".")[0]}.TIFF',
+                    },
+                    "thermal_jpg": {
+                        "filepath": f'{OUTPUT_FOLDER}{subfolder}/Images/Thermal/JPG/{rgb_filename_n}',
+                        "filename": rgb_filename_n,
+                    },
+                    "dataset_name": subfolder,
+                    "burn_set_name": "burn_set_001",
+                    "detected_camera": local_camera_used,
+                }
+                corrected_rgb, correction_debug = generate_corrected_fov(
+                    production_pair,
+                    mode="AUTO_ALIGN",
                     dataset_name=subfolder,
                     burn_set_name="burn_set_001",
                     camera_used=local_camera_used,
                     calibration_profile=calibration_profile,
+                    return_debug_info=True,
                 )
+                with open('log.txt', 'a+') as f:
+                    f.write(
+                        "corrected_fov "
+                        f"mode={correction_debug['correction_mode_used']} "
+                        f"thermal_source={correction_debug['thermal_source_used']} "
+                        f"fallback={correction_debug['fallback_occurred']} "
+                        f"transform={correction_debug['final_transform_matrix']}\n"
+                    )
 
                 # Copy cropped/aligned rgb image to output w/ original exif data when available
                 corrected_rgb_output_path = f'{OUTPUT_FOLDER}{subfolder}/Images/RGB/Corrected FOV/{rgb_filename_n}'

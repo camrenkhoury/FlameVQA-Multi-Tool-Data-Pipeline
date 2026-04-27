@@ -222,11 +222,7 @@ class AlignmentValidationWindow:
         detected_camera = self.pair.get("detected_camera")
         self.raw_rgb = self._load_standard_image(self.pair["rgb"]["filepath"])
         self.raw_rgb_value_image = self._load_value_image(self.pair["rgb"]["filepath"])
-        self.thermal_alignment_source = (
-            self.pair["cal_tiff"]["filepath"]
-            if self.pair["cal_tiff"] is not None
-            else self.pair["thermal_tiff"]["filepath"]
-        )
+        self.thermal_alignment_source, _ = self.sorter._select_corrected_fov_thermal_source(self.pair)
         self.fixed_crop_debug = self.sorter._get_crop_debug_info(
             self.pair["rgb"]["filepath"],
             thermal_source_path=self.thermal_alignment_source,
@@ -235,10 +231,9 @@ class AlignmentValidationWindow:
             burn_set_name=burn_set_name,
             camera_used=detected_camera,
         )
-        self.corrected_fixed = self.sorter._apply_rgb_fov_correction(
-            self.pair["rgb"]["filepath"],
-            thermal_source_path=self.thermal_alignment_source,
-            use_experimental_shift=False,
+        self.corrected_fixed = self.sorter.generate_corrected_fov(
+            self.pair,
+            mode=self.sorter.FOV_CORRECTION_MODE,
             dataset_name=dataset_name,
             burn_set_name=burn_set_name,
             camera_used=detected_camera,
@@ -928,16 +923,11 @@ class CalibrationProfileWindow:
         self.current_pair["dataset_name"] = self.dataset_name
         self.current_pair["burn_set_name"] = self.burn_set_name
         self.current_pair["detected_camera"] = self.detected_camera
-        thermal_source = (
-            self.current_pair["thermal_jpg"]["filepath"]
-            if self.current_pair["thermal_jpg"] is not None
-            else self.current_pair["cal_tiff"]["filepath"] if self.current_pair["cal_tiff"] is not None else self.current_pair["thermal_tiff"]["filepath"]
-        )
+        thermal_source, _ = self.sorter._select_corrected_fov_thermal_source(self.current_pair)
         self.current_raw_rgb = self._load_standard_image(self.current_pair["rgb"]["filepath"])
-        self.current_crop_only, self.current_crop_debug = self.sorter._apply_rgb_fov_correction(
-            self.current_pair["rgb"]["filepath"],
-            thermal_source_path=thermal_source,
-            use_experimental_shift=False,
+        self.current_crop_only, self.current_crop_debug = self.sorter.generate_corrected_fov(
+            self.current_pair,
+            mode="CROP_ONLY",
             dataset_name=self.dataset_name,
             burn_set_name=self.burn_set_name,
             calibration_profile=None,
@@ -1489,11 +1479,7 @@ class PairPreviewWindow:
         self.current_burn_set_name = pair.get("burn_set_name", self.burn_set.get("name"))
         self.current_detected_camera = pair.get("detected_camera", self.burn_set.get("detected_camera"))
 
-        thermal_source = (
-            pair["thermal_jpg"]["filepath"]
-            if pair["thermal_jpg"] is not None
-            else pair["cal_tiff"]["filepath"] if pair["cal_tiff"] is not None else pair["thermal_tiff"]["filepath"]
-        )
+        thermal_source, _ = self.sorter._select_corrected_fov_thermal_source(pair)
         self.current_thermal_source = thermal_source
         crop_only, crop_debug = self._load_corrected_with_mode(pair["rgb"]["filepath"], "CROP_ONLY")
         auto_align, auto_debug = self._load_corrected_with_mode(pair["rgb"]["filepath"], "AUTO_ALIGN")
@@ -1534,9 +1520,9 @@ class PairPreviewWindow:
     def _load_preview_image(self, path, mode="rgb"):
         img = Image.open(path)
         if mode == "rgb_corrected":
-            corrected = self.sorter._apply_rgb_fov_correction(
-                path,
-                getattr(self, "current_thermal_source", None),
+            corrected = self.sorter.generate_corrected_fov(
+                self.current_pair,
+                mode=self.sorter.FOV_CORRECTION_MODE,
                 dataset_name=getattr(self, "current_dataset_name", None),
                 burn_set_name=getattr(self, "current_burn_set_name", None),
                 camera_used=getattr(self, "current_detected_camera", None),
@@ -1553,19 +1539,14 @@ class PairPreviewWindow:
         return img
 
     def _load_corrected_with_mode(self, raw_path, mode):
-        previous_mode = self.sorter.FOV_CORRECTION_MODE
-        try:
-            self.sorter.FOV_CORRECTION_MODE = mode
-            corrected, debug_info = self.sorter._apply_rgb_fov_correction(
-                raw_path,
-                getattr(self, "current_thermal_source", None),
-                dataset_name=getattr(self, "current_dataset_name", None),
-                burn_set_name=getattr(self, "current_burn_set_name", None),
-                camera_used=getattr(self, "current_detected_camera", None),
-                return_debug_info=True,
-            )
-        finally:
-            self.sorter.FOV_CORRECTION_MODE = previous_mode
+        corrected, debug_info = self.sorter.generate_corrected_fov(
+            self.current_pair,
+            mode=mode,
+            dataset_name=getattr(self, "current_dataset_name", None),
+            burn_set_name=getattr(self, "current_burn_set_name", None),
+            camera_used=getattr(self, "current_detected_camera", None),
+            return_debug_info=True,
+        )
 
         if corrected.mode not in ("RGB", "RGBA"):
             corrected = corrected.convert("RGB")
