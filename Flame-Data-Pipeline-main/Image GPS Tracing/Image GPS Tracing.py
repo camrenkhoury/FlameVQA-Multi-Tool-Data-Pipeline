@@ -16,10 +16,12 @@ SOURCE_DIR = './Images/Fire/RGB/'
 OUTPUT_CSV_PATH = './GPS_Traces.csv'
 
 #import required libraries
-import os
-from exif import Image
 import csv
 from datetime import datetime
+import os
+from pathlib import Path
+
+from exif import Image
 
 '''
 Function that will convert latitude or longitude in hours-minutes-seconds (HMS) format 
@@ -74,59 +76,80 @@ def image_coordinates(image_path):
         print('The Image has no EXIF information')
 
 
-if __name__ == "__main__":
-    #create list variables
-    paths = []
-    filenames = []
-    datetimes = []
-    lats = []
-    lons = []
-    alts = []
+def _image_paths(source_dir, recursive=False):
+    source_path = Path(source_dir)
+    pattern_iter = source_path.rglob("*") if recursive else source_path.iterdir()
+    valid_extensions = {".jpg", ".jpeg", ".tif", ".tiff"}
+    return sorted(
+        path for path in pattern_iter
+        if path.is_file() and path.suffix.lower() in valid_extensions
+    )
+
+
+def trace_images(source_dir=SOURCE_DIR, output_csv_path=OUTPUT_CSV_PATH, recursive=False):
+    """Extract GPS EXIF records from a directory of images and write a sorted CSV."""
+    source_path = Path(source_dir)
+    output_path = Path(output_csv_path)
+    if not source_path.exists() or not source_path.is_dir():
+        raise FileNotFoundError(f"GPS source directory does not exist: {source_path}")
 
     print('Starting Image GPS Tracing Tool.')
-    print(f'Extracting EXIF metadata from images in {SOURCE_DIR}')
-    # Pull data from exifs of images in source dir
-    for file in os.listdir(SOURCE_DIR):
-        img_stats = image_coordinates(SOURCE_DIR + file)
-        paths.append(img_stats[0])
-        filenames.append(file)
-        datetimes.append(img_stats[1])
-        lats.append(img_stats[2][0])
-        lons.append(img_stats[2][1])
-        alts.append(img_stats[3])
+    print(f'Extracting EXIF metadata from images in {source_path}')
 
-    # convert exif times to datetimes for sorting
-    datetimes = [datetime.strptime(x, "%Y:%m:%d %H:%M:%S") for x in datetimes]
+    records = []
+    skipped = []
+    for path in _image_paths(source_path, recursive=recursive):
+        try:
+            img_stats = image_coordinates(str(path))
+            if img_stats is None:
+                skipped.append((str(path), "missing_exif_or_gps"))
+                continue
+            dt = datetime.strptime(img_stats[1], "%Y:%m:%d %H:%M:%S")
+            records.append(
+                {
+                    "datetime": dt,
+                    "latitude": img_stats[2][0],
+                    "longitude": img_stats[2][1],
+                    "altitude": img_stats[3],
+                    "filename": path.name,
+                    "path": img_stats[0],
+                }
+            )
+        except Exception as exc:
+            skipped.append((str(path), str(exc)))
 
-    # sort data by datetime
     print('Sorting images by datetime.')
-    sorted_data = sorted(zip(paths, filenames, datetimes, lats, lons, alts), key=lambda x:x[2])
+    records.sort(key=lambda record: record["datetime"])
 
-    paths = [p for p, f, d, la, lo, a in sorted_data]
-    filenames = [f for p, f, d, la, lo, a in sorted_data]
-    datetimes = [d for p, f, d, la, lo, a in sorted_data]
-    lats = [la for p, f, d, la, lo, a in sorted_data]
-    lons = [lo for p, f, d, la, lo, a in sorted_data]
-    alts = [a for p, f, d, la, lo, a in sorted_data]
-
-    # convert datetimes back to strings
-    datetimes = [datetime.strftime(x, "%Y:%m:%d %H:%M:%S") for x in datetimes]
-
-    # log data into csv
-    print(f'Logging data to {OUTPUT_CSV_PATH}')
-    with open(OUTPUT_CSV_PATH, 'w', newline='') as log:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    print(f'Logging data to {output_path}')
+    with open(output_path, 'w', newline='') as log:
         log_writer = csv.writer(log)
-
-        # write header
-        header = ['Datetime','Latitude','Longitude','Altitude [m ASL]','Image Filename','Image Path']
+        header = ['Datetime', 'Latitude', 'Longitude', 'Altitude [m ASL]', 'Image Filename', 'Image Path']
         log_writer.writerow(header)
+        for record in records:
+            log_writer.writerow([
+                datetime.strftime(record["datetime"], "%Y:%m:%d %H:%M:%S"),
+                record["latitude"],
+                record["longitude"],
+                record["altitude"],
+                record["filename"],
+                record["path"],
+            ])
 
-        # write data
-        for i in range(0, len(paths)):
-            log_writer.writerow([datetimes[i],
-                                 lats[i],
-                                 lons[i],
-                                 alts[i],
-                                 filenames[i],
-                                 paths[i]])
-    print('Image GPS Tracing Tool completed.')
+    print(
+        f'Image GPS Tracing Tool completed. '
+        f'Wrote {len(records)} record(s), skipped {len(skipped)} image(s).'
+    )
+    return {
+        "source_dir": str(source_path),
+        "output_csv_path": str(output_path),
+        "processed": len(records) + len(skipped),
+        "written": len(records),
+        "skipped": len(skipped),
+        "skipped_details": skipped,
+    }
+
+
+if __name__ == "__main__":
+    trace_images(SOURCE_DIR, OUTPUT_CSV_PATH)

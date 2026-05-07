@@ -10,20 +10,32 @@ import threading
 import traceback
 import tkinter as tk
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import numpy as np
 from PIL import Image, ImageDraw, ImageOps, ImageTk
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 SORTER_PATH = SCRIPT_DIR / "Raw File Sorting.py"
+PIPELINE_ROOT = SCRIPT_DIR.parent
+LABELING_TOOL_PATH = PIPELINE_ROOT / "Labeling" / "FLAME Image Labeling Tool.py"
+GPS_TOOL_PATH = PIPELINE_ROOT / "Image GPS Tracing" / "Image GPS Tracing.py"
 
 
-def load_sorter_module():
-    spec = importlib.util.spec_from_file_location("raw_file_sorting_module", SORTER_PATH)
+def load_python_module(module_name, module_path):
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def load_sorter_module():
+    return load_python_module("raw_file_sorting_module", SORTER_PATH)
+
+
+def load_gps_module():
+    return load_python_module("image_gps_tracing_module", GPS_TOOL_PATH)
 
 
 sorter = load_sorter_module()
@@ -1041,7 +1053,7 @@ class CalibrationProfileWindow:
             profile_scope=self.scope_var.get(),
             baseline_crop_box=self.current_crop_debug["base_crop_box"],
             source_rgb_size=self.current_raw_rgb.size,
-            notes="Created with the Raw File Sorting GUI developer check tool.",
+            notes="Created with the Full Pipeline GUI developer check tool.",
         )
         self._populate_model_tree(self.estimated_profile)
         self._populate_point_tree()
@@ -1695,10 +1707,10 @@ class PairPreviewWindow:
             messagebox.showerror("Open failed", f"Could not open:\n{path}\n\n{exc}")
 
 
-class RawSortingGui:
+class FullPipelineGui:
     def __init__(self, root):
         self.root = root
-        self.root.title("FLAME Raw File Sorting Assistant")
+        self.root.title("FLAME Full Pipeline GUI")
         self.root.geometry("1680x980")
 
         self.input_var = tk.StringVar(value=str(SCRIPT_DIR / "Input Folder"))
@@ -1706,11 +1718,21 @@ class RawSortingGui:
         self.mode_var = tk.StringVar(value="AUTO")
         self.camera_var = tk.StringVar(value="Detected automatically per dataset")
         self.status_var = tk.StringVar(
-            value="Set folders, then run the sort. After a successful run, Check Results becomes available."
+            value="Set folders, then run the full pipeline. Sorting runs first, then selected follow-up steps run automatically."
         )
         self.progress_var = tk.DoubleVar(value=0.0)
-        self.progress_label_var = tk.StringVar(value="Progress: idle")
+        self.progress_label_var = tk.StringVar(value="1. Raw sorting/export: idle")
+        self.gps_progress_var = tk.DoubleVar(value=0.0)
+        self.gps_progress_label_var = tk.StringVar(value="2. GPS traces: idle")
+        self.labeling_progress_var = tk.DoubleVar(value=0.0)
+        self.labeling_progress_label_var = tk.StringVar(value="3. Temperature labeling: idle")
         self.summary_var = tk.StringVar(value="No results loaded yet.")
+        self.auto_check_results_var = tk.BooleanVar(value=True)
+        self.auto_temperature_label_var = tk.BooleanVar(value=True)
+        self.temperature_threshold_var = tk.StringVar(value="150")
+        self.auto_gps_var = tk.BooleanVar(value=True)
+        self.auto_labeling_var = tk.BooleanVar(value=False)
+        self.current_temperature_threshold = None
 
         self.analysis = []
         self.selected_burn_set = None
@@ -1718,6 +1740,7 @@ class RawSortingGui:
         self.output_queue = queue.Queue()
         self.preview_images = {}
         self.results_ready = False
+        self.pending_post_sort_actions = False
 
         self._build_ui()
         self._sync_existing_results_state()
@@ -1733,15 +1756,15 @@ class RawSortingGui:
 
         ttk.Label(
             header,
-            text="FLAME Raw File Sorting Assistant",
+            text="FLAME Full Pipeline GUI",
             font=("Segoe UI", 16, "bold"),
         ).grid(row=0, column=0, sticky="w")
         ttk.Label(
             header,
             text=(
-                "Run the sort to build the FLAME labeling-tool folder structure. "
-                "The tool auto-detects the workflow, then writes the standard FLAME output. "
-                "After sorting finishes, use Check Results to inspect detected burn sets, pair counts, and image matches."
+                "Run one button to build the FLAME dataset folder structure, inspect pairings, "
+                "generate GPS traces, and launch labeling from the sorted output. "
+                "Raw sorting still runs first; the selected automation steps run after export completes."
             ),
             wraplength=1280,
         ).grid(row=1, column=0, sticky="w", pady=(6, 0))
@@ -1779,6 +1802,35 @@ class RawSortingGui:
         ttk.Label(controls, textvariable=self.status_var, wraplength=420).grid(
             row=1, column=7, sticky="e", pady=(10, 0)
         )
+
+        automation = ttk.LabelFrame(controls, text="Pipeline Automation After Run Full Pipeline", padding=8)
+        automation.grid(row=2, column=0, columnspan=8, sticky="ew", pady=(12, 0))
+        automation.columnconfigure(4, weight=1)
+        ttk.Checkbutton(
+            automation,
+            text="Check results automatically",
+            variable=self.auto_check_results_var,
+        ).grid(row=0, column=0, sticky="w", padx=(0, 18))
+        ttk.Checkbutton(
+            automation,
+            text="Temperature label Fire/No Fire",
+            variable=self.auto_temperature_label_var,
+        ).grid(row=0, column=1, sticky="w", padx=(0, 18))
+        ttk.Checkbutton(
+            automation,
+            text="Generate GPS traces from RGB/Raw",
+            variable=self.auto_gps_var,
+        ).grid(row=0, column=2, sticky="w", padx=(0, 18))
+        ttk.Checkbutton(
+            automation,
+            text="Open manual labeler after auto labels",
+            variable=self.auto_labeling_var,
+        ).grid(row=0, column=3, sticky="w", padx=(0, 18))
+        ttk.Label(
+            automation,
+            text="The Fire temperature threshold is requested before processing starts.",
+            wraplength=520,
+        ).grid(row=0, column=4, sticky="e")
 
         self.main_content = ttk.Panedwindow(self.root, orient="horizontal")
         self.main_content.grid(row=2, column=0, sticky="nsew", padx=12, pady=12)
@@ -1830,34 +1882,83 @@ class RawSortingGui:
         actions.columnconfigure(0, weight=1)
         self.view_output_button = ttk.Button(
             actions,
-            text="View Output Folder",
+            text="Review Output Images",
             command=self._open_output_viewer,
             state="disabled",
         )
         self.view_output_button.grid(row=0, column=0, sticky="ew")
+        self.generate_gps_button = ttk.Button(
+            actions,
+            text="Generate GPS Traces",
+            command=self._generate_gps_traces_for_selected,
+            state="disabled",
+        )
+        self.generate_gps_button.grid(row=1, column=0, sticky="ew", pady=(8, 0))
+        self.open_labeling_button = ttk.Button(
+            actions,
+            text="Open Labeling Tool",
+            command=self._open_labeling_for_selected,
+            state="disabled",
+        )
+        self.open_labeling_button.grid(row=2, column=0, sticky="ew", pady=(8, 0))
+        self.open_output_folder_button = ttk.Button(
+            actions,
+            text="Open Output Folder",
+            command=self._open_output_folder,
+            state="disabled",
+        )
+        self.open_output_folder_button.grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
         bottom = ttk.Frame(self.root, padding=(12, 0, 12, 12))
         bottom.grid(row=3, column=0, sticky="nsew")
         bottom.columnconfigure(0, weight=1)
 
+        pipeline_progress = ttk.LabelFrame(bottom, text="Full Pipeline Progress", padding=8)
+        pipeline_progress.grid(row=0, column=0, sticky="ew")
+        pipeline_progress.columnconfigure(1, weight=1)
+
+        ttk.Label(pipeline_progress, textvariable=self.progress_label_var, width=52).grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
         self.progress_bar = ttk.Progressbar(
-            bottom,
+            pipeline_progress,
             variable=self.progress_var,
             maximum=100,
             mode="determinate",
         )
-        self.progress_bar.grid(row=0, column=0, sticky="ew")
-        ttk.Label(bottom, textvariable=self.progress_label_var).grid(row=1, column=0, sticky="w", pady=(6, 0))
+        self.progress_bar.grid(row=0, column=1, sticky="ew")
+
+        ttk.Label(pipeline_progress, textvariable=self.gps_progress_label_var, width=52).grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(6, 0)
+        )
+        self.gps_progress_bar = ttk.Progressbar(
+            pipeline_progress,
+            variable=self.gps_progress_var,
+            maximum=100,
+            mode="determinate",
+        )
+        self.gps_progress_bar.grid(row=1, column=1, sticky="ew", pady=(6, 0))
+
+        ttk.Label(pipeline_progress, textvariable=self.labeling_progress_label_var, width=52).grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=(6, 0)
+        )
+        self.labeling_progress_bar = ttk.Progressbar(
+            pipeline_progress,
+            variable=self.labeling_progress_var,
+            maximum=100,
+            mode="determinate",
+        )
+        self.labeling_progress_bar.grid(row=2, column=1, sticky="ew", pady=(6, 0))
 
         self.run_sort_button = ttk.Button(
             bottom,
-            text="Run Sort",
+            text="Run Full Pipeline",
             command=self._run_sort,
             style="Run.TButton",
         )
-        self.run_sort_button.grid(row=2, column=0, sticky="ew", pady=(10, 0), ipady=10)
+        self.run_sort_button.grid(row=1, column=0, sticky="ew", pady=(10, 0), ipady=10)
         ttk.Label(bottom, textvariable=self.summary_var, wraplength=1200).grid(
-            row=3, column=0, sticky="w", pady=(10, 0)
+            row=2, column=0, sticky="w", pady=(10, 0)
         )
 
         self._handle_mode_change()
@@ -1879,7 +1980,7 @@ class RawSortingGui:
     def _handle_mode_change(self, event=None):
         self._sync_existing_results_state()
         self.status_var.set(
-            "Auto-detect is enabled. Run Sort will inspect the input folder, detect the camera per dataset, and choose the appropriate workflow."
+            "Auto-detect is enabled. Run Full Pipeline will inspect the input folder, detect the camera per dataset, and choose the appropriate workflow."
         )
 
     def _dataset_output_root(self, dataset_name):
@@ -2026,7 +2127,11 @@ class RawSortingGui:
         self.results_ready = False
         self.check_results_button.configure(state="disabled")
         self.progress_var.set(0)
-        self.progress_label_var.set("Progress: idle")
+        self.progress_label_var.set("1. Raw sorting/export: idle")
+        self.gps_progress_var.set(0)
+        self.gps_progress_label_var.set("2. GPS traces: idle")
+        self.labeling_progress_var.set(0)
+        self.labeling_progress_label_var.set("3. Temperature labeling: idle")
         self.summary_var.set("No results loaded yet.")
         self.analysis = []
         self.selected_burn_set = None
@@ -2034,6 +2139,9 @@ class RawSortingGui:
         self.burn_tree.delete(*self.burn_tree.get_children())
         self.pair_tree.delete(*self.pair_tree.get_children())
         self.view_output_button.configure(state="disabled")
+        self.generate_gps_button.configure(state="disabled")
+        self.open_labeling_button.configure(state="disabled")
+        self.open_output_folder_button.configure(state="disabled")
 
     def _append_log(self, message):
         cleaned = message.strip()
@@ -2049,6 +2157,9 @@ class RawSortingGui:
                 elif kind == "analysis":
                     self.analysis = payload
                     self._populate_analysis()
+                    if self.pending_post_sort_actions:
+                        self.pending_post_sort_actions = False
+                        self._run_post_sort_actions()
                 elif kind == "status":
                     self.status_var.set(payload)
                 elif kind == "progress":
@@ -2056,20 +2167,91 @@ class RawSortingGui:
                     total = payload["total"] if payload["total"] else 1
                     percent = (current / total) * 100.0
                     self.progress_var.set(percent)
-                    self.progress_label_var.set(payload["message"])
+                    message = str(payload["message"]).replace("Progress:", "").strip()
+                    self.progress_label_var.set(
+                        f"1. Raw sorting/export: {current}/{total} - {message}"
+                    )
+                elif kind == "gps_progress":
+                    current = payload["current"]
+                    total = payload["total"] if payload["total"] else 1
+                    percent = (current / total) * 100.0
+                    self.gps_progress_var.set(percent)
+                    self.gps_progress_label_var.set(
+                        f"2. GPS traces: {current}/{total} - {payload['message']}"
+                    )
+                elif kind == "labeling_progress":
+                    current = payload["current"]
+                    total = payload["total"] if payload["total"] else 1
+                    percent = (current / total) * 100.0
+                    self.labeling_progress_var.set(percent)
+                    self.labeling_progress_label_var.set(
+                        f"3. Temperature labeling: {current}/{total} - {payload['message']}"
+                    )
+                elif kind == "raw_complete":
+                    self.progress_var.set(100.0)
+                    self.progress_label_var.set("1. Raw sorting/export: complete")
                 elif kind == "results_ready":
                     self.results_ready = True
                     self.check_results_button.configure(state="normal")
+                elif kind == "sort_complete":
+                    self.results_ready = True
+                    self.check_results_button.configure(state="normal")
+                    should_load_results = (
+                        self.auto_check_results_var.get()
+                        or self.auto_temperature_label_var.get()
+                        or self.auto_gps_var.get()
+                        or self.auto_labeling_var.get()
+                    )
+                    if should_load_results:
+                        self.pending_post_sort_actions = True
+                        self.status_var.set("Sort completed. Loading results and running selected follow-up steps...")
+                        self._check_results()
+                    else:
+                        self.status_var.set("Sort completed successfully. Check Results is available.")
+                        self.pending_post_sort_actions = False
+                elif kind == "gps_complete":
+                    self.status_var.set(payload)
+                elif kind == "temperature_label_complete":
+                    self.status_var.set(payload["message"])
+                    if payload.get("open_manual_labeler"):
+                        burn_sets = self._all_loaded_burn_sets()
+                        if burn_sets:
+                            self._launch_labeling_tool(burn_sets[0], manual_review=True)
+                elif kind == "labeling_launched":
+                    self.status_var.set(payload)
                 elif kind == "error":
                     self.status_var.set("Error encountered. See log below.")
                     self._append_log(payload + "\n")
-                    messagebox.showerror("FLAME Raw File Sorting Assistant", payload)
+                    messagebox.showerror("FLAME Full Pipeline GUI", payload)
         except queue.Empty:
             pass
         self.root.after(100, self._poll_output_queue)
 
     def _run_in_thread(self, target):
         threading.Thread(target=target, daemon=True).start()
+
+    def _request_temperature_threshold(self):
+        try:
+            initial_value = float(self.temperature_threshold_var.get())
+        except ValueError:
+            initial_value = 150.0
+
+        threshold = simpledialog.askfloat(
+            "Temperature Based Labeling",
+            (
+                "Please input the Celsius temperature threshold for Fire labels.\n\n"
+                "Pairs with max thermal TIFF temperature greater than or equal to this value "
+                "will be exported as Fire. Pairs below it will be exported as No Fire.\n\n"
+                "Suggested value: 150"
+            ),
+            parent=self.root,
+            initialvalue=initial_value,
+            minvalue=-273.15,
+        )
+        if threshold is None:
+            self.status_var.set("Full pipeline cancelled before processing because no Fire threshold was provided.")
+            return None
+        return float(threshold)
 
     def _check_results(self):
         if not self.results_ready:
@@ -2101,6 +2283,15 @@ class RawSortingGui:
             messagebox.showerror("Missing folders", "Choose both input and output folders before running.")
             return
 
+        if self.auto_temperature_label_var.get():
+            threshold = self._request_temperature_threshold()
+            if threshold is None:
+                return
+            self.current_temperature_threshold = threshold
+            self.temperature_threshold_var.set(f"{threshold:g}")
+        else:
+            self.current_temperature_threshold = None
+
         output_path = Path(output_folder)
         if output_path.exists() and any(output_path.iterdir()):
             should_replace = messagebox.askyesno(
@@ -2128,10 +2319,22 @@ class RawSortingGui:
 
         sorter.PROCESSING_MODE = self.mode_var.get()
         self._reset_results_state()
-        self.status_var.set("Running sort...")
+        self.status_var.set("Running sort as the first full-pipeline step...")
         self.progress_var.set(0)
-        self.progress_label_var.set("Progress: preparing")
-        self.summary_var.set("Sorting in progress...")
+        self.progress_label_var.set("1. Raw sorting/export: preparing")
+        self.gps_progress_var.set(0)
+        self.gps_progress_label_var.set(
+            "2. GPS traces: waiting for raw sorting/export"
+            if self.auto_gps_var.get()
+            else "2. GPS traces: skipped (disabled)"
+        )
+        self.labeling_progress_var.set(0)
+        self.labeling_progress_label_var.set(
+            f"3. Temperature labeling: waiting, Fire >= {self.current_temperature_threshold:g} C"
+            if self.auto_temperature_label_var.get() and self.current_temperature_threshold is not None
+            else "3. Temperature labeling: skipped (disabled)"
+        )
+        self.summary_var.set("Full pipeline in progress: sorting output is being created...")
 
         def worker():
             writer = QueueWriter(self.output_queue)
@@ -2154,14 +2357,8 @@ class RawSortingGui:
                 self.output_queue.put(("error", traceback.format_exc()))
                 return
 
-            self.output_queue.put(
-                (
-                    "progress",
-                    {"current": 1, "total": 1, "message": "Progress: complete"},
-                )
-            )
-            self.output_queue.put(("results_ready", True))
-            self.output_queue.put(("status", "Sort completed successfully. You can now click Check Results."))
+            self.output_queue.put(("raw_complete", None))
+            self.output_queue.put(("sort_complete", {"output_folder": output_folder}))
 
         self._run_in_thread(worker)
 
@@ -2171,6 +2368,9 @@ class RawSortingGui:
         self.selected_burn_set = None
         self.selected_pair = None
         self.view_output_button.configure(state="disabled")
+        self.generate_gps_button.configure(state="disabled")
+        self.open_labeling_button.configure(state="disabled")
+        self.open_output_folder_button.configure(state="disabled")
 
         dataset_count = len(self.analysis)
         burn_set_count = sum(len(dataset["burn_sets"]) for dataset in self.analysis)
@@ -2196,6 +2396,9 @@ class RawSortingGui:
             self.burn_tree.selection_set(first)
             self._handle_burn_selection()
             self.view_output_button.configure(state="normal")
+            self.generate_gps_button.configure(state="normal")
+            self.open_labeling_button.configure(state="normal")
+            self.open_output_folder_button.configure(state="normal")
 
     def _handle_burn_selection(self, event=None):
         selection = self.burn_tree.selection()
@@ -2205,6 +2408,9 @@ class RawSortingGui:
         dataset_idx, burn_idx = [int(part) for part in selection[0].split(":")]
         self.selected_burn_set = self.analysis[dataset_idx]["burn_sets"][burn_idx]
         self.view_output_button.configure(state="normal")
+        self.generate_gps_button.configure(state="normal")
+        self.open_labeling_button.configure(state="normal")
+        self.open_output_folder_button.configure(state="normal")
 
         self.pair_tree.delete(*self.pair_tree.get_children())
         for pair_idx, pair in enumerate(self.selected_burn_set["pairs"], start=1):
@@ -2247,6 +2453,290 @@ class RawSortingGui:
         self.selected_pair = self.selected_burn_set["pairs"][int(selection[0])]
         self.view_output_button.configure(state="normal")
 
+    def _all_loaded_burn_sets(self):
+        return [
+            burn_set
+            for dataset in self.analysis
+            for burn_set in dataset.get("burn_sets", [])
+        ]
+
+    def _burn_output_root(self, burn_set):
+        images_root = Path(burn_set["source_root"])
+        return images_root.parent if images_root.name.lower() == "images" else images_root
+
+    def _temperature_label_output_root_for_burn_set(self, burn_set):
+        return Path(burn_set["source_root"])
+
+    def _labeling_output_root_for_burn_set(self, burn_set, manual_review=False):
+        if manual_review:
+            return self._burn_output_root(burn_set) / "Manual Labeled Output"
+        return self._temperature_label_output_root_for_burn_set(burn_set)
+
+    def _run_post_sort_actions(self):
+        burn_sets = self._all_loaded_burn_sets()
+        if not burn_sets:
+            self.status_var.set("Sort completed, but no burn sets were detected for follow-up steps.")
+            self.gps_progress_var.set(100.0)
+            self.gps_progress_label_var.set("2. GPS traces: skipped, no burn sets detected")
+            self.labeling_progress_var.set(100.0)
+            self.labeling_progress_label_var.set("3. Temperature labeling: skipped, no burn sets detected")
+            return
+
+        if self.auto_temperature_label_var.get() and self.current_temperature_threshold is not None:
+            self._generate_temperature_labels(
+                burn_sets,
+                self.current_temperature_threshold,
+                open_manual_labeler_after=self.auto_labeling_var.get(),
+            )
+        else:
+            self.labeling_progress_var.set(100.0)
+            self.labeling_progress_label_var.set("3. Temperature labeling: skipped (disabled)")
+            if self.auto_labeling_var.get():
+                if len(burn_sets) > 1:
+                    self.status_var.set(
+                        "Multiple burn sets were found. Opening the manual labeling tool for the first set; select another set to open it manually."
+                    )
+                self._launch_labeling_tool(burn_sets[0])
+
+        if self.auto_gps_var.get():
+            self._generate_gps_traces(burn_sets)
+        else:
+            self.gps_progress_var.set(100.0)
+            self.gps_progress_label_var.set("2. GPS traces: skipped (disabled)")
+
+    def _temperature_label_output_dirs(self, output_root):
+        return {
+            "Fire": {
+                "rgb_corrected": output_root / "Fire" / "RGB" / "Corrected FOV",
+                "rgb_raw": output_root / "Fire" / "RGB" / "Raw",
+                "thermal_jpg": output_root / "Fire" / "Thermal" / "JPG",
+                "thermal_tiff": output_root / "Fire" / "Thermal" / "Celsius TIFF",
+            },
+            "No Fire": {
+                "rgb_corrected": output_root / "No Fire" / "RGB" / "Corrected FOV",
+                "rgb_raw": output_root / "No Fire" / "RGB" / "Raw",
+                "thermal_jpg": output_root / "No Fire" / "Thermal" / "JPG",
+                "thermal_tiff": output_root / "No Fire" / "Thermal" / "Celsius TIFF",
+            },
+        }
+
+    def _safe_copy_pair_file(self, source_path, destination_dir, destination_name):
+        if not source_path:
+            return False
+        source = Path(source_path)
+        if not source.exists():
+            return False
+        destination_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy(str(source), str(destination_dir / destination_name))
+        return True
+
+    def _generate_temperature_labels(self, burn_sets, threshold, open_manual_labeler_after=False):
+        burn_sets = list(burn_sets)
+        pairs_to_label = [
+            (burn_set, pair)
+            for burn_set in burn_sets
+            for pair in burn_set.get("pairs", [])
+        ]
+        total = len(pairs_to_label)
+        if total == 0:
+            self.labeling_progress_var.set(100.0)
+            self.labeling_progress_label_var.set("3. Temperature labeling: skipped, no pairs found")
+            return
+
+        self.status_var.set(f"Temperature labeling Fire/No Fire with threshold >= {threshold:g} C...")
+        self.labeling_progress_var.set(0)
+        self.labeling_progress_label_var.set(f"3. Temperature labeling: 0/{total} - starting")
+
+        def worker():
+            try:
+                summaries = []
+                counts_by_root = {}
+                for burn_set in burn_sets:
+                    output_root = self._temperature_label_output_root_for_burn_set(burn_set)
+                    for label_folder in (output_root / "Fire", output_root / "No Fire"):
+                        if label_folder.exists():
+                            shutil.rmtree(label_folder)
+                    output_dirs = self._temperature_label_output_dirs(output_root)
+                    for label_dirs in output_dirs.values():
+                        for folder in label_dirs.values():
+                            folder.mkdir(parents=True, exist_ok=True)
+                    counts_by_root[str(output_root)] = {"Fire": 0, "No Fire": 0, "Skipped": 0}
+
+                for index, (burn_set, pair) in enumerate(pairs_to_label, start=1):
+                    output_root = self._temperature_label_output_root_for_burn_set(burn_set)
+                    output_dirs = self._temperature_label_output_dirs(output_root)
+                    corrected_rgb = pair.get("corrected_rgb") or {}
+                    raw_rgb = pair.get("rgb") or {}
+                    thermal_jpg = pair.get("thermal_jpg") or {}
+                    thermal_tiff = pair.get("thermal_tiff") or {}
+                    corrected_name = corrected_rgb.get("filename") or Path(corrected_rgb.get("filepath", "")).name
+                    thermal_tiff_path = thermal_tiff.get("filepath")
+
+                    if not thermal_tiff_path or not Path(thermal_tiff_path).exists():
+                        counts_by_root[str(output_root)]["Skipped"] += 1
+                        self.output_queue.put((
+                            "labeling_progress",
+                            {
+                                "current": index,
+                                "total": total,
+                                "message": f"{corrected_name} skipped, no TIFF",
+                            },
+                        ))
+                        continue
+
+                    thermal_array = np.array(Image.open(thermal_tiff_path))
+                    max_temp = float(np.nanmax(thermal_array))
+                    label = "Fire" if max_temp >= threshold else "No Fire"
+                    label_dirs = output_dirs[label]
+
+                    self._safe_copy_pair_file(
+                        corrected_rgb.get("filepath"),
+                        label_dirs["rgb_corrected"],
+                        corrected_name,
+                    )
+                    self._safe_copy_pair_file(
+                        raw_rgb.get("filepath"),
+                        label_dirs["rgb_raw"],
+                        corrected_name,
+                    )
+                    if thermal_jpg:
+                        self._safe_copy_pair_file(
+                            thermal_jpg.get("filepath"),
+                            label_dirs["thermal_jpg"],
+                            thermal_jpg.get("filename") or Path(thermal_jpg.get("filepath", "")).name,
+                        )
+                    self._safe_copy_pair_file(
+                        thermal_tiff_path,
+                        label_dirs["thermal_tiff"],
+                        thermal_tiff.get("filename") or Path(thermal_tiff_path).name,
+                    )
+
+                    counts_by_root[str(output_root)][label] += 1
+                    self.output_queue.put((
+                        "labeling_progress",
+                        {
+                            "current": index,
+                            "total": total,
+                            "message": f"{corrected_name} -> {label} (max {max_temp:.1f} C)",
+                        },
+                    ))
+
+                for output_root_text, counts in counts_by_root.items():
+                    output_root = Path(output_root_text)
+                    summaries.append(
+                        f"{output_root.parent.name}: Fire={counts['Fire']}, "
+                        f"No Fire={counts['No Fire']}, skipped={counts['Skipped']} -> {output_root}"
+                    )
+            except Exception:
+                self.output_queue.put(("error", traceback.format_exc()))
+                return
+
+            self.output_queue.put(("log", "\n".join(summaries)))
+            self.output_queue.put((
+                "temperature_label_complete",
+                {
+                    "message": f"Temperature labeling complete for {len(burn_sets)} burn set(s).",
+                    "open_manual_labeler": open_manual_labeler_after,
+                },
+            ))
+
+        self._run_in_thread(worker)
+
+    def _generate_gps_traces_for_selected(self):
+        if self.selected_burn_set is None:
+            messagebox.showinfo("Generate GPS Traces", "Select a detected burn set first.")
+            return
+        self._generate_gps_traces([self.selected_burn_set])
+
+    def _generate_gps_traces(self, burn_sets):
+        burn_sets = list(burn_sets)
+        if not burn_sets:
+            return
+
+        self.status_var.set("Generating GPS trace CSV files from RGB/Raw images...")
+        self.gps_progress_var.set(0)
+        self.gps_progress_label_var.set(f"2. GPS traces: 0/{len(burn_sets)} - starting")
+
+        def worker():
+            try:
+                gps_tracing = load_gps_module()
+                summaries = []
+                total = len(burn_sets)
+                for index, burn_set in enumerate(burn_sets, start=1):
+                    images_root = Path(burn_set["source_root"])
+                    raw_rgb_dir = images_root / "RGB" / "Raw"
+                    output_csv = self._burn_output_root(burn_set) / "GPS_Traces.csv"
+                    if not raw_rgb_dir.exists():
+                        summaries.append(
+                            f"{burn_set['name']}: skipped, RGB/Raw folder not found"
+                        )
+                        self.output_queue.put((
+                            "gps_progress",
+                            {
+                                "current": index,
+                                "total": total,
+                                "message": f"{burn_set['name']} skipped, RGB/Raw missing",
+                            },
+                        ))
+                        continue
+                    summary = gps_tracing.trace_images(
+                        source_dir=str(raw_rgb_dir),
+                        output_csv_path=str(output_csv),
+                    )
+                    summaries.append(
+                        f"{burn_set['name']}: wrote {summary['written']} GPS row(s), "
+                        f"skipped {summary['skipped']} image(s) -> {output_csv}"
+                    )
+                    self.output_queue.put((
+                        "gps_progress",
+                        {
+                            "current": index,
+                            "total": total,
+                            "message": f"{burn_set['name']} wrote {summary['written']} row(s)",
+                        },
+                    ))
+            except Exception:
+                self.output_queue.put(("error", traceback.format_exc()))
+                return
+
+            self.output_queue.put(("log", "\n".join(summaries)))
+            self.output_queue.put(("gps_complete", f"GPS tracing complete for {len(summaries)} burn set(s)."))
+
+        self._run_in_thread(worker)
+
+    def _open_labeling_for_selected(self):
+        if self.selected_burn_set is None:
+            messagebox.showinfo("Open Labeling Tool", "Select a detected burn set first.")
+            return
+        self._launch_labeling_tool(self.selected_burn_set, manual_review=True)
+
+    def _launch_labeling_tool(self, burn_set, manual_review=False):
+        if not LABELING_TOOL_PATH.exists():
+            messagebox.showerror("Open Labeling Tool", f"Could not find labeling tool:\n{LABELING_TOOL_PATH}")
+            return
+
+        images_root = Path(burn_set["source_root"])
+        output_root = self._labeling_output_root_for_burn_set(burn_set, manual_review=manual_review)
+        output_root.mkdir(parents=True, exist_ok=True)
+        command = [
+            sys.executable,
+            str(LABELING_TOOL_PATH),
+            "--input-folder",
+            str(images_root),
+            "--output-folder",
+            str(output_root),
+        ]
+        try:
+            subprocess.Popen(command, cwd=str(LABELING_TOOL_PATH.parent))
+        except Exception as exc:
+            messagebox.showerror("Open Labeling Tool", f"Could not launch labeling tool:\n{exc}")
+            return
+
+        self.output_queue.put((
+            "labeling_launched",
+            f"Labeling tool opened for {burn_set['name']}. Labeled export target: {output_root}",
+        ))
+
     def _open_output_viewer(self):
         if self.selected_burn_set is None:
             return
@@ -2257,6 +2747,9 @@ class RawSortingGui:
         PairPreviewWindow(self.root, sorter, self.selected_burn_set, initial_index=initial_index)
 
     def _open_output_folder(self):
+        if self.selected_burn_set is not None:
+            self._open_path(str(self._burn_output_root(self.selected_burn_set)))
+            return
         output_folder = self.output_var.get().strip()
         if output_folder:
             self._open_path(output_folder)
@@ -2273,13 +2766,16 @@ class RawSortingGui:
             messagebox.showerror("Open failed", f"Could not open:\n{path}\n\n{exc}")
 
 
+RawSortingGui = FullPipelineGui
+
+
 def main():
     root = tk.Tk()
     style = ttk.Style(root)
     if "vista" in style.theme_names():
         style.theme_use("vista")
     style.configure("Run.TButton", font=("Segoe UI", 12, "bold"))
-    RawSortingGui(root)
+    FullPipelineGui(root)
     root.mainloop()
 
 

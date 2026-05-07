@@ -7,6 +7,7 @@
 # For questions, email bryceh@clemson.edu
 #~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~#
 
+import argparse
 import os
 import PySimpleGUI as sg
 import shutil
@@ -16,6 +17,7 @@ from PIL import Image
 import queue
 import numpy as np
 import threading
+from pathlib import Path
 
 # Initialize lists and queue
 BUFF_RADIUS = 7                 # Radius of buffer to preload images. 7 seems to work well for typical use.
@@ -23,6 +25,9 @@ q = queue.Queue()               # Queue full of img filepaths to load   P
 b_rgb = []                      # Vector to store output img data. Should be moved to rotary buffer later.
 b_ir = []
 b_tiff = []
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+DEFAULT_OUTPUT_ROOT = SCRIPT_DIR / "Output"
 
 # Note: Current code loads images from low end of buffer to high end. Would be more efficient to load center of buffer first and gradually expand outwards.
 
@@ -109,21 +114,34 @@ Returns the list of image files that match the extensions listed
 '''
 def get_image_files(folder_path):
     image_extensions = (".jpg", ".jpeg" ,".JPG", ".TIFF", ".tiff")
-    image_files = [file for file in os.listdir(folder_path) if file.lower().endswith(image_extensions)]
+    image_files = sorted(file for file in os.listdir(folder_path) if file.lower().endswith(image_extensions))
     return image_files
 
+
+def find_matching_file_by_stem(filename, candidates):
+    stem = Path(filename).stem.lower()
+    for candidate in candidates:
+        if Path(candidate).stem.lower() == stem:
+            return candidate
+    return None
+
 # main function, handle events within the application and image processing
-def main():
+def main(initial_folder=None, output_root=None):
+    output_root = Path(output_root) if output_root else DEFAULT_OUTPUT_ROOT
+    output_root = output_root.resolve()
+
     # Load in the image assets
-    coming_soon = load_image('./Assets/ComingSoon.png')
-    fire_img = load_image('./Assets/Fire.png', (100,100))
-    no_fire_img = load_image('./Assets/No_Fire.png', (100,100)) # NOTE: No_Fire.png needs to be downscaled... its 5000x5000 for some reason
-    no_label_img = load_image('./Assets/No_Label.png', (100,100))
+    coming_soon = load_image(str(SCRIPT_DIR / 'Assets' / 'ComingSoon.png'))
+    fire_img = load_image(str(SCRIPT_DIR / 'Assets' / 'Fire.png'), (100,100))
+    no_fire_img = load_image(str(SCRIPT_DIR / 'Assets' / 'No_Fire.png'), (100,100)) # NOTE: No_Fire.png needs to be downscaled... its 5000x5000 for some reason
+    no_label_img = load_image(str(SCRIPT_DIR / 'Assets' / 'No_Label.png'), (100,100))
 
     # section to let the user choose the path to their image files
     folder_selected = False
+    folder_path = initial_folder
     while not folder_selected:
-        folder_path = sg.popup_get_folder("Select parent folder containing images. File directory should be:\n\tfolder/RGB/Raw/image.JPG\n\tfolder/RGB/Corrected FOV/image.JPG\n\tfolder/Thermal/JPG/image.JPG\n\tfolder/Thermal/Celsius TIFF/image.TIFF)\n\nPlease use 'Raw File Sorting.ipynb' on raw data before using this tool.\nIf 'Raw File Sorting.ipynb' was used, select the 'Images' subfolder as the input.", title="Select Parent Folder")
+        if not folder_path:
+            folder_path = sg.popup_get_folder("Select parent folder containing images. File directory should be:\n\tfolder/RGB/Raw/image.JPG\n\tfolder/RGB/Corrected FOV/image.JPG\n\tfolder/Thermal/JPG/image.JPG\n\tfolder/Thermal/Celsius TIFF/image.TIFF)\n\nPlease use 'Raw File Sorting.ipynb' on raw data before using this tool.\nIf 'Raw File Sorting.ipynb' was used, select the 'Images' subfolder as the input.", title="Select Parent Folder")
         if not folder_path:
             return
 
@@ -135,6 +153,9 @@ def main():
         # Error if the input image folder structure is invalid
         except:
             sg.popup(f"ERROR: Unable to open subdirectories:\n\t{folder_path}/RGB/Corrected FOV/\n\t{folder_path}/Thermal/JPG/\n\t{folder_path}/Thermal/Celsius TIFF/\n\nPlease make sure the correct parent folder is selected.", line_width=350, title="Error")
+            if initial_folder:
+                return
+            folder_path = None
         else:
             folder_selected = True
 
@@ -146,8 +167,7 @@ def main():
         sg.popup_error("No ir jpg image files found in the selected folder.")
         return
     if not tiff_image_files:
-        sg.popup_error("No ir tiff image files found in the selected folder.")
-        return
+        sg.popup("No ir tiff image files found. Manual labeling is still available, but temperature threshold labeling and TIFF export will be skipped.", title="TIFF Files Not Found")
 
     # GUI Layouts
     layout = [
@@ -168,7 +188,7 @@ def main():
     starting_images = []
     for i in range(-BUFF_RADIUS, BUFF_RADIUS + 1):
         starting_images.append(((index+i)% len(rgb_image_files), f'{folder_path}/RGB/Corrected FOV/{rgb_image_files[(index+i)% len(rgb_image_files)]}', "rgb"))
-        starting_images.append(((index+i)% len(rgb_image_files), f'{folder_path}/Thermal/JPG/{rgb_image_files[(index+i)% len(rgb_image_files)]}', "ir"))
+        starting_images.append(((index+i)% len(rgb_image_files), f'{folder_path}/Thermal/JPG/{ir_image_files[(index+i)% len(ir_image_files)]}', "ir"))
         #starting_images.append(((index+i)% len(rgb_image_files), f'{folder_path}/Thermal/Celsius TIFF/{rgb_image_files[(index+i)% len(rgb_image_files)].split(".")[0]}.TIFF', "tiff"))
 
     # Initialize workers, add tasks to queue, then wait for workers to finish preloading initial batch of images.
@@ -218,12 +238,12 @@ def main():
             if event == "Left:37":
                 index = (index - 1) % len(rgb_image_files)
                 q.put(((index - BUFF_RADIUS) % len(rgb_image_files), f'{folder_path}/RGB/Corrected FOV/{rgb_image_files[(index - BUFF_RADIUS) % len(rgb_image_files)]}', "rgb"))
-                q.put(((index - BUFF_RADIUS) % len(rgb_image_files), f'{folder_path}/Thermal/JPG/{rgb_image_files[(index - BUFF_RADIUS) % len(rgb_image_files)]}', "ir"))
+                q.put(((index - BUFF_RADIUS) % len(rgb_image_files), f'{folder_path}/Thermal/JPG/{ir_image_files[(index - BUFF_RADIUS) % len(ir_image_files)]}', "ir"))
                 #q.put(((index - BUFF_RADIUS) % len(rgb_image_files), f'{folder_path}/Thermal/Celsius TIFF/{rgb_image_files[(index - BUFF_RADIUS) % len(rgb_image_files)].split(".")[0]}.TIFF', "tiff"))
             elif event == "Right:39":
                 index = (index + 1) % len(rgb_image_files)
                 q.put(((index + BUFF_RADIUS) % len(rgb_image_files), f'{folder_path}/RGB/Corrected FOV/{rgb_image_files[(index + BUFF_RADIUS) % len(rgb_image_files)]}', "rgb"))
-                q.put(((index + BUFF_RADIUS) % len(rgb_image_files), f'{folder_path}/Thermal/JPG/{rgb_image_files[(index + BUFF_RADIUS) % len(rgb_image_files)]}', "ir"))
+                q.put(((index + BUFF_RADIUS) % len(rgb_image_files), f'{folder_path}/Thermal/JPG/{ir_image_files[(index + BUFF_RADIUS) % len(ir_image_files)]}', "ir"))
                 #q.put(((index + BUFF_RADIUS) % len(rgb_image_files), f'{folder_path}/Thermal/Celsius TIFF/{rgb_image_files[(index + BUFF_RADIUS) % len(rgb_image_files)].split(".")[0]}.TIFF', "tiff"))
 
         # handle labeling commands
@@ -258,34 +278,21 @@ def main():
             if renumber == None:
                 continue
 
-            # if it doesn't exist, creat the output file directory
-            if not os.path.exists('./Output/Fire/RGB/Corrected FOV/'):
-                os.makedirs('./Output/Fire/RGB/Corrected FOV/')
-            if not os.path.exists('./Output/Fire/RGB/Raw/'):
-                os.makedirs('./Output/Fire/RGB/Raw/')
-            if not os.path.exists('./Output/Fire/Thermal/JPG/'):
-                os.makedirs('./Output/Fire/Thermal/JPG/')
-            if not os.path.exists('./Output/Fire/Thermal/Celsius TIFF/'):
-                os.makedirs('./Output/Fire/Thermal/Celsius TIFF/')
-            
-            if not os.path.exists('./Output/No Fire/RGB/Corrected FOV/'):
-                os.makedirs('./Output/No Fire/RGB/Corrected FOV/')
-            if not os.path.exists('./Output/No Fire/RGB/Raw/'):
-                os.makedirs('./Output/No Fire/RGB/Raw/')
-            if not os.path.exists('./Output/No Fire/Thermal/JPG/'):
-                os.makedirs('./Output/No Fire/Thermal/JPG/')
-            if not os.path.exists('./Output/No Fire/Thermal/Celsius TIFF/'):
-                os.makedirs('./Output/No Fire/Thermal/Celsius TIFF/')
+            output_dirs = {
+                "fire_rgb_corrected": output_root / 'Fire' / 'RGB' / 'Corrected FOV',
+                "fire_rgb_raw": output_root / 'Fire' / 'RGB' / 'Raw',
+                "fire_thermal_jpg": output_root / 'Fire' / 'Thermal' / 'JPG',
+                "fire_thermal_tiff": output_root / 'Fire' / 'Thermal' / 'Celsius TIFF',
+                "nofire_rgb_corrected": output_root / 'No Fire' / 'RGB' / 'Corrected FOV',
+                "nofire_rgb_raw": output_root / 'No Fire' / 'RGB' / 'Raw',
+                "nofire_thermal_jpg": output_root / 'No Fire' / 'Thermal' / 'JPG',
+                "nofire_thermal_tiff": output_root / 'No Fire' / 'Thermal' / 'Celsius TIFF',
+            }
+            for output_dir in output_dirs.values():
+                output_dir.mkdir(parents=True, exist_ok=True)
 
             # validate that there are no files in the output directories
-            if (not len(os.listdir('./Output/No Fire/RGB/Corrected FOV/')) == 0 or
-                not len(os.listdir('./Output/Fire/RGB/Corrected FOV/')) == 0 or
-                not len(os.listdir('./Output/No Fire/RGB/Raw/')) == 0 or
-                not len(os.listdir('./Output/Fire/RGB/Raw/')) == 0 or
-                not len(os.listdir('./Output/No Fire/Thermal/JPG/')) == 0 or
-                not len(os.listdir('./Output/Fire/Thermal/JPG/')) == 0 or
-                not len(os.listdir('./Output/No Fire/Thermal/Celsius TIFF/')) == 0 or
-                not len(os.listdir('./Output/Fire/Thermal/Celsius TIFF/')) == 0):
+            if any(os.listdir(output_dir) for output_dir in output_dirs.values()):
                 sg.popup('Error: The output directories are not empty! Please clear the output directory and try again.')
                 continue
             
@@ -294,7 +301,8 @@ def main():
             nfcount = 0
             ulcount = 0
             #iterate over the rgb, ir, tiff, and label lists/files
-            for ix, (rgb, ir, tiff, label) in enumerate(zip(rgb_image_files, ir_image_files, tiff_image_files, labels)):
+            for ix, (rgb, ir, label) in enumerate(zip(rgb_image_files, ir_image_files, labels)):
+                tiff = find_matching_file_by_stem(rgb, tiff_image_files)
                 rgb_n = rgb
                 ir_n = ir
                 tiff_n = tiff
@@ -305,31 +313,38 @@ def main():
                     if renumber == "Yes":
                         rgb_n = f'{"0"*(OUTPUT_FILENAME_DIGITS-len(str(fcount+1))) + str(fcount+1)}.{rgb.split(".")[1]}'
                         ir_n = f'{"0"*(OUTPUT_FILENAME_DIGITS-len(str(fcount+1))) + str(fcount+1)}.{ir.split(".")[1]}'
-                        tiff_n = f'{"0"*(OUTPUT_FILENAME_DIGITS-len(str(fcount+1))) + str(fcount+1)}.{tiff.split(".")[1]}'
+                        if tiff:
+                            tiff_n = f'{"0"*(OUTPUT_FILENAME_DIGITS-len(str(fcount+1))) + str(fcount+1)}.{tiff.split(".")[1]}'
 
-                    shutil.copy(f'{folder_path}/RGB/Corrected FOV/{rgb}', f'./Output/Fire/RGB/Corrected FOV/{rgb_n}')
-                    shutil.copy(f'{folder_path}/RGB/Raw/{rgb}', f'./Output/Fire/RGB/Raw/{rgb_n}')
-                    shutil.copy(f'{folder_path}/Thermal/JPG/{ir}', f'./Output/Fire/Thermal/JPG/{ir_n}')
-                    shutil.copy(f'{folder_path}/Thermal/Celsius TIFF/{tiff}', f'./Output/Fire/Thermal/Celsius TIFF/{tiff_n}')
+                    shutil.copy(f'{folder_path}/RGB/Corrected FOV/{rgb}', output_dirs["fire_rgb_corrected"] / rgb_n)
+                    shutil.copy(f'{folder_path}/RGB/Raw/{rgb}', output_dirs["fire_rgb_raw"] / rgb_n)
+                    shutil.copy(f'{folder_path}/Thermal/JPG/{ir}', output_dirs["fire_thermal_jpg"] / ir_n)
+                    if tiff:
+                        shutil.copy(f'{folder_path}/Thermal/Celsius TIFF/{tiff}', output_dirs["fire_thermal_tiff"] / tiff_n)
                     fcount += 1
                 elif label == 'No Fire':
                     if renumber == "Yes":
                         rgb_n = f'{"0"*(OUTPUT_FILENAME_DIGITS-len(str(nfcount+1))) + str(nfcount+1)}.{rgb.split(".")[1]}'
                         ir_n = f'{"0"*(OUTPUT_FILENAME_DIGITS-len(str(nfcount+1))) + str(nfcount+1)}.{ir.split(".")[1]}'
-                        tiff_n = f'{"0"*(OUTPUT_FILENAME_DIGITS-len(str(nfcount+1))) + str(nfcount+1)}.{tiff.split(".")[1]}'
-                    shutil.copy(f'{folder_path}/RGB/Corrected FOV/{rgb}', f'./Output/No Fire/RGB/Corrected FOV/{rgb_n}')
-                    shutil.copy(f'{folder_path}/RGB/Raw/{rgb}', f'./Output/No Fire/RGB/Raw/{rgb_n}')
-                    shutil.copy(f'{folder_path}/Thermal/JPG/{ir}', f'./Output/No Fire/Thermal/JPG/{ir_n}')
-                    shutil.copy(f'{folder_path}/Thermal/Celsius TIFF/{tiff}', f'./Output/No Fire/Thermal/Celsius TIFF/{tiff_n}')
+                        if tiff:
+                            tiff_n = f'{"0"*(OUTPUT_FILENAME_DIGITS-len(str(nfcount+1))) + str(nfcount+1)}.{tiff.split(".")[1]}'
+                    shutil.copy(f'{folder_path}/RGB/Corrected FOV/{rgb}', output_dirs["nofire_rgb_corrected"] / rgb_n)
+                    shutil.copy(f'{folder_path}/RGB/Raw/{rgb}', output_dirs["nofire_rgb_raw"] / rgb_n)
+                    shutil.copy(f'{folder_path}/Thermal/JPG/{ir}', output_dirs["nofire_thermal_jpg"] / ir_n)
+                    if tiff:
+                        shutil.copy(f'{folder_path}/Thermal/Celsius TIFF/{tiff}', output_dirs["nofire_thermal_tiff"] / tiff_n)
                     nfcount += 1
                 else:
                     ulcount += 1
                     #print(f'File pair {rgb} is unlabeld and was discarded')
             # display the number of image pairs that were copied successfully, as well as how many were discarded/unlabeled
-            sg.popup(f'Files exported successfully. Totals:\n\tFire Pairs: {fcount}\n\tNo Fire Pairs: {nfcount}\n\tUnlabeled Pairs (discarded): {ulcount}')
+            sg.popup(f'Files exported successfully to:\n\t{output_root}\n\nTotals:\n\tFire Pairs: {fcount}\n\tNo Fire Pairs: {nfcount}\n\tUnlabeled Pairs (discarded): {ulcount}')
 
         # handle temperature threshold labeling
         elif event == '-TEMP_LABEL-':
+            if not tiff_image_files:
+                sg.popup("No thermal TIFF files are available for temperature threshold labeling.")
+                continue
             temp_thres = sg.popup_get_text('Please input temperature (Celsius) to threshold images with.\nSuggested val: 150\n\n\n\nCurrently uses basic threshold on max value in TIFF\nMay take 1-2 minutes for large batches of images')
             if temp_thres is None:
                 continue
@@ -341,7 +356,10 @@ def main():
                 continue
 
             # loop through the tiff image files and label according to the threshold
-            for ix, tiff in enumerate(tiff_image_files):
+            for ix, rgb in enumerate(rgb_image_files):
+                tiff = find_matching_file_by_stem(rgb, tiff_image_files)
+                if not tiff:
+                    continue
                 arr = np.array(Image.open(f'{folder_path}/Thermal/Celsius TIFF/{tiff}'))
                 if arr.max() >= temp_thres:
                     labels[ix] = "Fire"
@@ -437,9 +455,12 @@ def main():
             
             # add images in buff radius around index to queue.
             for i in range(-BUFF_RADIUS, BUFF_RADIUS + 1):
-                q.put(((index+i)% len(rgb_image_files), f'{folder_path}/RGB/Corrected FOV/{rgb_image_files[(index+i)% len(rgb_image_files)]}', "rgb"))
-                q.put(((index+i)% len(rgb_image_files), f'{folder_path}/Thermal/JPG/{rgb_image_files[(index+i)% len(rgb_image_files)]}', "ir"))
-                q.put(((index+i)% len(rgb_image_files), f'{folder_path}/Thermal/Celsius TIFF/{rgb_image_files[(index+i)% len(rgb_image_files)].split(".")[0]}.TIFF', "tiff"))
+                load_ix = (index+i) % len(rgb_image_files)
+                q.put((load_ix, f'{folder_path}/RGB/Corrected FOV/{rgb_image_files[load_ix]}', "rgb"))
+                q.put((load_ix, f'{folder_path}/Thermal/JPG/{ir_image_files[load_ix % len(ir_image_files)]}', "ir"))
+                matching_tiff = find_matching_file_by_stem(rgb_image_files[load_ix], tiff_image_files)
+                if matching_tiff:
+                    q.put((load_ix, f'{folder_path}/Thermal/Celsius TIFF/{matching_tiff}', "tiff"))
 
             sg.popup('Sucessfully loaded state')
         # handle the go to event, allows user to navigate quickly to a specific image pair
@@ -467,9 +488,12 @@ def main():
                 
                 # add images in buff radius around index to queue.
                 for i in range(-BUFF_RADIUS, BUFF_RADIUS + 1):
-                    q.put(((index+i)% len(rgb_image_files), f'{folder_path}/RGB/Corrected FOV/{rgb_image_files[(index+i)% len(rgb_image_files)]}', "rgb"))
-                    q.put(((index+i)% len(rgb_image_files), f'{folder_path}/Thermal/JPG/{rgb_image_files[(index+i)% len(rgb_image_files)]}', "ir"))
-                    q.put(((index+i)% len(rgb_image_files), f'{folder_path}/Thermal/Celsius TIFF/{rgb_image_files[(index+i)% len(rgb_image_files)].split(".")[0]}.TIFF', "tiff"))
+                    load_ix = (index+i) % len(rgb_image_files)
+                    q.put((load_ix, f'{folder_path}/RGB/Corrected FOV/{rgb_image_files[load_ix]}', "rgb"))
+                    q.put((load_ix, f'{folder_path}/Thermal/JPG/{ir_image_files[load_ix % len(ir_image_files)]}', "ir"))
+                    matching_tiff = find_matching_file_by_stem(rgb_image_files[load_ix], tiff_image_files)
+                    if matching_tiff:
+                        q.put((load_ix, f'{folder_path}/Thermal/Celsius TIFF/{matching_tiff}', "tiff"))
 
                 sg.popup(f'Successfully set index to {index + 1}')
 
@@ -537,4 +561,16 @@ def main():
 
 #main function
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="FLAME Image Labeling Tool")
+    parser.add_argument(
+        "--input-folder",
+        default=None,
+        help="Images folder containing RGB/Corrected FOV, RGB/Raw, Thermal/JPG, and Thermal/Celsius TIFF.",
+    )
+    parser.add_argument(
+        "--output-folder",
+        default=None,
+        help="Folder where labeled Fire and No Fire outputs should be written.",
+    )
+    args = parser.parse_args()
+    main(initial_folder=args.input_folder, output_root=args.output_folder)
