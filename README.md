@@ -19,7 +19,7 @@ FlameVQA Dataset Builder is part of a wildfire research effort at Clemson Univer
 Mobin Habibpour, Niloufar Alipour Talemi
 
 **Undergraduate Researchers**  
-Camren J. Khoury, John Spodnik
+Camren J. Khoury
 
 **Project Oversight**  
 Dr. Fatemeh Afghah
@@ -486,7 +486,6 @@ Developed at Clemson University - IS-WiN Lab.
 - Camren J. Khoury
 - Mobin Habibpour
 - Niloufar Alipour Talemi
-- John Spodnik
 - Dr. Fatemeh Afghah
 - Bryce Hopkins
 - Michael Marinaccio
