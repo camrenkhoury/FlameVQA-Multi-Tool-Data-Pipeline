@@ -1,5 +1,14 @@
 # FlameVQA-Multi-Tool-Data-Pipeline
 
+FlameVQA Dataset Builder is a GUI-based wildfire dataset pipeline for converting raw or semi-structured RGB/thermal data into FLAME-compatible dataset folders.
+
+The current workflow is centered on the **FLAME Full Pipeline GUI**. Raw sorting still runs first, then optional temperature-based labeling, GPS tracing, and manual label review run from the same interface.
+
+**Tool Author and Primary Developer**  
+Camren J. Khoury
+
+This repository documents **Camren J. Khoury's Full Pipeline GUI and dataset-pipeline work**, focusing on GUI integration, usability, raw-file pairing, RGB-thermal FOV correction, temperature-based labeling, GPS workflow integration, and full-pipeline automation.
+
 ---
 
 ## Project Credits
@@ -10,7 +19,7 @@ FlameVQA Dataset Builder is part of a wildfire research effort at Clemson Univer
 Mobin Habibpour, Niloufar Alipour Talemi
 
 **Undergraduate Researchers**  
-John Spodnik, Camren J. Khoury
+Camren J. Khoury, John Spodnik
 
 **Project Oversight**  
 Dr. Fatemeh Afghah
@@ -18,135 +27,317 @@ Dr. Fatemeh Afghah
 **Foundational Work**  
 Bryce Hopkins, Michael Marinaccio (Flame-Data-Pipeline)
 
-This repository documents **Camren J. Khoury's contributions**, focusing on improving dataset workflows, GUI tooling, usability, raw-file pairing, and RGB-thermal FOV alignment validation.
-
 ---
 
-## Current Development
+## Active Tools
 
-The primary code currently under active development is:
+The main entry point is:
 
-**Flame-Data-Pipeline-main -> Raw File Sorting Tool (GUI and pipeline)**
+- `Full Pipeline GUI.cmd`
 
-The active files are:
+The active implementation files are:
 
-- `Flame-Data-Pipeline-main/Raw File Sorting/Raw File Sorting.py`
+- `Flame-Data-Pipeline-main/Raw File Sorting/Full Pipeline GUI.py`
+- `Flame-Data-Pipeline-main/Raw File Sorting/Full Pipeline GUI.cmd`
 - `Flame-Data-Pipeline-main/Raw File Sorting/Raw File Sorting GUI.py`
+- `Flame-Data-Pipeline-main/Raw File Sorting/Raw File Sorting.py`
 
-Other tools in the pipeline remain available:
+The supporting tools remain available and are integrated into the GUI workflow:
 
 - `Flame-Data-Pipeline-main/Image GPS Tracing/Image GPS Tracing.py`
 - `Flame-Data-Pipeline-main/Labeling/FLAME Image Labeling Tool.py`
 
-### How to Run
+---
 
-From within the **Raw File Sorting** directory:
+## Quick Start
 
+Double-click the launcher at the repository root:
+
+```text
+Full Pipeline GUI.cmd
 ```
-python "Raw File Sorting GUI.py"
+
+The launcher:
+
+1. Enters the Raw File Sorting tool folder.
+2. Creates `.venv` with Python 3.11 if needed.
+3. Activates the virtual environment.
+4. Installs the known working dependencies on first run.
+5. Starts the **FLAME Full Pipeline GUI**.
+
+You can also run directly from:
+
+```text
+Flame-Data-Pipeline-main/Raw File Sorting/Full Pipeline GUI.cmd
 ```
 
-The GUI reads from `Input Folder` and writes to `Output Folder` by default.
+Or from an already activated environment:
 
-### What It Does
-
-The GUI and pipeline perform automated preprocessing by:
-
-- Reading files from the **Input Folder**
-- Detecting whether the input is DJI raw-style data or pre-sorted standard image/TIFF data
-- Pairing RGB images, thermal JPG images, thermal TIFF data, and calibrated thermal TIFF data when available
-- Detecting camera type from RGB resolution and EXIF hints
-- Producing FLAME-compatible output folders
-- Preserving raw RGB files for traceability
-- Producing `Corrected FOV` RGB outputs
-- Writing pairing logs and review logs
-- Providing visual validation tools for RGB-thermal alignment
-
-Each dataset is processed and reorganized into a consistent format for downstream labeling and analysis.
-
-### Output Structure
-
+```powershell
+python "Full Pipeline GUI.py"
 ```
+
+---
+
+## Full Pipeline Workflow
+
+Typical user workflow:
+
+1. Put a dataset folder into `Flame-Data-Pipeline-main/Raw File Sorting/Input Folder`.
+2. Open `Full Pipeline GUI.cmd`.
+3. Confirm the Input Folder and Output Folder.
+4. Choose pipeline automation options.
+5. Click `Run Full Pipeline`.
+6. If temperature labeling is enabled, enter the Fire temperature threshold in Celsius.
+7. Let the pipeline complete the selected stages.
+8. Review the final dataset folders in `Output Folder`.
+
+The normal user does not need to manually pre-sort files or choose a processing mode. The GUI auto-detects whether the input looks like DJI raw-style data or standard pre-sorted RGB/thermal data.
+
+---
+
+## Pipeline Stages
+
+The GUI displays separate progress meters for each stage.
+
+### 1. Raw Sorting / Export
+
+This stage reads the input dataset, detects file types, pairs RGB and thermal data, detects camera type, generates Corrected FOV RGB images, and writes the base FLAME-style `Images` folder.
+
+Supported input data includes:
+
+- RGB JPG images
+- Thermal JPG images
+- Thermal TIFF images
+- Calibrated thermal TIFF images when available
+- DJI-style raw thermal workflows when applicable
+
+Pairing uses:
+
+- Numeric suffix matching, such as `0001` to `0001`
+- Capture timestamps when available
+- Modality presence
+- Sequence consistency across nearby files
+
+### 2. GPS Traces
+
+If `Generate GPS traces from RGB/Raw` is enabled, the GUI runs the GPS tracing tool after sorting.
+
+The GPS trace source is:
+
+```text
+Images/RGB/Raw/
+```
+
+The GPS output is:
+
+```text
+GPS_Traces.csv
+```
+
+This CSV is the expected output of the Image GPS Tracing Tool. If GPS traces are not needed for a dataset generation run, leave the GPS checkbox unchecked.
+
+### 3. Temperature Labeling
+
+If `Temperature label Fire/No Fire` is enabled, the GUI asks for a Celsius threshold before processing starts.
+
+The labeling rule is:
+
+```text
+max thermal TIFF temperature >= threshold -> Fire
+max thermal TIFF temperature < threshold  -> No Fire
+```
+
+The suggested threshold is `150 C`, matching the original labeling tool's temperature-threshold workflow.
+
+Temperature labeling happens after raw sorting because it uses the sorted thermal TIFF files. The output is written directly into the completed dataset structure under each `Images` folder:
+
+```text
+Images/
++-- Fire/
+|   +-- RGB/
+|   |   +-- Corrected FOV/
+|   |   +-- Raw/
+|   +-- Thermal/
+|       +-- Celsius TIFF/
+|       +-- JPG/
++-- No Fire/
+    +-- RGB/
+    |   +-- Corrected FOV/
+    |   +-- Raw/
+    +-- Thermal/
+        +-- Celsius TIFF/
+        +-- JPG/
+```
+
+Example completed paths:
+
+```text
+Shoetank/Images/Fire/RGB/Raw/
+Shoetank/Images/No Fire/RGB/Raw/
+```
+
+### 4. Manual Label Review
+
+If `Open manual labeler after auto labels` is enabled, the FLAME Image Labeling Tool opens after automatic temperature labeling.
+
+Manual review is optional. It is useful when a dataset needs human inspection after the automated Fire/No Fire split.
+
+The manual labeler still supports:
+
+- Arrow-key navigation
+- Number-key labeling
+- Fire / No Fire / Unlabeled labels
+- Temperature-threshold labeling inside the manual tool
+- Exporting reviewed labels
+
+---
+
+## Output Structure
+
+For a single dataset, the base sorted output is:
+
+```text
 Output Folder/
 +-- <Dataset_Name>/
     +-- Images/
-    |   +-- RGB/
-    |   |   +-- Corrected FOV/
-    |   |   +-- Raw/
-    |   +-- Thermal/
-    |       +-- Celsius TIFF/
-    |       +-- JPG/
-    +-- pairing_log.csv
-    +-- pairing_review.csv
+        +-- RGB/
+        |   +-- Corrected FOV/
+        |   +-- Raw/
+        +-- Thermal/
+            +-- Celsius TIFF/
+            +-- JPG/
+```
+
+When temperature labeling is enabled, the completed labeled output is:
+
+```text
+Output Folder/
++-- <Dataset_Name>/
+    +-- Images/
+        +-- Fire/
+        |   +-- RGB/
+        |   |   +-- Corrected FOV/
+        |   |   +-- Raw/
+        |   +-- Thermal/
+        |       +-- Celsius TIFF/
+        |       +-- JPG/
+        +-- No Fire/
+        |   +-- RGB/
+        |   |   +-- Corrected FOV/
+        |   |   +-- Raw/
+        |   +-- Thermal/
+        |       +-- Celsius TIFF/
+        |       +-- JPG/
+        +-- RGB/
+        |   +-- Corrected FOV/
+        |   +-- Raw/
+        +-- Thermal/
+            +-- Celsius TIFF/
+            +-- JPG/
 ```
 
 If a dataset contains multiple burn sets, each burn set may be written under:
 
-```
+```text
 Output Folder/
 +-- <Dataset_Name>/
     +-- burn_set_###/
         +-- Images/
 ```
 
----
-
-## Overview
-
-FlameVQA Dataset Builder is a **GUI-based system** for transforming raw wildfire imagery into structured multimodal datasets.
-
-### Key Improvements
-
-- Improved dataset organization and structure
-- Metadata preservation and traceability
-- Removal of strict DJI/RJPEG dependency for standard RGB/TIFF workflows
-- Support for mixed, flat, and nested input folders
-- Robust suffix-first pairing with timestamp and sequence consistency checks
-- Pairing confidence scoring: `HIGH`, `MEDIUM`, and `LOW`
-- Pairing logs: `pairing_log.csv` and `pairing_review.csv`
-- Camera detection for M30T and M2EA-style RGB resolutions
-- Safe crop-only FOV correction baseline
-- Experimental and reviewable SIFT-based AUTO_ALIGN workflow
-- Shared Corrected FOV generation path used by both GUI AUTO_ALIGN preview and production export
-- Visual validation exports for comparing crop-only vs AUTO_ALIGN
-- GUI viewer for side-by-side RGB/thermal overlay review
-- Strict validation for saved calibration profiles
-
-This extends the original Flame-Data-Pipeline into a **more unified dataset construction workflow**.
+If GPS tracing is enabled, `GPS_Traces.csv` is written at the dataset or burn-set root.
 
 ---
 
-## Purpose
+## Corrected FOV and RGB-Thermal Alignment
 
-Wildfire datasets are often:
+The production default is:
 
-- Large-scale
-- Multimodal (RGB + thermal)
-- Inconsistently structured
-- Captured by cameras with different RGB and thermal fields of view
-- Difficult to label unless image pairs are correctly organized and aligned
+```text
+FOV_CORRECTION_MODE = "AUTO_ALIGN"
+```
 
-This tool addresses those issues by:
+`Corrected FOV` means the RGB image has been cropped and/or transformed so it better corresponds to the thermal field of view.
 
-- Centralizing preprocessing
-- Reducing manual sorting steps
-- Standardizing outputs
-- Making RGB-thermal pairing traceable
-- Separating safe production output from experimental alignment validation
+The saved production RGB output is:
 
-**Goal:** Convert raw or semi-structured data into clean, research-ready datasets without requiring normal users to manually prepare folders or select modes.
+```text
+Images/RGB/Corrected FOV/<image>.JPG
+```
+
+The final saved image is always color RGB. Temporary grayscale, CLAHE, edge, and feature images are used only internally to estimate alignment.
+
+### Thermal Source Priority
+
+For alignment, the pipeline automatically uses the best available thermal source per pair:
+
+1. Calibrated thermal TIFF
+2. Thermal TIFF
+3. Thermal JPG
+
+If a pair does not have all thermal formats, the pipeline still processes it with the best available source.
+
+### AUTO_ALIGN Summary
+
+`AUTO_ALIGN` performs:
+
+1. Camera-aware coarse RGB crop.
+2. Temporary grayscale/contrast/edge preprocessing for alignment only.
+3. SIFT feature matching with RANSAC.
+4. Guarded transform validation.
+5. Color RGB warp/crop into thermal-size output.
+6. Safe fallback when a transform is not reliable.
+
+The output size is normally:
+
+```text
+640 x 512
+```
+
+AUTO_ALIGN is slower than crop-only because it performs feature extraction, matching, transform validation, and image warping.
+
+### Current Crop Tightening Values
+
+AUTO_ALIGN uses crop tightening to avoid matching RGB content that is outside the thermal FOV:
+
+```text
+CROP_SHRINK_LEFT = 0.06
+CROP_SHRINK_RIGHT = 0.02
+CROP_SHRINK_TOP = 0.00
+CROP_SHRINK_BOTTOM = 0.00
+```
+
+### Parallel Corrected FOV Export
+
+Corrected FOV generation can run in parallel with a bounded worker pool:
+
+```text
+PARALLEL_CORRECTED_FOV_EXPORT = True
+PARALLEL_CORRECTED_FOV_WORKERS = "AUTO"
+PARALLEL_CORRECTED_FOV_MAX_WORKERS = 4
+PARALLEL_CORRECTED_FOV_MIN_FREE_RAM_GB = 6.0
+PARALLEL_CORRECTED_FOV_ESTIMATED_RAM_PER_WORKER_GB = 2.0
+```
+
+The automatic worker count reserves memory first, then limits by CPU.
 
 ---
 
-## Foundation
+## GUI Review Tools
 
-Built on the original **Flame-Data-Pipeline**, which includes:
+The Full Pipeline GUI includes review tools for inspecting output pairs.
 
-- Raw File Sorting Tool
-- FLAME Image Labeling Tool
-- Image GPS Tracing Tool
+The image review window can show:
 
-The original pipeline was designed around DJI radiometric JPG data and used a fixed camera crop for `Corrected FOV`. The current work expands this into a more automatic dataset-building workflow while preserving the original FLAME labeling output structure.
+- Corrected FOV RGB
+- Thermal image
+- Crop-only comparison
+- AUTO_ALIGN comparison
+- RGB/thermal overlay with adjustable opacity
+- Alignment metrics for the selected pair
+
+Developer calibration and validation tools remain available inside the GUI for alignment development and calibration work. Normal production dataset generation does not require those tools.
 
 ---
 
@@ -156,47 +347,43 @@ The original pipeline was designed around DJI radiometric JPG data and used a fi
 
 Use **Python 3.11**.
 
-Python 3.13 is not recommended for this repository because several pinned scientific packages, especially older `contourpy` / `matplotlib` dependencies, may not have compatible wheels and may try to build from source.
+Python 3.13 is not recommended because several pinned scientific packages may not have compatible wheels and may try to build from source.
 
 Install Python 3.11 on Windows:
 
-```
+```powershell
 winget install Python.Python.3.11
 ```
 
 Check installation:
 
-```
+```powershell
 py -3.11 --version
 ```
 
-### Virtual Environment
+### Launcher Installation
 
-From inside:
+The recommended launcher handles the environment automatically:
 
+```text
+Full Pipeline GUI.cmd
 ```
+
+### Manual Environment Setup
+
+From:
+
+```text
 Flame-Data-Pipeline-main/Raw File Sorting
 ```
 
 run:
 
-```
+```powershell
 py -3.11 -m venv .venv
 .\.venv\Scripts\activate
 python -m pip install "pip<25"
-```
-
-### Install Requirements
-
-Install Raw File Sorting and GPS dependencies:
-
-```
 python -m pip install -r ".\requirements.txt" -r "..\Image GPS Tracing\requirements.txt"
-```
-
-Install Labeling dependencies. The original labeling requirements pin `PySimpleGUI==5.0.2`, which may not be available from the normal package index. If that fails, use the available PySimpleGUI version below:
-
-```
 python -m pip install numpy==1.26.4 opencv-python==4.9.0.80 pillow==10.2.0 pyasn1==0.5.1 rsa==4.9 PySimpleGUI==4.60.5.1
 ```
 
@@ -210,374 +397,68 @@ python -m pip install numpy==1.26.4 opencv-python==4.9.0.80 pillow==10.2.0 pyasn
 - `psutil`
 - `exif`
 - `get-video-properties`
-- `PySimpleGUI` for the labeling tool
+- `PySimpleGUI`
 
 ### Dependency Notes
 
-- `opencv-python` is required for SIFT, affine estimation, homography estimation, and optional ECC refinement.
-- `pillow` is used for image loading, RGB crops, overlays, EXIF preservation, and debug image exports.
+- `opencv-python` is required for SIFT, affine estimation, optional homography experimentation, and image warping.
+- `pillow` is used for image loading, EXIF preservation, RGB crops, overlays, TIFF reading, and output writing.
 - `exif` is required by DJI raw-style processing and GPS tracing.
-- `matplotlib` is used for the legacy DJI thermal JPG `inferno` colormap. The thermal JPG render path no longer uses `seaborn` or `matplotlib.pyplot`.
+- `matplotlib` is used for legacy DJI thermal JPG rendering.
 - DJI thermal SDK DLLs remain in `Raw File Sorting/dji_thermal_sdk` for legacy DJI raw workflows.
-
----
-
-## Usage (High-Level)
-
-Typical workflow:
-
-1. Put a dataset folder into `Raw File Sorting/Input Folder`
-2. Run `python "Raw File Sorting GUI.py"`
-3. Click `Run Sort`
-4. Inspect results with `Check Results`
-5. Use the output with the FLAME Image Labeling Tool
-
-Normal users should not need to manually pre-sort files or select a processing mode. The pipeline attempts to detect the correct workflow from the input folder.
-
----
-
-## Pairing Workflow
-
-The current pre-sorted standard workflow supports datasets containing:
-
-- RGB JPG files
-- Thermal JPG files
-- Thermal TIFF files
-- Calibrated thermal TIFF files
-
-Pairing is based on:
-
-- Numeric suffix matching, such as `0001 -> 0001`
-- Capture timestamps when available
-- Expected modality presence
-- Sequence consistency across neighboring pairs
-
-Pairing outputs:
-
-- `pairing_log.csv`: full pairing and confidence record
-- `pairing_review.csv`: `MEDIUM`, `LOW`, or skipped/review-needed records
-
-Pair confidence levels:
-
-- `HIGH`: likely correct automatic pair
-- `MEDIUM`: accepted but should be reviewed
-- `LOW`: accepted only when no better candidate exists, should be reviewed
-
----
-
-## FOV Correction and Alignment
-
-### Current Production Default
-
-The production default is:
-
-```
-FOV_CORRECTION_MODE = "AUTO_ALIGN"
-```
-
-`AUTO_ALIGN` means:
-
-- Use the camera's fixed coarse RGB crop
-- Resize that crop to the thermal output size, usually `640x512`
-- Estimate a guarded SIFT/RANSAC transform against the selected thermal source
-- Apply the accepted transform to the original color RGB crop
-- Fall back to crop-only if AUTO_ALIGN fails validation
-
-The saved `Images/RGB/Corrected FOV/<number>.JPG` is generated through the same `generate_corrected_fov(..., mode="AUTO_ALIGN")` path used by the GUI AUTO_ALIGN preview. When thermal opacity is set to 0%, the RGB shown in the AUTO_ALIGN overlay is the same Corrected FOV image source used for production export, aside from JPG compression.
-
-### Why Crop-Only Is Not the Final Goal
-
-Crop-only is not true geometric alignment. It does not fully solve:
-
-- RGB/thermal lens differences
-- Different sensor fields of view
-- Scale mismatch
-- Slight rotation or shear
-- Parallax between RGB and thermal sensors
-- Misalignment that changes across the image
-
-The long-term goal is better `Corrected FOV` alignment than fixed crop alone, while ensuring the output is never worse than crop-only by default.
-
-### Alignment Modes
-
-Available FOV correction modes in `Raw File Sorting.py`:
-
-- `CROP_ONLY`: safe production baseline
-- `CALIBRATION_PROFILE`: applies a saved calibration profile if valid
-- `EXPERIMENTAL_SIFT`: developer feature-alignment mode
-- `AUTO_ALIGN`: improved SIFT-based candidate alignment mode
-- `AUTO_SIFT_CALIBRATED`: AUTO_ALIGN-style mode that can use validated calibration fallback
-
-The GUI preview and production export now share one Corrected FOV generation function. Thermal source selection follows this priority: calibrated TIFF, thermal TIFF, then thermal JPG.
-
-### AUTO_ALIGN Pipeline
-
-AUTO_ALIGN does the following:
-
-1. Load RGB and thermal pair
-2. Apply camera coarse crop
-3. Optionally tighten the crop before feature matching
-4. Create temporary grayscale/CLAHE/edge representations
-5. Run SIFT on temporary representations only
-6. Match features with Lowe ratio filtering
-7. Spatially balance matches across a grid
-8. Test multiple transform models
-9. Validate the selected transform
-10. Apply the final transform to the original color RGB crop
-11. Use sequence-assisted or dataset-median fallback if per-image validation fails
-12. Fall back to crop-only only as the last resort
-
-The final saved RGB output is never grayscale. Grayscale/edge images are temporary working images only.
-
-AUTO_ALIGN uses per-image SIFT/RANSAC transforms. It does not reuse developer calibration points or a dataset-level calibration profile for normal AUTO_ALIGN output. If strict high-confidence validation is not met, a guarded medium-confidence affine transform may still be accepted when it has low reprojection error, spatial coverage, sane geometry, source-footprint bounds, and a reasonable scale ratio.
-
-After per-image export, the pipeline runs dataset-wide alignment finalization before writing the pairing logs. The finalizer logs each transform's model, confidence, inliers, RMSE, scale, translation, rotation, source-footprint margins, border expansion, and fallback state. It keeps high-confidence SIFT results, keeps guarded medium SIFT results when they are plausible, otherwise tries a sequence-assisted transform from nearby accepted frames in the same dataset/burn-set. If no nearby transform is available, it tries the dataset/burn-set median transform from successful frames. Crop-only is used only when SIFT, sequence-assisted, and median-transform options are unavailable or invalid. Final labels include `aligned_sift_high`, `aligned_sift_medium`, `aligned_sequence_assisted`, `aligned_dataset_median`, `crop_only_last_resort`, and `review_required`.
-
-AUTO_ALIGN is slower than crop-only because each exported pair runs feature extraction, feature matching, RANSAC validation, and image warping. Crop-only only crops and resizes.
-
-Corrected FOV export can run in parallel using a bounded worker pool:
-
-```
-PARALLEL_CORRECTED_FOV_EXPORT = True
-PARALLEL_CORRECTED_FOV_WORKERS = "AUTO"
-PARALLEL_CORRECTED_FOV_MAX_WORKERS = 4
-PARALLEL_CORRECTED_FOV_MIN_FREE_RAM_GB = 6.0
-PARALLEL_CORRECTED_FOV_ESTIMATED_RAM_PER_WORKER_GB = 2.0
-```
-
-Each worker still runs the full AUTO_ALIGN Corrected FOV generation for its assigned pair. The automatic worker count reserves RAM first, then limits by CPU, and the exporter keeps only a bounded number of active jobs instead of queuing the whole dataset at once.
-
-### Crop Tightening
-
-AUTO_ALIGN uses tunable crop shrink parameters to avoid matching RGB content outside the thermal field of view:
-
-```
-CROP_SHRINK_LEFT = 0.06
-CROP_SHRINK_RIGHT = 0.02
-CROP_SHRINK_TOP = 0.00
-CROP_SHRINK_BOTTOM = 0.00
-```
-
-This was added because extra scene content, such as road visible in RGB but not thermal, can mislead feature matching.
-
-### Transform Models
-
-AUTO_ALIGN compares candidates from:
-
-- Similarity / partial affine transform
-- Full affine transform
-- Homography, optional and disabled by default
-
-Homography is intentionally not trusted by default because it can overfit feature matches and produce visually bad warps.
-
-### Preprocessing Variants
-
-AUTO_ALIGN tests multiple temporary structural representations:
-
-- `clahe`
-- `edge_blend`
-- `sobel`
-- `canny`
-- `thermal_inverted_clahe`
-
-These are used only for feature detection and matching.
-
-### Validation Metrics
-
-Each AUTO_ALIGN candidate is evaluated with:
-
-- Good match count
-- RANSAC inlier count
-- Inlier ratio
-- Match grid cell coverage
-- Inlier grid cell coverage
-- Mean reprojection error / RMSE
-- Max reprojection error
-- `scale_x`
-- `scale_y`
-- Scale ratio
-- Rotation
-- Skew / shear
-- Translation
-- Determinant
-- Confidence level
-
-Transforms are rejected if they have:
-
-- Too few good matches
-- Too few RANSAC inliers
-- Poor inlier ratio
-- Inliers clustered near the center
-- High reprojection error
-- Unrealistic scale
-- Unrealistic translation
-- Excessive skew
-- Orientation flip
-
-Important: high numerical confidence does not automatically mean visual correctness. AUTO_ALIGN results remain marked as needing visual review.
-
----
-
-## Visual Validation
-
-AUTO_ALIGN debug validation exports are available through:
-
-```
-export_alignment_debug_samples(...)
-```
-
-By default, validation exports sample:
-
-```
-CORRECTION_VALIDATION_SAMPLE_COUNT = 20
-```
-
-### Exported Debug Files
-
-For each sampled pair, the tool exports:
-
-- Crop-only `Corrected FOV`
-- Best AUTO_ALIGN RGB result
-- Thermal preview
-- Crop-only vs thermal overlay
-- AUTO_ALIGN vs thermal overlay
-- Per-candidate warped RGB images
-- Combined comparison image
-
-### Exported CSV Files
-
-Validation exports include:
-
-- `correction_validation_summary.csv`
-- `alignment_candidate_metrics.csv`
-
-The summary includes:
-
-- Chosen model
-- Preprocessing mode
-- Scale values
-- Translation values
-- Skew
-- Rotation
-- Inlier count
-- Inlier ratio
-- Inlier grid cells
-- RMSE / reprojection error
-- Confidence level
-- Fallback reason
-- `visual_review_status`
-- `auto_align_questionable_reasons`
-
-The default visual review flag is:
-
-```
-visual_review_status = visually_better_unknown
-```
-
-AUTO_ALIGN is now the production Corrected FOV path. If AUTO_ALIGN fails validation, the pipeline falls back to crop-only and records the fallback in the pairing log.
-
-### GUI Review
-
-The output viewer now supports side-by-side visual comparison:
-
-- Crop-only Corrected FOV
-- Thermal image
-- Crop-only vs thermal overlay
-- AUTO_ALIGN vs thermal overlay
-
-It also includes:
-
-- Overlay opacity slider
-- AUTO_ALIGN metrics for the selected pair
-- Confidence, transform, scale, translation, skew, rotation, inlier, grid-cell, RMSE, fallback, and questionable-reason display
-
-This is for review and for validating the same AUTO_ALIGN RGB image source used by production export.
-
----
-
-## Calibration Profiles
-
-Saved calibration profiles are now validated before use.
-
-Invalid profiles are ignored when loaded. Profiles are considered invalid if they contain unrealistic transform values, such as:
-
-- Extreme `scale_x` or `scale_y`
-- Large translation relative to output size
-- Excessive skew
-- Orientation flip
-- Missing matrix
-- Missing or high RMSE
-
-The existing `payson_test` profile was identified as invalid because it contained an extreme `scale_y = 5.0`, which visibly distorted the output. The loader now ignores profiles with this kind of transform.
-
-New profiles are also validated before saving. Invalid profiles raise an error instead of silently becoming part of the pipeline.
 
 ---
 
 ## Definitions
 
-**RGB Raw**
+**Full Pipeline GUI**  
+The main GUI that runs sorting, Corrected FOV generation, optional GPS tracing, optional temperature labeling, and optional manual review.
+
+**RGB Raw**  
 The original RGB image copied into the output for traceability.
 
-**Thermal JPG**
-A displayable thermal image used for visual comparison.
+**Corrected FOV**  
+The RGB image cropped and/or transformed to better match the thermal field of view.
 
-**Thermal Celsius TIFF**
-Thermal TIFF data, often used for temperature-aware labeling or analysis.
+**Thermal JPG**  
+A displayable thermal image used for visual comparison and labeling context.
 
-**Calibrated Thermal TIFF**
-Thermal TIFF already calibrated by an upstream source. Used preferentially when available.
+**Thermal Celsius TIFF**  
+Thermal TIFF data used for temperature-based labeling and analysis.
 
-**Corrected FOV**
-The RGB image cropped and/or transformed to better correspond to the thermal field of view.
+**Calibrated Thermal TIFF**  
+Thermal TIFF already calibrated by an upstream process. Used preferentially when available.
 
-**CROP_ONLY**
-Safe baseline FOV correction. Uses only fixed camera crop and resize.
+**Temperature Labeling**  
+Automatic Fire / No Fire splitting based on the maximum value in the thermal TIFF.
 
-**AUTO_ALIGN**
-Production guarded alignment mode. Tests SIFT-based transform candidates and falls back if validation fails.
+**AUTO_ALIGN**  
+Production RGB-to-thermal alignment mode. It estimates guarded SIFT/RANSAC alignment candidates and falls back safely when confidence is low.
 
-**SIFT**
-Scale-Invariant Feature Transform. Used here only on temporary grayscale/edge images to estimate RGB-to-thermal alignment.
+**SIFT**  
+Scale-Invariant Feature Transform. Used internally on temporary grayscale/edge images to estimate alignment.
 
-**RANSAC**
+**RANSAC**  
 Robust model fitting used to reject bad feature matches.
 
-**Similarity Transform**
-Translation, rotation, and uniform scale. Less flexible and less likely to overfit.
+**Affine Transform**  
+Transform model that can represent translation, rotation, scale, and shear.
 
-**Affine Transform**
-Translation, rotation, nonuniform scale, and shear. More flexible than similarity.
+**Homography**  
+Perspective transform used for developer calibration experiments when affine alignment is not sufficient.
 
-**Homography**
-Perspective transform. Powerful but risky for this problem because it can overfit.
-
-**Inlier**
-A feature match that agrees with the estimated transform after RANSAC.
-
-**Inlier Ratio**
-The fraction of matched features accepted as inliers.
-
-**Inlier Grid Cells**
-How many spatial grid cells contain inlier matches. Used to detect center-biased matching.
-
-**RMSE / Reprojection Error**
-Pixel error between transformed RGB feature points and matching thermal feature points.
-
-**visually_better_unknown**
-Default validation status meaning AUTO_ALIGN has not been visually confirmed as better than crop-only.
+**GPS_Traces.csv**  
+Optional GPS tracing output containing image datetime, latitude, longitude, altitude, filename, and path.
 
 ---
 
-## Known Issues
+## Known Notes
 
-- The previously documented `seaborn` heatmap memory leak in legacy DJI thermal JPG rendering may be fixed. That path now renders thermal JPGs directly with NumPy, the matplotlib `inferno` colormap, and PIL instead of `sns.heatmap(...)` / `matplotlib.pyplot` figures.
-- Large batches should still be monitored for memory use because AUTO_ALIGN and DJI thermal extraction create temporary image arrays per pair.
-- AUTO_ALIGN can produce numerically strong candidates that still need visual review
-- Center landmarks may align while edges remain scaled or offset
-- Crop shrink settings may need camera-specific tuning
-- Homography is disabled by default because it can overfit
-- `PySimpleGUI==5.0.2` may not be available from the normal package index; use `PySimpleGUI==4.60.5.1` if needed
+- Large batches should still be monitored for memory use because AUTO_ALIGN and thermal extraction create temporary image arrays per pair.
+- AUTO_ALIGN can be slower on large datasets than crop-only processing.
+- Smoke, low texture, repeated branches, and weak thermal structure can make per-image alignment harder.
+- Crop shrink settings may need camera-specific tuning.
+- `PySimpleGUI==5.0.2` may not be available from the normal package index; `PySimpleGUI==4.60.5.1` is the current fallback used by the launcher.
 
 ---
 
@@ -587,8 +468,9 @@ This repository focuses on:
 
 - Dataset preparation tooling
 - File sorting and pairing
-- RGB-thermal FOV correction experiments
-- Visual validation of alignment
+- RGB-thermal FOV correction
+- Temperature-based Fire / No Fire labeling
+- Optional GPS trace extraction
 - Workflow improvements for FlameVQA / FireSense dataset construction
 
 It does **not include** internal research methods or restricted project details.
@@ -601,10 +483,10 @@ Developed at Clemson University - IS-WiN Lab.
 
 **Contributors**
 
+- Camren J. Khoury
 - Mobin Habibpour
 - Niloufar Alipour Talemi
 - John Spodnik
-- Camren J. Khoury
 - Dr. Fatemeh Afghah
 - Bryce Hopkins
 - Michael Marinaccio
