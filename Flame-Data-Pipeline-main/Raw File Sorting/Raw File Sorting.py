@@ -104,6 +104,7 @@ FEATURE_ALIGNMENT_SMOKE_PREPROCESSING_VARIANTS = ["edge_blend", "sobel"]
 FEATURE_ALIGNMENT_BORDER_PREPROCESSING_VARIANTS = ["edge_blend"]
 FEATURE_ALIGNMENT_AKAZE_PREPROCESSING_VARIANTS = ["edge_blend"]
 FEATURE_ALIGNMENT_WEAK_THERMAL_PREPROCESSING_VARIANTS = [
+    "thermal_dark_brightened",
     "thermal_gamma",
     "adaptive_canny",
     "morph_edges",
@@ -143,6 +144,13 @@ FEATURE_ALIGNMENT_LOW_GRADIENT_RETRY_THRESHOLD = 18.0
 FEATURE_ALIGNMENT_MIN_USABLE_MASK_PERCENTAGE = 0.08
 FEATURE_ALIGNMENT_BORDER_BAND_FRACTION = 0.15
 FEATURE_ALIGNMENT_THERMAL_EDGE_PERCENTILE = 70
+THERMAL_DARK_MEAN_THRESHOLD = 55.0
+THERMAL_DARK_P90_THRESHOLD = 85.0
+THERMAL_DARK_P95_THRESHOLD = 100.0
+THERMAL_LOW_CONTRAST_P98_P2_THRESHOLD = 38.0
+THERMAL_VERY_LOW_DYNAMIC_RANGE_THRESHOLD = 18.0
+THERMAL_DARK_BRIGHTEN_GAMMA = 0.55
+THERMAL_DARK_BRIGHTEN_CLAHE_CLIP_LIMIT = 3.0
 FEATURE_ALIGNMENT_USE_ECC_REFINEMENT = False
 FEATURE_ALIGNMENT_THERMAL_JPG_RETRY_ENABLED = True
 FEATURE_ALIGNMENT_THERMAL_JPG_RETRY_FAILURE_REASONS = {
@@ -1244,6 +1252,99 @@ def _warp_corrected_image(corrected_image, transform_matrix, output_size):
     return Image.fromarray(warped)
 
 
+def _thermal_brightness_diagnostics(image_array):
+    array = np.asarray(image_array)
+    if array.ndim == 3:
+        if cv2 is not None:
+            array = cv2.cvtColor(array[:, :, :3], cv2.COLOR_RGB2GRAY)
+        else:
+            array = np.asarray(Image.fromarray(array[:, :, :3]).convert("L"))
+
+    array = array.astype(np.float32)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return {
+            "thermal_brightness_mean": 0.0,
+            "thermal_brightness_median": 0.0,
+            "thermal_brightness_p90": 0.0,
+            "thermal_brightness_p95": 0.0,
+            "thermal_brightness_p98": 0.0,
+            "thermal_brightness_p2": 0.0,
+            "thermal_brightness_dynamic_range": 0.0,
+            "thermal_too_dark": True,
+            "thermal_low_contrast": True,
+            "thermal_brightness_boost_needed": True,
+            "thermal_brightness_scaled_for_display": False,
+        }
+
+    scaled_for_display = False
+    if float(np.nanmax(finite)) > 255.0 or float(np.nanmin(finite)) < 0.0:
+        low, high = np.percentile(finite, [2, 98])
+        if high > low:
+            array = np.clip((array - low) / (high - low), 0.0, 1.0) * 255.0
+            finite = array[np.isfinite(array)]
+            scaled_for_display = True
+
+    p2, p90, p95, p98 = np.percentile(finite, [2, 90, 95, 98])
+    mean_value = float(np.mean(finite))
+    median_value = float(np.median(finite))
+    dynamic_range = float(p98 - p2)
+    too_dark = (
+        mean_value < THERMAL_DARK_MEAN_THRESHOLD
+        or float(p90) < THERMAL_DARK_P90_THRESHOLD
+        or float(p95) < THERMAL_DARK_P95_THRESHOLD
+    )
+    low_contrast = dynamic_range < THERMAL_LOW_CONTRAST_P98_P2_THRESHOLD
+    return {
+        "thermal_brightness_mean": mean_value,
+        "thermal_brightness_median": median_value,
+        "thermal_brightness_p90": float(p90),
+        "thermal_brightness_p95": float(p95),
+        "thermal_brightness_p98": float(p98),
+        "thermal_brightness_p2": float(p2),
+        "thermal_brightness_dynamic_range": dynamic_range,
+        "thermal_too_dark": bool(too_dark),
+        "thermal_low_contrast": bool(low_contrast),
+        "thermal_brightness_boost_needed": bool(too_dark or low_contrast),
+        "thermal_brightness_scaled_for_display": bool(scaled_for_display),
+    }
+
+
+def _thermal_brightness_diagnostics_from_path(thermal_source_path):
+    if not thermal_source_path or not os.path.exists(thermal_source_path):
+        return _thermal_brightness_diagnostics(np.zeros((1, 1), dtype=np.uint8))
+    try:
+        with Image.open(thermal_source_path) as thermal_img:
+            return _thermal_brightness_diagnostics(thermal_img)
+    except Exception:
+        return _thermal_brightness_diagnostics(np.zeros((1, 1), dtype=np.uint8))
+
+
+def _enhance_dark_thermal_array(gray_array):
+    array = np.asarray(gray_array, dtype=np.float32)
+    finite = array[np.isfinite(array)]
+    if finite.size == 0:
+        return np.zeros(array.shape, dtype=np.uint8)
+
+    low, high = np.percentile(finite, [1, 99])
+    if high <= low:
+        low = float(finite.min())
+        high = float(finite.max())
+    if high <= low:
+        return np.zeros(array.shape, dtype=np.uint8)
+
+    stretched = np.clip((array - low) / (high - low), 0.0, 1.0)
+    brightened = np.power(stretched, THERMAL_DARK_BRIGHTEN_GAMMA)
+    brightened = np.clip(brightened * 255.0, 0, 255).astype(np.uint8)
+    if cv2 is not None:
+        clahe = cv2.createCLAHE(
+            clipLimit=THERMAL_DARK_BRIGHTEN_CLAHE_CLIP_LIMIT,
+            tileGridSize=(8, 8),
+        )
+        brightened = clahe.apply(brightened)
+    return brightened
+
+
 def _normalize_feature_array(image, variant="edge_blend", invert=False):
     array = np.asarray(image)
     if array.ndim == 3:
@@ -1256,6 +1357,12 @@ def _normalize_feature_array(image, variant="edge_blend", invert=False):
     finite = np.isfinite(array)
     if not np.any(finite):
         return np.zeros(array.shape, dtype=np.uint8)
+
+    if variant == "thermal_dark_brightened":
+        normalized = _enhance_dark_thermal_array(array)
+        if invert:
+            normalized = 255 - normalized
+        return normalized
 
     valid_values = array[finite]
     low, high = np.percentile(valid_values, [2, 98])
@@ -1569,7 +1676,8 @@ def _thermal_structure_quality(thermal_feature):
     }
 
 
-def _alignment_precheck_level(rgb_diagnostics, thermal_diagnostics):
+def _alignment_precheck_level(rgb_diagnostics, thermal_diagnostics, thermal_brightness_diagnostics=None):
+    thermal_brightness_diagnostics = thermal_brightness_diagnostics or {}
     if thermal_diagnostics["thermal_structure_class"] == "BAD_INFORMATION_FRAME":
         return "BAD"
     if (
@@ -1577,6 +1685,7 @@ def _alignment_precheck_level(rgb_diagnostics, thermal_diagnostics):
         and rgb_diagnostics["low_information_pct"] < FEATURE_ALIGNMENT_SMOKE_RETRY_TRIGGER_PERCENTAGE
         and rgb_diagnostics["gradient_mean"] > FEATURE_ALIGNMENT_LOW_GRADIENT_RETRY_THRESHOLD
         and not thermal_diagnostics["thermal_structure_concentrated"]
+        and not thermal_brightness_diagnostics.get("thermal_brightness_boost_needed", False)
     ):
         return "GOOD"
     return "QUESTIONABLE"
@@ -1617,6 +1726,18 @@ def _default_feature_alignment_result(status="not_run"):
         "thermal_edge_side_dominance_fraction": 0.0,
         "thermal_edge_corner_dominance_fraction": 0.0,
         "thermal_structure_concentrated": False,
+        "thermal_brightness_mean": 0.0,
+        "thermal_brightness_median": 0.0,
+        "thermal_brightness_p90": 0.0,
+        "thermal_brightness_p95": 0.0,
+        "thermal_brightness_p98": 0.0,
+        "thermal_brightness_p2": 0.0,
+        "thermal_brightness_dynamic_range": 0.0,
+        "thermal_too_dark": False,
+        "thermal_low_contrast": False,
+        "thermal_brightness_boost_needed": False,
+        "thermal_brightness_scaled_for_display": False,
+        "thermal_brightness_boost_used": False,
         "rgb_mask_usable_fraction": 1.0,
         "thermal_mask_usable_fraction": 1.0,
         "keypoints_rgb_unmasked": 0,
@@ -1692,6 +1813,7 @@ def _build_alignment_representation_pairs(
     enabled_stages = set(enabled_stages or {"sift_standard", "sift_smoke_masked", "border_guided"})
     variants = list(variants or FEATURE_ALIGNMENT_PREPROCESSING_VARIANTS)
     rgb_diagnostics = _rgb_low_information_mask(corrected_crop_image)
+    thermal_brightness_diagnostics = _thermal_brightness_diagnostics_from_path(thermal_source_path)
     border_mask = _border_band_mask(output_size)
     should_try_low_information_retry = (
         FEATURE_ALIGNMENT_SMOKE_RETRY_ENABLED
@@ -1702,25 +1824,38 @@ def _build_alignment_representation_pairs(
     )
     for variant in variants:
         thermal_invert = variant == "thermal_inverted_clahe"
-        representation_variant = "clahe" if thermal_invert else variant
+        if thermal_invert:
+            rgb_variant = "clahe"
+            thermal_variant = "clahe"
+        elif variant in {"thermal_dark_brightened", "thermal_gamma"}:
+            rgb_variant = "edge_blend"
+            thermal_variant = variant
+        else:
+            rgb_variant = variant
+            thermal_variant = variant
         rgb_feature = _normalize_feature_array(
             corrected_crop_image.convert("RGB"),
-            variant=representation_variant,
+            variant=rgb_variant,
             invert=False,
         )
         thermal_feature = _load_thermal_feature_image(
             thermal_source_path,
             output_size,
-            variant=representation_variant,
+            variant=thermal_variant,
             invert=thermal_invert,
         )
         if thermal_feature is None:
             continue
         thermal_diagnostics = _thermal_structure_quality(thermal_feature)
         base_diagnostics = {
-            "alignment_precheck_level": _alignment_precheck_level(rgb_diagnostics, thermal_diagnostics),
+            "alignment_precheck_level": _alignment_precheck_level(
+                rgb_diagnostics,
+                thermal_diagnostics,
+                thermal_brightness_diagnostics,
+            ),
             "rgb_low_information_pct": rgb_diagnostics["low_information_pct"],
             "rgb_gradient_mean": rgb_diagnostics["gradient_mean"],
+            "thermal_brightness_boost_used": variant in {"thermal_dark_brightened", "thermal_gamma"},
             "thermal_structure_class": thermal_diagnostics["thermal_structure_class"],
             "thermal_gradient_mean": thermal_diagnostics["thermal_gradient_mean"],
             "thermal_gradient_std": thermal_diagnostics["thermal_gradient_std"],
@@ -1734,6 +1869,7 @@ def _build_alignment_representation_pairs(
             "thermal_edge_corner_dominance_fraction": thermal_diagnostics["thermal_edge_corner_dominance_fraction"],
             "thermal_structure_concentrated": thermal_diagnostics["thermal_structure_concentrated"],
         }
+        base_diagnostics.update(thermal_brightness_diagnostics)
         if "sift_standard" in enabled_stages:
             representation_pairs.append(
                 {
@@ -2147,6 +2283,8 @@ def _validate_feature_alignment_result(
         < FEATURE_ALIGNMENT_MIN_THERMAL_EDGE_SUPPORT_RATIO
     ):
         reasons.append("weak_thermal_edge_support")
+    if result.get("thermal_brightness_boost_needed") and not result.get("thermal_brightness_boost_used"):
+        reasons.append("thermal_brightness_boost_needed")
     post_edge_distance = result.get("post_warp_edge_mean_distance_px")
     if (
         post_edge_distance is not None
@@ -2186,6 +2324,7 @@ def _validate_feature_alignment_result(
         "biased_affine_not_trusted",
         "weak_similarity_spatial_bias",
         "weak_post_warp_thermal_edge_alignment",
+        "thermal_brightness_boost_needed",
     }
     relaxed_reasons = {"not_enough_ransac_inliers", "low_inlier_ratio"}
     relaxed_accepted = (
@@ -2876,6 +3015,8 @@ def _auto_align_questionable_reasons(alignment_result):
         reasons.append(str(alignment_result.get("thermal_structure_class")).lower())
     if alignment_result.get("inlier_spatial_bias_reasons"):
         reasons.append("inlier_spatial_bias_present")
+    if alignment_result.get("thermal_brightness_boost_needed") and not alignment_result.get("thermal_brightness_boost_used"):
+        reasons.append("thermal_brightness_boost_needed")
     if (
         int(alignment_result.get("good_matches", 0) or 0) > 0
         and float(alignment_result.get("good_match_thermal_edge_support_ratio", 0.0))
