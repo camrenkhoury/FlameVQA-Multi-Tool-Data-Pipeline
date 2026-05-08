@@ -103,6 +103,11 @@ FEATURE_ALIGNMENT_PRIMARY_PREPROCESSING_VARIANTS = ["edge_blend", "clahe"]
 FEATURE_ALIGNMENT_SMOKE_PREPROCESSING_VARIANTS = ["edge_blend", "sobel"]
 FEATURE_ALIGNMENT_BORDER_PREPROCESSING_VARIANTS = ["edge_blend"]
 FEATURE_ALIGNMENT_AKAZE_PREPROCESSING_VARIANTS = ["edge_blend"]
+FEATURE_ALIGNMENT_WEAK_THERMAL_PREPROCESSING_VARIANTS = [
+    "thermal_gamma",
+    "adaptive_canny",
+    "morph_edges",
+]
 FEATURE_ALIGNMENT_USE_EDGE_BLEND = True
 FEATURE_ALIGNMENT_EDGE_BLEND_WEIGHT = 0.35
 FEATURE_ALIGNMENT_MIN_GOOD_MATCHES = 20
@@ -133,6 +138,7 @@ FEATURE_ALIGNMENT_SMOKE_MIN_VALUE_THRESHOLD = 55
 FEATURE_ALIGNMENT_SMOKE_RETRY_TRIGGER_PERCENTAGE = 0.18
 FEATURE_ALIGNMENT_SMOKE_MATCH_DOMINANCE_THRESHOLD = 0.45
 FEATURE_ALIGNMENT_THERMAL_EDGE_SUPPORT_WARNING_RATIO = 0.15
+FEATURE_ALIGNMENT_MIN_THERMAL_EDGE_SUPPORT_RATIO = 0.20
 FEATURE_ALIGNMENT_LOW_GRADIENT_RETRY_THRESHOLD = 18.0
 FEATURE_ALIGNMENT_MIN_USABLE_MASK_PERCENTAGE = 0.08
 FEATURE_ALIGNMENT_BORDER_BAND_FRACTION = 0.15
@@ -146,6 +152,32 @@ FEATURE_ALIGNMENT_THERMAL_JPG_RETRY_FAILURE_REASONS = {
 }
 FEATURE_ALIGNMENT_ECC_MAX_ITERATIONS = 80
 FEATURE_ALIGNMENT_ECC_EPSILON = 1e-5
+THERMAL_STRUCTURE_GRID_SIZE = (4, 4)
+THERMAL_STRUCTURE_GOOD_MIN_ENTROPY = 4.20
+THERMAL_STRUCTURE_WEAK_MIN_ENTROPY = 2.80
+THERMAL_STRUCTURE_GOOD_MIN_EDGE_FRACTION = 0.030
+THERMAL_STRUCTURE_WEAK_MIN_EDGE_FRACTION = 0.010
+THERMAL_STRUCTURE_GOOD_MIN_EDGE_GRID_CELLS = 6
+THERMAL_STRUCTURE_WEAK_MIN_EDGE_GRID_CELLS = 3
+THERMAL_STRUCTURE_MIN_CONNECTED_COMPONENTS = 2
+THERMAL_STRUCTURE_ASYMMETRY_GRID_DOMINANCE = 0.45
+THERMAL_STRUCTURE_ASYMMETRY_SIDE_DOMINANCE = 0.72
+FEATURE_ALIGNMENT_SPATIAL_MIN_HULL_AREA_RATIO = 0.06
+FEATURE_ALIGNMENT_SPATIAL_MIN_BBOX_WIDTH_RATIO = 0.22
+FEATURE_ALIGNMENT_SPATIAL_MIN_BBOX_HEIGHT_RATIO = 0.22
+FEATURE_ALIGNMENT_SPATIAL_MAX_CENTROID_OFFSET_FRACTION = 0.32
+FEATURE_ALIGNMENT_SPATIAL_MAX_GRID_DOMINANCE = 0.62
+FEATURE_ALIGNMENT_SPATIAL_MAX_SIDE_DOMINANCE = 0.82
+FEATURE_ALIGNMENT_SPATIAL_MAX_CORNER_DOMINANCE = 0.58
+STRUCTURE_SEARCH_ALIGNMENT_ENABLED = True
+STRUCTURE_SEARCH_ROTATION_DEGREES = [-8, -6, -4, -2, 0, 2, 4, 6, 8]
+STRUCTURE_SEARCH_TRANSLATION_PIXELS = [-24, -16, -8, 0, 8, 16, 24]
+STRUCTURE_SEARCH_SCALE_VALUES = [1.0]
+STRUCTURE_SEARCH_MAX_RGB_EDGE_POINTS = 4500
+STRUCTURE_SEARCH_MAX_MEAN_EDGE_DISTANCE_PX = 7.0
+STRUCTURE_SEARCH_MIN_EDGE_OVERLAP_RATIO = 0.055
+STRUCTURE_SEARCH_MIN_EDGE_GRID_CELLS = 4
+STRUCTURE_SEARCH_MIN_SCORE_IMPROVEMENT_OVER_CROP_ONLY = 0.15
 CORRECTION_VALIDATION_SAMPLE_COUNT = 20
 CORRECTION_VALIDATION_DIRNAME = "correction_validation"
 VISUAL_ALIGNMENT_REVIEW_DEFAULT = "visually_better_unknown"
@@ -238,6 +270,7 @@ ALIGNMENT_DECISION_DEBUG_DIRNAME = "alignment_decision_debug"
 SEQUENCE_ALIGNMENT_ASSIST_ENABLED = True
 SEQUENCE_ALIGNMENT_MAX_NEIGHBOR_GAP = 5
 DATASET_MEDIAN_ALIGNMENT_FALLBACK_ENABLED = False
+DATASET_MEDIAN_ALIGNMENT_FALLBACK_FOR_WEAK_FRAMES = True
 PARALLEL_CORRECTED_FOV_EXPORT = True
 PARALLEL_CORRECTED_FOV_WORKERS = "AUTO"
 PARALLEL_CORRECTED_FOV_MAX_WORKERS = 4
@@ -1240,6 +1273,10 @@ def _normalize_feature_array(image, variant="edge_blend", invert=False):
     if cv2 is not None:
         clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
         normalized = clahe.apply(normalized)
+        if variant == "thermal_gamma":
+            gamma = 0.65
+            gamma_adjusted = ((normalized.astype(np.float32) / 255.0) ** gamma) * 255.0
+            return np.clip(gamma_adjusted, 0, 255).astype(np.uint8)
         if variant == "clahe":
             return normalized
 
@@ -1251,6 +1288,19 @@ def _normalize_feature_array(image, variant="edge_blend", invert=False):
             return gradient
         if variant == "canny":
             return cv2.Canny(normalized, 50, 150)
+        if variant == "adaptive_canny":
+            median_value = float(np.median(normalized))
+            lower = int(max(10, 0.66 * median_value))
+            upper = int(min(220, 1.33 * median_value + 35))
+            if upper <= lower:
+                upper = lower + 40
+            return cv2.Canny(normalized, lower, upper)
+        if variant == "morph_edges":
+            finite_gradient = gradient[np.isfinite(gradient)]
+            threshold = np.percentile(finite_gradient, 70) if finite_gradient.size else 25
+            edges = np.where(gradient >= max(float(threshold), 8.0), 255, 0).astype(np.uint8)
+            kernel = np.ones((3, 3), dtype=np.uint8)
+            return cv2.dilate(cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel), kernel, iterations=1)
         if variant == "edge_blend" and FEATURE_ALIGNMENT_USE_EDGE_BLEND:
             return cv2.addWeighted(
                 normalized,
@@ -1386,6 +1436,139 @@ def _thermal_edge_mask(thermal_feature):
     }
 
 
+def _grid_distribution_metrics(mask, image_size, grid_size=None):
+    grid_cols, grid_rows = grid_size or THERMAL_STRUCTURE_GRID_SIZE
+    mask_array = np.asarray(mask, dtype=bool)
+    height, width = mask_array.shape[:2]
+    total = int(np.count_nonzero(mask_array))
+    if total <= 0:
+        return {
+            "grid_cells": 0,
+            "largest_grid_fraction": 0.0,
+            "side_dominance_fraction": 0.0,
+            "corner_dominance_fraction": 0.0,
+            "left_fraction": 0.0,
+            "right_fraction": 0.0,
+            "top_fraction": 0.0,
+            "bottom_fraction": 0.0,
+        }
+
+    cell_counts = []
+    occupied = 0
+    for row in range(grid_rows):
+        y0 = int(round(row * height / grid_rows))
+        y1 = int(round((row + 1) * height / grid_rows))
+        for col in range(grid_cols):
+            x0 = int(round(col * width / grid_cols))
+            x1 = int(round((col + 1) * width / grid_cols))
+            count = int(np.count_nonzero(mask_array[y0:y1, x0:x1]))
+            if count > 0:
+                occupied += 1
+            cell_counts.append(count)
+
+    left_count = int(np.count_nonzero(mask_array[:, : width // 2]))
+    right_count = total - left_count
+    top_count = int(np.count_nonzero(mask_array[: height // 2, :]))
+    bottom_count = total - top_count
+    corner_counts = [
+        int(np.count_nonzero(mask_array[: height // 2, : width // 2])),
+        int(np.count_nonzero(mask_array[: height // 2, width // 2 :])),
+        int(np.count_nonzero(mask_array[height // 2 :, : width // 2])),
+        int(np.count_nonzero(mask_array[height // 2 :, width // 2 :])),
+    ]
+
+    return {
+        "grid_cells": int(occupied),
+        "largest_grid_fraction": float(max(cell_counts) / total),
+        "side_dominance_fraction": float(max(left_count, right_count, top_count, bottom_count) / total),
+        "corner_dominance_fraction": float(max(corner_counts) / total),
+        "left_fraction": float(left_count / total),
+        "right_fraction": float(right_count / total),
+        "top_fraction": float(top_count / total),
+        "bottom_fraction": float(bottom_count / total),
+    }
+
+
+def _image_entropy_u8(image_array, bins=64):
+    array = np.asarray(image_array, dtype=np.uint8)
+    hist, _ = np.histogram(array, bins=bins, range=(0, 256))
+    total = float(hist.sum())
+    if total <= 0:
+        return 0.0
+    probabilities = hist.astype(np.float64) / total
+    probabilities = probabilities[probabilities > 0]
+    return float(-np.sum(probabilities * np.log2(probabilities)))
+
+
+def _thermal_structure_quality(thermal_feature):
+    thermal_array = np.asarray(thermal_feature, dtype=np.uint8)
+    width_height = (thermal_array.shape[1], thermal_array.shape[0])
+    edge_info = _thermal_edge_mask(thermal_array)
+    support_mask = edge_info.get("support_mask")
+    if support_mask is None:
+        support_mask = np.zeros(thermal_array.shape[:2], dtype=np.uint8)
+    edge_bool = np.asarray(support_mask, dtype=np.uint8) > 0
+    distribution = _grid_distribution_metrics(edge_bool, width_height)
+
+    component_count = 0
+    if cv2 is not None and np.count_nonzero(edge_bool):
+        component_count, labels, stats, _centroids = cv2.connectedComponentsWithStats(
+            edge_bool.astype(np.uint8),
+            connectivity=8,
+        )
+        min_area = max(6, int(round(edge_bool.size * 0.00005)))
+        component_count = int(
+            sum(
+                1
+                for label_index in range(1, component_count)
+                if int(stats[label_index, cv2.CC_STAT_AREA]) >= min_area
+            )
+        )
+
+    entropy = _image_entropy_u8(thermal_array)
+    edge_fraction = float(edge_info.get("edge_fraction", 0.0))
+    edge_grid_cells = int(distribution["grid_cells"])
+    is_asymmetric = (
+        distribution["largest_grid_fraction"] >= THERMAL_STRUCTURE_ASYMMETRY_GRID_DOMINANCE
+        or distribution["side_dominance_fraction"] >= THERMAL_STRUCTURE_ASYMMETRY_SIDE_DOMINANCE
+    )
+
+    if (
+        entropy < THERMAL_STRUCTURE_WEAK_MIN_ENTROPY
+        or edge_fraction < THERMAL_STRUCTURE_WEAK_MIN_EDGE_FRACTION
+        or edge_grid_cells < THERMAL_STRUCTURE_WEAK_MIN_EDGE_GRID_CELLS
+    ):
+        quality_class = "BAD_INFORMATION_FRAME"
+    elif is_asymmetric:
+        quality_class = "ASYMMETRIC_STRUCTURE_FRAME"
+    elif (
+        entropy >= THERMAL_STRUCTURE_GOOD_MIN_ENTROPY
+        and edge_fraction >= THERMAL_STRUCTURE_GOOD_MIN_EDGE_FRACTION
+        and edge_grid_cells >= THERMAL_STRUCTURE_GOOD_MIN_EDGE_GRID_CELLS
+        and component_count >= THERMAL_STRUCTURE_MIN_CONNECTED_COMPONENTS
+    ):
+        quality_class = "GOOD_FEATURE_FRAME"
+    else:
+        quality_class = "WEAK_FEATURE_BUT_STRUCTURED_FRAME"
+
+    return {
+        "thermal_structure_class": quality_class,
+        "thermal_gradient_mean": edge_info["gradient_mean"],
+        "thermal_gradient_std": float(np.std(_gradient_magnitude(thermal_array))),
+        "thermal_gradient_median": edge_info["gradient_median"],
+        "thermal_entropy": entropy,
+        "thermal_edge_fraction": edge_fraction,
+        "thermal_edge_connected_components": component_count,
+        "thermal_edge_grid_cells": edge_grid_cells,
+        "thermal_edge_largest_grid_fraction": distribution["largest_grid_fraction"],
+        "thermal_edge_side_dominance_fraction": distribution["side_dominance_fraction"],
+        "thermal_edge_corner_dominance_fraction": distribution["corner_dominance_fraction"],
+        "thermal_structure_concentrated": bool(is_asymmetric),
+        "thermal_edge_mask": support_mask,
+        "thermal_mask": edge_info.get("mask"),
+    }
+
+
 def _default_feature_alignment_result(status="not_run"):
     return {
         "status": status,
@@ -1406,8 +1589,18 @@ def _default_feature_alignment_result(status="not_run"):
         "detector_type": "sift",
         "rgb_low_information_pct": 0.0,
         "rgb_gradient_mean": 0.0,
+        "thermal_structure_class": "UNKNOWN",
         "thermal_gradient_mean": 0.0,
+        "thermal_gradient_std": 0.0,
+        "thermal_gradient_median": 0.0,
+        "thermal_entropy": 0.0,
         "thermal_edge_fraction": 0.0,
+        "thermal_edge_connected_components": 0,
+        "thermal_edge_grid_cells": 0,
+        "thermal_edge_largest_grid_fraction": 0.0,
+        "thermal_edge_side_dominance_fraction": 0.0,
+        "thermal_edge_corner_dominance_fraction": 0.0,
+        "thermal_structure_concentrated": False,
         "rgb_mask_usable_fraction": 1.0,
         "thermal_mask_usable_fraction": 1.0,
         "keypoints_rgb_unmasked": 0,
@@ -1426,6 +1619,18 @@ def _default_feature_alignment_result(status="not_run"):
         "determinant": 1.0,
         "translation_x": 0.0,
         "translation_y": 0.0,
+        "inlier_bbox_width_ratio": 0.0,
+        "inlier_bbox_height_ratio": 0.0,
+        "inlier_convex_hull_area_ratio": 0.0,
+        "inlier_centroid_offset_fraction": 0.0,
+        "inlier_largest_grid_fraction": 0.0,
+        "inlier_side_dominance_fraction": 0.0,
+        "inlier_corner_dominance_fraction": 0.0,
+        "inlier_spatial_bias_reasons": [],
+        "post_warp_edge_mean_distance_px": None,
+        "post_warp_edge_overlap_ratio": 0.0,
+        "post_warp_edge_grid_cells": 0,
+        "post_warp_edge_score": None,
         "source_footprint_valid": True,
         "source_footprint_min_x": 0.0,
         "source_footprint_min_y": 0.0,
@@ -1495,12 +1700,22 @@ def _build_alignment_representation_pairs(
         )
         if thermal_feature is None:
             continue
-        thermal_diagnostics = _thermal_edge_mask(thermal_feature)
+        thermal_diagnostics = _thermal_structure_quality(thermal_feature)
         base_diagnostics = {
             "rgb_low_information_pct": rgb_diagnostics["low_information_pct"],
             "rgb_gradient_mean": rgb_diagnostics["gradient_mean"],
-            "thermal_gradient_mean": thermal_diagnostics["gradient_mean"],
-            "thermal_edge_fraction": thermal_diagnostics["edge_fraction"],
+            "thermal_structure_class": thermal_diagnostics["thermal_structure_class"],
+            "thermal_gradient_mean": thermal_diagnostics["thermal_gradient_mean"],
+            "thermal_gradient_std": thermal_diagnostics["thermal_gradient_std"],
+            "thermal_gradient_median": thermal_diagnostics["thermal_gradient_median"],
+            "thermal_entropy": thermal_diagnostics["thermal_entropy"],
+            "thermal_edge_fraction": thermal_diagnostics["thermal_edge_fraction"],
+            "thermal_edge_connected_components": thermal_diagnostics["thermal_edge_connected_components"],
+            "thermal_edge_grid_cells": thermal_diagnostics["thermal_edge_grid_cells"],
+            "thermal_edge_largest_grid_fraction": thermal_diagnostics["thermal_edge_largest_grid_fraction"],
+            "thermal_edge_side_dominance_fraction": thermal_diagnostics["thermal_edge_side_dominance_fraction"],
+            "thermal_edge_corner_dominance_fraction": thermal_diagnostics["thermal_edge_corner_dominance_fraction"],
+            "thermal_structure_concentrated": thermal_diagnostics["thermal_structure_concentrated"],
         }
         if "sift_standard" in enabled_stages:
             representation_pairs.append(
@@ -1513,7 +1728,7 @@ def _build_alignment_representation_pairs(
                     "rgb_mask": None,
                     "thermal_mask": None,
                     "rgb_low_information_mask": rgb_diagnostics["low_information_mask"],
-                    "thermal_edge_mask": thermal_diagnostics.get("support_mask"),
+                    "thermal_edge_mask": thermal_diagnostics.get("thermal_edge_mask"),
                     "diagnostics": base_diagnostics,
                 }
             )
@@ -1526,9 +1741,9 @@ def _build_alignment_representation_pairs(
                     "candidate_stage": "sift_smoke_masked",
                     "detector_type": "sift",
                     "rgb_mask": rgb_diagnostics["mask"],
-                    "thermal_mask": thermal_diagnostics["mask"],
+                    "thermal_mask": thermal_diagnostics["thermal_mask"],
                     "rgb_low_information_mask": rgb_diagnostics["low_information_mask"],
-                    "thermal_edge_mask": thermal_diagnostics.get("support_mask"),
+                    "thermal_edge_mask": thermal_diagnostics.get("thermal_edge_mask"),
                     "diagnostics": base_diagnostics,
                 }
             )
@@ -1541,9 +1756,9 @@ def _build_alignment_representation_pairs(
                     "candidate_stage": "border_guided",
                     "detector_type": "sift",
                     "rgb_mask": border_mask,
-                    "thermal_mask": _combine_feature_masks(border_mask, thermal_diagnostics["mask"]),
+                    "thermal_mask": _combine_feature_masks(border_mask, thermal_diagnostics["thermal_mask"]),
                     "rgb_low_information_mask": rgb_diagnostics["low_information_mask"],
-                    "thermal_edge_mask": thermal_diagnostics.get("support_mask"),
+                    "thermal_edge_mask": thermal_diagnostics.get("thermal_edge_mask"),
                     "diagnostics": base_diagnostics,
                 }
             )
@@ -1589,6 +1804,82 @@ def _occupied_grid_cell_count(points, image_size):
     if points is None or len(points) == 0:
         return 0
     return len({_grid_cell_for_point(point, image_size) for point in points})
+
+
+def _point_spatial_bias_metrics(points, image_size):
+    points = np.asarray(points, dtype=np.float32)
+    width, height = image_size
+    default_metrics = {
+        "bbox_width_ratio": 0.0,
+        "bbox_height_ratio": 0.0,
+        "convex_hull_area_ratio": 0.0,
+        "centroid_offset_fraction": 1.0,
+        "largest_grid_fraction": 1.0,
+        "side_dominance_fraction": 1.0,
+        "corner_dominance_fraction": 1.0,
+    }
+    if points.size == 0 or len(points) < 2:
+        return default_metrics
+
+    min_x = float(np.min(points[:, 0]))
+    max_x = float(np.max(points[:, 0]))
+    min_y = float(np.min(points[:, 1]))
+    max_y = float(np.max(points[:, 1]))
+    bbox_width_ratio = (max_x - min_x) / max(float(width), 1.0)
+    bbox_height_ratio = (max_y - min_y) / max(float(height), 1.0)
+    centroid = np.mean(points, axis=0)
+    center = np.asarray([float(width) / 2.0, float(height) / 2.0], dtype=np.float32)
+    centroid_offset = float(np.linalg.norm(centroid - center) / max(np.hypot(width, height), 1.0))
+
+    hull_area_ratio = 0.0
+    if cv2 is not None and len(points) >= 3:
+        hull = cv2.convexHull(points.reshape(-1, 1, 2))
+        hull_area_ratio = float(cv2.contourArea(hull) / max(float(width * height), 1.0))
+
+    grid_counts = {}
+    for point in points:
+        cell = _grid_cell_for_point(point, image_size)
+        grid_counts[cell] = grid_counts.get(cell, 0) + 1
+    total = max(len(points), 1)
+    left_count = int(np.count_nonzero(points[:, 0] < float(width) / 2.0))
+    right_count = total - left_count
+    top_count = int(np.count_nonzero(points[:, 1] < float(height) / 2.0))
+    bottom_count = total - top_count
+    corner_counts = [
+        int(np.count_nonzero((points[:, 0] < width / 2.0) & (points[:, 1] < height / 2.0))),
+        int(np.count_nonzero((points[:, 0] >= width / 2.0) & (points[:, 1] < height / 2.0))),
+        int(np.count_nonzero((points[:, 0] < width / 2.0) & (points[:, 1] >= height / 2.0))),
+        int(np.count_nonzero((points[:, 0] >= width / 2.0) & (points[:, 1] >= height / 2.0))),
+    ]
+
+    return {
+        "bbox_width_ratio": float(bbox_width_ratio),
+        "bbox_height_ratio": float(bbox_height_ratio),
+        "convex_hull_area_ratio": float(hull_area_ratio),
+        "centroid_offset_fraction": centroid_offset,
+        "largest_grid_fraction": float(max(grid_counts.values()) / total) if grid_counts else 1.0,
+        "side_dominance_fraction": float(max(left_count, right_count, top_count, bottom_count) / total),
+        "corner_dominance_fraction": float(max(corner_counts) / total),
+    }
+
+
+def _spatial_bias_reasons(metrics):
+    reasons = []
+    if metrics["bbox_width_ratio"] < FEATURE_ALIGNMENT_SPATIAL_MIN_BBOX_WIDTH_RATIO:
+        reasons.append("inlier_bbox_too_narrow")
+    if metrics["bbox_height_ratio"] < FEATURE_ALIGNMENT_SPATIAL_MIN_BBOX_HEIGHT_RATIO:
+        reasons.append("inlier_bbox_too_short")
+    if metrics["convex_hull_area_ratio"] < FEATURE_ALIGNMENT_SPATIAL_MIN_HULL_AREA_RATIO:
+        reasons.append("inlier_convex_hull_too_small")
+    if metrics["centroid_offset_fraction"] > FEATURE_ALIGNMENT_SPATIAL_MAX_CENTROID_OFFSET_FRACTION:
+        reasons.append("inlier_centroid_far_from_center")
+    if metrics["largest_grid_fraction"] > FEATURE_ALIGNMENT_SPATIAL_MAX_GRID_DOMINANCE:
+        reasons.append("inlier_grid_cell_dominance")
+    if metrics["side_dominance_fraction"] > FEATURE_ALIGNMENT_SPATIAL_MAX_SIDE_DOMINANCE:
+        reasons.append("inlier_side_dominance")
+    if metrics["corner_dominance_fraction"] > FEATURE_ALIGNMENT_SPATIAL_MAX_CORNER_DOMINANCE:
+        reasons.append("inlier_corner_dominance")
+    return reasons
 
 
 def _transform_geometry_summary(matrix, output_size):
@@ -1778,6 +2069,11 @@ def _validate_feature_alignment_result(
         source_points[inlier_mask] if inlier_count else [],
         source_image_size or output_size,
     )
+    spatial_metrics = _point_spatial_bias_metrics(
+        target_points[inlier_mask] if inlier_count else [],
+        output_size,
+    )
+    spatial_bias_reasons = _spatial_bias_reasons(spatial_metrics)
 
     reasons = []
     if good_matches < FEATURE_ALIGNMENT_MIN_GOOD_MATCHES:
@@ -1807,6 +2103,43 @@ def _validate_feature_alignment_result(
         reasons.append("invalid_source_footprint")
     if source_footprint["source_border_extension_px"] > ALIGNMENT_QA_SOURCE_BORDER_EXTENSION_PX:
         reasons.append("source_border_expansion")
+    if spatial_bias_reasons:
+        result["inlier_spatial_bias_reasons"] = spatial_bias_reasons
+        if result.get("transform_type") == "affine":
+            reasons.extend(spatial_bias_reasons)
+            reasons.append("biased_affine_not_trusted")
+        elif (
+            result.get("transform_type") == "similarity"
+            and (
+                inlier_count < FEATURE_ALIGNMENT_MIN_INLIERS
+                or result.get("thermal_structure_class") != "GOOD_FEATURE_FRAME"
+            )
+        ):
+            reasons.extend(spatial_bias_reasons)
+            reasons.append("weak_similarity_spatial_bias")
+    if result.get("thermal_structure_class") == "BAD_INFORMATION_FRAME":
+        reasons.append("weak_thermal_information")
+    if (
+        result.get("thermal_structure_class") == "ASYMMETRIC_STRUCTURE_FRAME"
+        and spatial_bias_reasons
+    ):
+        reasons.append("thermal_structure_asymmetric_and_inliers_biased")
+    if (
+        good_matches > 0
+        and float(result.get("good_match_thermal_edge_support_ratio", 0.0))
+        < FEATURE_ALIGNMENT_MIN_THERMAL_EDGE_SUPPORT_RATIO
+    ):
+        reasons.append("weak_thermal_edge_support")
+    post_edge_distance = result.get("post_warp_edge_mean_distance_px")
+    if (
+        post_edge_distance is not None
+        and (
+            float(post_edge_distance) > STRUCTURE_SEARCH_MAX_MEAN_EDGE_DISTANCE_PX + 2.0
+            or float(result.get("post_warp_edge_overlap_ratio", 0.0)) < STRUCTURE_SEARCH_MIN_EDGE_OVERLAP_RATIO
+            or int(result.get("post_warp_edge_grid_cells", 0) or 0) < STRUCTURE_SEARCH_MIN_EDGE_GRID_CELLS
+        )
+    ):
+        reasons.append("weak_post_warp_thermal_edge_alignment")
     low_information_inlier_ratio = result.get("inliers_in_rgb_low_information", 0) / max(inlier_count, 1)
     low_information_match_ratio = max(
         float(result.get("good_match_rgb_low_information_ratio", 0.0)),
@@ -1830,6 +2163,12 @@ def _validate_feature_alignment_result(
         "invalid_source_footprint",
         "source_border_expansion",
         "smoke_or_low_information_dominated_matches",
+        "weak_thermal_information",
+        "weak_thermal_edge_support",
+        "thermal_structure_asymmetric_and_inliers_biased",
+        "biased_affine_not_trusted",
+        "weak_similarity_spatial_bias",
+        "weak_post_warp_thermal_edge_alignment",
     }
     relaxed_reasons = {"not_enough_ransac_inliers", "low_inlier_ratio"}
     relaxed_accepted = (
@@ -1845,6 +2184,7 @@ def _validate_feature_alignment_result(
         and not any(reason in disqualifying_reasons for reason in reasons)
     )
 
+    reasons = _unique_reasons(reasons)
     confidence_level = "HIGH"
     if relaxed_accepted:
         confidence_level = "MEDIUM"
@@ -1871,6 +2211,13 @@ def _validate_feature_alignment_result(
             "determinant": geometry["determinant"],
             "translation_x": geometry["translation_x"],
             "translation_y": geometry["translation_y"],
+            "inlier_bbox_width_ratio": spatial_metrics["bbox_width_ratio"],
+            "inlier_bbox_height_ratio": spatial_metrics["bbox_height_ratio"],
+            "inlier_convex_hull_area_ratio": spatial_metrics["convex_hull_area_ratio"],
+            "inlier_centroid_offset_fraction": spatial_metrics["centroid_offset_fraction"],
+            "inlier_largest_grid_fraction": spatial_metrics["largest_grid_fraction"],
+            "inlier_side_dominance_fraction": spatial_metrics["side_dominance_fraction"],
+            "inlier_corner_dominance_fraction": spatial_metrics["corner_dominance_fraction"],
             "source_footprint_valid": source_footprint["source_footprint_valid"],
             "source_footprint_min_x": source_footprint["source_footprint_min_x"],
             "source_footprint_min_y": source_footprint["source_footprint_min_y"],
@@ -1993,6 +2340,249 @@ def _refine_candidate_with_ecc(candidate, rgb_feature, thermal_feature, source_p
     return rejected
 
 
+def _edge_mask_from_feature(feature_array, prefer_morph=True):
+    feature_array = np.asarray(feature_array, dtype=np.uint8)
+    if cv2 is None:
+        threshold = max(float(np.percentile(feature_array, 75)), 10.0)
+        return np.where(feature_array >= threshold, 255, 0).astype(np.uint8)
+
+    if prefer_morph:
+        edges = _normalize_feature_array(feature_array, variant="morph_edges")
+        if np.count_nonzero(edges) > 0:
+            return np.where(edges > 0, 255, 0).astype(np.uint8)
+
+    finite = feature_array[np.isfinite(feature_array)]
+    threshold = np.percentile(finite, 75) if finite.size else 25
+    return np.where(feature_array >= max(float(threshold), 8.0), 255, 0).astype(np.uint8)
+
+
+def _sample_edge_points(edge_mask, max_points=None):
+    ys, xs = np.nonzero(np.asarray(edge_mask) > 0)
+    if xs.size == 0:
+        return np.zeros((0, 2), dtype=np.float32)
+    points = np.column_stack([xs, ys]).astype(np.float32)
+    max_points = max_points or STRUCTURE_SEARCH_MAX_RGB_EDGE_POINTS
+    if len(points) <= max_points:
+        return points
+    indices = np.linspace(0, len(points) - 1, max_points).astype(np.int32)
+    return points[indices]
+
+
+def _edge_alignment_metrics_from_masks(rgb_edge_mask, thermal_edge_mask, matrix, output_size):
+    default_metrics = {
+        "post_warp_edge_mean_distance_px": None,
+        "post_warp_edge_overlap_ratio": 0.0,
+        "post_warp_edge_grid_cells": 0,
+        "post_warp_edge_score": None,
+        "post_warp_edge_largest_grid_fraction": 1.0,
+        "post_warp_edge_corner_dominance_fraction": 1.0,
+        "post_warp_edge_side_dominance_fraction": 1.0,
+    }
+    if cv2 is None:
+        return default_metrics
+
+    width, height = output_size
+    thermal_edges = np.where(np.asarray(thermal_edge_mask) > 0, 255, 0).astype(np.uint8)
+    rgb_edges = np.where(np.asarray(rgb_edge_mask) > 0, 255, 0).astype(np.uint8)
+    if not np.count_nonzero(thermal_edges) or not np.count_nonzero(rgb_edges):
+        return default_metrics
+
+    warped_rgb_edges = cv2.warpPerspective(
+        rgb_edges,
+        np.asarray(matrix, dtype=np.float32),
+        (int(width), int(height)),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    warped_points = _sample_edge_points(warped_rgb_edges)
+    if len(warped_points) == 0:
+        return default_metrics
+
+    thermal_support = cv2.dilate(
+        thermal_edges,
+        np.ones((5, 5), dtype=np.uint8),
+        iterations=1,
+    )
+    distance_map = cv2.distanceTransform(255 - thermal_edges, cv2.DIST_L2, 3)
+    point_x = np.clip(np.round(warped_points[:, 0]).astype(np.int32), 0, width - 1)
+    point_y = np.clip(np.round(warped_points[:, 1]).astype(np.int32), 0, height - 1)
+    distances = distance_map[point_y, point_x]
+    overlap_ratio = float(np.mean(thermal_support[point_y, point_x] > 0))
+    mean_distance = float(np.mean(distances))
+    grid_cells = _occupied_grid_cell_count(warped_points, output_size)
+    spread = _point_spatial_bias_metrics(warped_points, output_size)
+    one_region_penalty = max(
+        0.0,
+        spread["largest_grid_fraction"] - FEATURE_ALIGNMENT_SPATIAL_MAX_GRID_DOMINANCE,
+        spread["corner_dominance_fraction"] - FEATURE_ALIGNMENT_SPATIAL_MAX_CORNER_DOMINANCE,
+        spread["side_dominance_fraction"] - FEATURE_ALIGNMENT_SPATIAL_MAX_SIDE_DOMINANCE,
+    )
+    score = mean_distance - (overlap_ratio * 4.0) + (one_region_penalty * 10.0)
+    return {
+        "post_warp_edge_mean_distance_px": mean_distance,
+        "post_warp_edge_overlap_ratio": overlap_ratio,
+        "post_warp_edge_grid_cells": int(grid_cells),
+        "post_warp_edge_score": float(score),
+        "post_warp_edge_largest_grid_fraction": spread["largest_grid_fraction"],
+        "post_warp_edge_corner_dominance_fraction": spread["corner_dominance_fraction"],
+        "post_warp_edge_side_dominance_fraction": spread["side_dominance_fraction"],
+    }
+
+
+def _edge_alignment_metrics_from_features(rgb_feature, thermal_feature, matrix, output_size):
+    return _edge_alignment_metrics_from_masks(
+        _edge_mask_from_feature(rgb_feature),
+        _edge_mask_from_feature(thermal_feature),
+        matrix,
+        output_size,
+    )
+
+
+def _rigid_search_matrix(output_size, rotation_degrees=0.0, translation_x=0.0, translation_y=0.0, scale=1.0):
+    width, height = output_size
+    if cv2 is None:
+        return _identity_transform_matrix()
+    center = (float(width) / 2.0, float(height) / 2.0)
+    affine = cv2.getRotationMatrix2D(center, float(rotation_degrees), float(scale))
+    affine[0, 2] += float(translation_x)
+    affine[1, 2] += float(translation_y)
+    return np.vstack([affine.astype(np.float32), np.array([0.0, 0.0, 1.0], dtype=np.float32)])
+
+
+def _estimate_structure_search_candidate(corrected_crop_image, thermal_source_path, output_size, seed_candidate=None):
+    result = _default_feature_alignment_result("not_run")
+    result.update(
+        {
+            "representation": "structure_edge_search",
+            "transform_type": "rigid_search",
+            "candidate_stage": "structure_search",
+            "detector_type": "edge_overlap",
+        }
+    )
+    if not STRUCTURE_SEARCH_ALIGNMENT_ENABLED or cv2 is None:
+        result["status"] = "structure_search_disabled"
+        result["reasons"] = ["structure_search_disabled"]
+        return result
+
+    rgb_feature = _normalize_feature_array(
+        corrected_crop_image.convert("RGB"),
+        variant="morph_edges",
+        invert=False,
+    )
+    thermal_feature = _load_thermal_feature_image(
+        thermal_source_path,
+        output_size,
+        variant="morph_edges",
+        invert=False,
+    )
+    if thermal_feature is None:
+        result["status"] = "thermal_unavailable"
+        result["reasons"] = ["thermal_unavailable"]
+        return result
+
+    thermal_quality = _thermal_structure_quality(thermal_feature)
+    result.update(
+        {
+            key: value
+            for key, value in thermal_quality.items()
+            if key not in {"thermal_edge_mask", "thermal_mask"}
+        }
+    )
+    if thermal_quality["thermal_structure_class"] == "BAD_INFORMATION_FRAME":
+        result["status"] = "structure_search_skipped_bad_information"
+        result["reasons"] = ["weak_thermal_information"]
+        return result
+
+    rgb_edges = _edge_mask_from_feature(rgb_feature)
+    thermal_edges = thermal_quality.get("thermal_edge_mask")
+    if thermal_edges is None:
+        thermal_edges = _edge_mask_from_feature(thermal_feature)
+    if not np.count_nonzero(rgb_edges) or not np.count_nonzero(thermal_edges):
+        result["status"] = "structure_edges_unavailable"
+        result["reasons"] = ["structure_edges_unavailable"]
+        return result
+
+    crop_only_matrix = _identity_transform_matrix()
+    crop_only_metrics = _edge_alignment_metrics_from_masks(
+        rgb_edges,
+        thermal_edges,
+        crop_only_matrix,
+        output_size,
+    )
+    seed_matrix = _alignment_matrix_or_none(seed_candidate) if seed_candidate else None
+    if seed_matrix is None:
+        seed_matrix = crop_only_matrix
+    seed_geometry = _transform_geometry_summary(seed_matrix, output_size)
+    seed_tx = seed_geometry.get("translation_x", 0.0)
+    seed_ty = seed_geometry.get("translation_y", 0.0)
+    seed_rotation = seed_geometry.get("rotation_degrees", 0.0)
+    best_matrix = crop_only_matrix
+    best_metrics = crop_only_metrics
+
+    for scale in STRUCTURE_SEARCH_SCALE_VALUES:
+        for rotation_delta in STRUCTURE_SEARCH_ROTATION_DEGREES:
+            rotation = seed_rotation + rotation_delta
+            for tx_delta in STRUCTURE_SEARCH_TRANSLATION_PIXELS:
+                for ty_delta in STRUCTURE_SEARCH_TRANSLATION_PIXELS:
+                    matrix = _rigid_search_matrix(
+                        output_size,
+                        rotation_degrees=rotation,
+                        translation_x=seed_tx + tx_delta,
+                        translation_y=seed_ty + ty_delta,
+                        scale=scale,
+                    )
+                    metrics = _edge_alignment_metrics_from_masks(
+                        rgb_edges,
+                        thermal_edges,
+                        matrix,
+                        output_size,
+                    )
+                    if metrics["post_warp_edge_score"] is None:
+                        continue
+                    if (
+                        best_metrics["post_warp_edge_score"] is None
+                        or metrics["post_warp_edge_score"] < best_metrics["post_warp_edge_score"]
+                    ):
+                        best_matrix = matrix
+                        best_metrics = metrics
+
+    result["matrix"] = _matrix_to_list(best_matrix)
+    result.update(best_metrics)
+    geometry = _transform_geometry_summary(best_matrix, output_size)
+    source_footprint = _source_footprint_summary(best_matrix, output_size)
+    result.update(geometry)
+    result.update(source_footprint)
+
+    reasons = []
+    crop_score = crop_only_metrics.get("post_warp_edge_score")
+    best_score = best_metrics.get("post_warp_edge_score")
+    if best_score is None:
+        reasons.append("structure_search_no_score")
+    elif crop_score is not None and best_score > crop_score - STRUCTURE_SEARCH_MIN_SCORE_IMPROVEMENT_OVER_CROP_ONLY:
+        reasons.append("structure_search_did_not_improve_crop_only")
+    if (
+        best_metrics.get("post_warp_edge_mean_distance_px") is None
+        or best_metrics["post_warp_edge_mean_distance_px"] > STRUCTURE_SEARCH_MAX_MEAN_EDGE_DISTANCE_PX
+    ):
+        reasons.append("structure_search_high_edge_distance")
+    if best_metrics.get("post_warp_edge_overlap_ratio", 0.0) < STRUCTURE_SEARCH_MIN_EDGE_OVERLAP_RATIO:
+        reasons.append("structure_search_low_edge_overlap")
+    if best_metrics.get("post_warp_edge_grid_cells", 0) < STRUCTURE_SEARCH_MIN_EDGE_GRID_CELLS:
+        reasons.append("structure_search_not_spatially_distributed")
+    reasons.extend(_profile_transform_sanity_reasons(best_matrix, output_size, model_name="similarity"))
+    if not source_footprint["source_footprint_valid"]:
+        reasons.append("invalid_source_footprint")
+    if source_footprint["source_border_extension_px"] > ALIGNMENT_QA_SOURCE_BORDER_EXTENSION_PX:
+        reasons.append("source_border_expansion")
+
+    result["reasons"] = _unique_reasons(reasons)
+    result["accepted"] = not bool(result["reasons"])
+    result["confidence_level"] = "MEDIUM" if result["accepted"] else "LOW"
+    result["status"] = "ok" if result["accepted"] else "alignment_low_confidence"
+    return result
+
+
 def _run_sift_alignment_candidate(
     rgb_feature,
     thermal_feature,
@@ -2103,6 +2693,15 @@ def _run_sift_alignment_candidate(
 
     result["status"] = "ok"
     result["matrix"] = _matrix_to_list(matrix)
+    if len(balanced_matches) >= FEATURE_ALIGNMENT_RELAXED_MIN_INLIERS:
+        result.update(
+            _edge_alignment_metrics_from_features(
+                rgb_feature,
+                thermal_feature,
+                matrix,
+                output_size,
+            )
+        )
     inlier_mask = np.asarray(inliers, dtype=bool).reshape(-1) if inliers is not None else np.zeros(
         len(balanced_matches),
         dtype=bool,
@@ -2157,12 +2756,13 @@ def _select_best_alignment_candidate(candidates):
     if not candidates:
         return _default_feature_alignment_result("no_candidates")
 
-    model_rank = {"crop_only": 0, "similarity": 1, "affine": 2, "homography": 3}
+    model_rank = {"crop_only": 0, "rigid_search": 1, "similarity": 2, "affine": 3, "homography": 4}
     stage_rank = {
         "sift_standard": 0,
         "sift_smoke_masked": 1,
         "border_guided": 2,
-        "akaze_retry": 3,
+        "structure_search": 3,
+        "akaze_retry": 4,
     }
     accepted = [candidate for candidate in candidates if candidate.get("accepted")]
     if accepted:
@@ -2174,6 +2774,7 @@ def _select_best_alignment_candidate(candidates):
                 stage_rank.get(candidate.get("candidate_stage"), 99),
                 model_rank.get(candidate.get("transform_type"), 99),
                 1 if candidate.get("relaxed_acceptance") else 0,
+                candidate.get("post_warp_edge_score") if candidate.get("post_warp_edge_score") is not None else float("inf"),
                 candidate.get("mean_reprojection_error_px") or float("inf"),
                 -candidate.get("inlier_grid_cells", 0),
                 -candidate.get("inliers", 0),
@@ -2215,12 +2816,29 @@ def _auto_align_questionable_reasons(alignment_result):
         reasons.append("smoke_or_low_information_present")
     if float(alignment_result.get("thermal_gradient_mean", 0.0)) <= FEATURE_ALIGNMENT_LOW_GRADIENT_RETRY_THRESHOLD:
         reasons.append("weak_thermal_structure")
+    if alignment_result.get("thermal_structure_class") in {
+        "WEAK_FEATURE_BUT_STRUCTURED_FRAME",
+        "BAD_INFORMATION_FRAME",
+        "ASYMMETRIC_STRUCTURE_FRAME",
+    }:
+        reasons.append(str(alignment_result.get("thermal_structure_class")).lower())
+    if alignment_result.get("inlier_spatial_bias_reasons"):
+        reasons.append("inlier_spatial_bias_present")
     if (
         int(alignment_result.get("good_matches", 0) or 0) > 0
         and float(alignment_result.get("good_match_thermal_edge_support_ratio", 0.0))
         < FEATURE_ALIGNMENT_THERMAL_EDGE_SUPPORT_WARNING_RATIO
     ):
         reasons.append("weak_thermal_edge_match_support")
+    post_edge_distance = alignment_result.get("post_warp_edge_mean_distance_px")
+    if (
+        post_edge_distance is not None
+        and (
+            float(post_edge_distance) > STRUCTURE_SEARCH_MAX_MEAN_EDGE_DISTANCE_PX + 2.0
+            or float(alignment_result.get("post_warp_edge_overlap_ratio", 0.0)) < STRUCTURE_SEARCH_MIN_EDGE_OVERLAP_RATIO
+        )
+    ):
+        reasons.append("weak_post_warp_edge_support")
     return _unique_reasons(reasons)
 
 
@@ -2232,9 +2850,10 @@ def _alignment_candidate_is_strong_enough_to_stop(candidate):
     return not _auto_align_questionable_reasons(candidate)
 
 
-def _append_alignment_candidates(candidates, representation_pairs, output_size, detector_type=None):
+def _append_alignment_candidates(candidates, representation_pairs, output_size, detector_type=None, model_order=None):
+    models = list(model_order or _alignment_model_order())
     for representation in representation_pairs:
-        for model_name in _alignment_model_order():
+        for model_name in models:
             current_detector_type = detector_type or representation.get("detector_type", "sift")
             candidate_stage = "akaze_retry" if current_detector_type == "akaze" else representation.get(
                 "candidate_stage",
@@ -2295,6 +2914,31 @@ def _estimate_sift_alignment_matrix(corrected_crop_image, thermal_source_path, o
     if _alignment_candidate_is_strong_enough_to_stop(selected):
         return _finalize_alignment_selection(candidates)
 
+    weak_model_order = ["similarity"] if FEATURE_ALIGNMENT_MODEL == "auto" else _alignment_model_order()
+    selected_thermal_class = selected.get("thermal_structure_class", "UNKNOWN")
+    if selected_thermal_class in {
+        "WEAK_FEATURE_BUT_STRUCTURED_FRAME",
+        "BAD_INFORMATION_FRAME",
+        "ASYMMETRIC_STRUCTURE_FRAME",
+        "UNKNOWN",
+    } or not selected.get("accepted"):
+        weak_thermal_pairs = _build_alignment_representation_pairs(
+            corrected_crop_image,
+            thermal_source_path,
+            output_size,
+            enabled_stages={"sift_standard"},
+            variants=FEATURE_ALIGNMENT_WEAK_THERMAL_PREPROCESSING_VARIANTS,
+        )
+        _append_alignment_candidates(
+            candidates,
+            weak_thermal_pairs,
+            output_size,
+            model_order=weak_model_order,
+        )
+        selected = _select_best_alignment_candidate(candidates)
+        if _alignment_candidate_is_strong_enough_to_stop(selected):
+            return _finalize_alignment_selection(candidates)
+
     smoke_pairs = _build_alignment_representation_pairs(
         corrected_crop_image,
         thermal_source_path,
@@ -2302,7 +2946,7 @@ def _estimate_sift_alignment_matrix(corrected_crop_image, thermal_source_path, o
         enabled_stages={"sift_smoke_masked"},
         variants=FEATURE_ALIGNMENT_SMOKE_PREPROCESSING_VARIANTS,
     )
-    _append_alignment_candidates(candidates, smoke_pairs, output_size)
+    _append_alignment_candidates(candidates, smoke_pairs, output_size, model_order=weak_model_order)
     selected = _select_best_alignment_candidate(candidates)
     if _alignment_candidate_is_strong_enough_to_stop(selected):
         return _finalize_alignment_selection(candidates)
@@ -2314,12 +2958,18 @@ def _estimate_sift_alignment_matrix(corrected_crop_image, thermal_source_path, o
         enabled_stages={"border_guided"},
         variants=FEATURE_ALIGNMENT_BORDER_PREPROCESSING_VARIANTS,
     )
-    _append_alignment_candidates(candidates, border_pairs, output_size)
+    _append_alignment_candidates(candidates, border_pairs, output_size, model_order=weak_model_order)
     selected = _select_best_alignment_candidate(candidates)
     if _alignment_candidate_is_strong_enough_to_stop(selected):
         return _finalize_alignment_selection(candidates)
 
-    if FEATURE_ALIGNMENT_AKAZE_RETRY_ENABLED and not any(candidate.get("accepted") for candidate in candidates):
+    if (
+        FEATURE_ALIGNMENT_AKAZE_RETRY_ENABLED
+        and (
+            not any(candidate.get("accepted") for candidate in candidates)
+            or _auto_align_questionable_reasons(selected)
+        )
+    ):
         akaze_pairs = _build_alignment_representation_pairs(
             corrected_crop_image,
             thermal_source_path,
@@ -2327,7 +2977,32 @@ def _estimate_sift_alignment_matrix(corrected_crop_image, thermal_source_path, o
             enabled_stages={"sift_standard"},
             variants=FEATURE_ALIGNMENT_AKAZE_PREPROCESSING_VARIANTS,
         )
-        _append_alignment_candidates(candidates, akaze_pairs, output_size, detector_type="akaze")
+        _append_alignment_candidates(
+            candidates,
+            akaze_pairs,
+            output_size,
+            detector_type="akaze",
+            model_order=weak_model_order,
+        )
+        selected = _select_best_alignment_candidate(candidates)
+        if _alignment_candidate_is_strong_enough_to_stop(selected):
+            return _finalize_alignment_selection(candidates)
+
+    if (
+        STRUCTURE_SEARCH_ALIGNMENT_ENABLED
+        and (
+            not any(candidate.get("accepted") for candidate in candidates)
+            or _auto_align_questionable_reasons(selected)
+        )
+    ):
+        candidates.append(
+            _estimate_structure_search_candidate(
+                corrected_crop_image,
+                thermal_source_path,
+                output_size,
+                seed_candidate=selected,
+            )
+        )
 
     return _finalize_alignment_selection(candidates)
 
@@ -2821,8 +3496,21 @@ def _accepted_alignment_entries(pairs):
     entries = []
     for pair_index, pair in enumerate(pairs, start=1):
         alignment = pair.get("feature_alignment", {})
-        if alignment.get("accepted") and alignment.get("fallback_used", "none") == "none":
-            entries.append((pair_index, pair, alignment))
+        if not alignment.get("accepted") or alignment.get("fallback_used", "none") != "none":
+            continue
+        if alignment.get("confidence_level") != "HIGH":
+            continue
+        if alignment.get("thermal_structure_class") in {"BAD_INFORMATION_FRAME", "ASYMMETRIC_STRUCTURE_FRAME"}:
+            continue
+        if alignment.get("inlier_spatial_bias_reasons"):
+            continue
+        if "weak_thermal_edge_support" in alignment.get("reasons", []):
+            continue
+        if "weak_post_warp_thermal_edge_alignment" in alignment.get("reasons", []):
+            continue
+        if alignment.get("alignment_decision_source") in {"sequence_assisted_align", "dataset_median_transform"}:
+            continue
+        entries.append((pair_index, pair, alignment))
     return entries
 
 
@@ -3119,6 +3807,32 @@ def _median_transform_matrix(anchor_entries):
     return median_matrix
 
 
+def _dataset_median_allowed_for_frame(per_image_alignment, per_image_accepted, per_image_qa_reasons):
+    if DATASET_MEDIAN_ALIGNMENT_FALLBACK_ENABLED:
+        return True
+    if not DATASET_MEDIAN_ALIGNMENT_FALLBACK_FOR_WEAK_FRAMES:
+        return False
+    if not per_image_accepted:
+        return True
+    if per_image_qa_reasons and per_image_alignment.get("thermal_structure_class") != "GOOD_FEATURE_FRAME":
+        return True
+    weak_reasons = {
+        "weak_thermal_information",
+        "weak_thermal_edge_support",
+        "weak_post_warp_thermal_edge_alignment",
+        "thermal_structure_asymmetric_and_inliers_biased",
+        "biased_affine_not_trusted",
+        "weak_similarity_spatial_bias",
+    }
+    if set(per_image_alignment.get("reasons", [])).intersection(weak_reasons):
+        return True
+    return per_image_alignment.get("thermal_structure_class") in {
+        "WEAK_FEATURE_BUT_STRUCTURED_FRAME",
+        "BAD_INFORMATION_FRAME",
+        "ASYMMETRIC_STRUCTURE_FRAME",
+    }
+
+
 def _save_corrected_fov_with_transform(
     pair,
     dataset_name,
@@ -3243,7 +3957,11 @@ def _run_alignment_dataset_qa(
     _add_neighbor_jump_reasons(qa_reasons_by_index, accepted_entries)
 
     anchor_entries = _sequence_anchor_entries(accepted_entries, qa_reasons_by_index)
-    median_matrix = _median_transform_matrix(anchor_entries) if DATASET_MEDIAN_ALIGNMENT_FALLBACK_ENABLED else None
+    median_matrix = (
+        _median_transform_matrix(anchor_entries)
+        if (DATASET_MEDIAN_ALIGNMENT_FALLBACK_ENABLED or DATASET_MEDIAN_ALIGNMENT_FALLBACK_FOR_WEAK_FRAMES)
+        else None
+    )
     counts = {"sequence_assisted": 0, "dataset_median": 0, "crop_only_last_resort": 0}
     output_size = _get_output_size()
 
@@ -3328,7 +4046,12 @@ def _run_alignment_dataset_qa(
                 counts["sequence_assisted"] += 1
                 continue
 
-        if median_matrix is not None:
+        median_allowed = _dataset_median_allowed_for_frame(
+            per_image_alignment,
+            per_image_accepted,
+            per_image_qa_reasons,
+        )
+        if median_matrix is not None and median_allowed:
             median_alignment = _alignment_from_transform_matrix(
                 median_matrix,
                 output_size,
@@ -3362,7 +4085,9 @@ def _run_alignment_dataset_qa(
                 )
                 counts["dataset_median"] += 1
                 continue
-        elif not DATASET_MEDIAN_ALIGNMENT_FALLBACK_ENABLED:
+        elif median_matrix is not None and not median_allowed:
+            pair["median_transform_candidate_reasons"] = ["dataset_median_skipped_for_good_per_image_frame"]
+        elif not (DATASET_MEDIAN_ALIGNMENT_FALLBACK_ENABLED or DATASET_MEDIAN_ALIGNMENT_FALLBACK_FOR_WEAK_FRAMES):
             pair["median_transform_candidate_reasons"] = ["dataset_median_fallback_disabled_no_blind_global_reuse"]
 
         crop_reasons = _unique_reasons(
