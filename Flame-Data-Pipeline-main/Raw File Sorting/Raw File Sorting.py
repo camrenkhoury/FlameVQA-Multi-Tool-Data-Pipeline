@@ -1569,6 +1569,19 @@ def _thermal_structure_quality(thermal_feature):
     }
 
 
+def _alignment_precheck_level(rgb_diagnostics, thermal_diagnostics):
+    if thermal_diagnostics["thermal_structure_class"] == "BAD_INFORMATION_FRAME":
+        return "BAD"
+    if (
+        thermal_diagnostics["thermal_structure_class"] == "GOOD_FEATURE_FRAME"
+        and rgb_diagnostics["low_information_pct"] < FEATURE_ALIGNMENT_SMOKE_RETRY_TRIGGER_PERCENTAGE
+        and rgb_diagnostics["gradient_mean"] > FEATURE_ALIGNMENT_LOW_GRADIENT_RETRY_THRESHOLD
+        and not thermal_diagnostics["thermal_structure_concentrated"]
+    ):
+        return "GOOD"
+    return "QUESTIONABLE"
+
+
 def _default_feature_alignment_result(status="not_run"):
     return {
         "status": status,
@@ -1587,6 +1600,9 @@ def _default_feature_alignment_result(status="not_run"):
         "transform_type": FEATURE_ALIGNMENT_MODEL,
         "candidate_stage": "not_run",
         "detector_type": "sift",
+        "alignment_path_label": "NOT_RUN",
+        "alignment_runtime_path": "NOT_RUN",
+        "alignment_precheck_level": "UNKNOWN",
         "rgb_low_information_pct": 0.0,
         "rgb_gradient_mean": 0.0,
         "thermal_structure_class": "UNKNOWN",
@@ -1702,6 +1718,7 @@ def _build_alignment_representation_pairs(
             continue
         thermal_diagnostics = _thermal_structure_quality(thermal_feature)
         base_diagnostics = {
+            "alignment_precheck_level": _alignment_precheck_level(rgb_diagnostics, thermal_diagnostics),
             "rgb_low_information_pct": rgb_diagnostics["low_information_pct"],
             "rgb_gradient_mean": rgb_diagnostics["gradient_mean"],
             "thermal_structure_class": thermal_diagnostics["thermal_structure_class"],
@@ -2236,6 +2253,30 @@ def _validate_feature_alignment_result(
     return result
 
 
+def _candidate_needs_post_warp_edge_check(result):
+    if result.get("post_warp_edge_score") is not None:
+        return False
+    if int(result.get("good_matches", 0) or 0) < FEATURE_ALIGNMENT_RELAXED_MIN_INLIERS:
+        return False
+    if not result.get("accepted"):
+        return True
+    if result.get("confidence_level") != "HIGH":
+        return True
+    if result.get("candidate_stage") != "sift_standard":
+        return True
+    if result.get("thermal_structure_class") != "GOOD_FEATURE_FRAME":
+        return True
+    if result.get("inlier_spatial_bias_reasons"):
+        return True
+    if (
+        int(result.get("good_matches", 0) or 0) > 0
+        and float(result.get("good_match_thermal_edge_support_ratio", 0.0))
+        < FEATURE_ALIGNMENT_MIN_THERMAL_EDGE_SUPPORT_RATIO
+    ):
+        return True
+    return False
+
+
 def _alignment_model_order():
     if FEATURE_ALIGNMENT_MODEL in {"similarity", "affine", "homography"}:
         return [FEATURE_ALIGNMENT_MODEL]
@@ -2580,6 +2621,8 @@ def _estimate_structure_search_candidate(corrected_crop_image, thermal_source_pa
     result["accepted"] = not bool(result["reasons"])
     result["confidence_level"] = "MEDIUM" if result["accepted"] else "LOW"
     result["status"] = "ok" if result["accepted"] else "alignment_low_confidence"
+    result["alignment_path_label"] = "STRUCTURE_SEARCH_USED" if result["accepted"] else "CROP_ONLY_USED"
+    result["alignment_runtime_path"] = result["alignment_path_label"]
     return result
 
 
@@ -2693,15 +2736,6 @@ def _run_sift_alignment_candidate(
 
     result["status"] = "ok"
     result["matrix"] = _matrix_to_list(matrix)
-    if len(balanced_matches) >= FEATURE_ALIGNMENT_RELAXED_MIN_INLIERS:
-        result.update(
-            _edge_alignment_metrics_from_features(
-                rgb_feature,
-                thermal_feature,
-                matrix,
-                output_size,
-            )
-        )
     inlier_mask = np.asarray(inliers, dtype=bool).reshape(-1) if inliers is not None else np.zeros(
         len(balanced_matches),
         dtype=bool,
@@ -2730,6 +2764,24 @@ def _run_sift_alignment_candidate(
         source_image_size=output_size,
         match_grid_cells=match_grid_cells,
     )
+    if _candidate_needs_post_warp_edge_check(result):
+        result.update(
+            _edge_alignment_metrics_from_features(
+                rgb_feature,
+                thermal_feature,
+                matrix,
+                output_size,
+            )
+        )
+        result = _validate_feature_alignment_result(
+            result,
+            source_points,
+            target_points,
+            inliers,
+            output_size,
+            source_image_size=output_size,
+            match_grid_cells=match_grid_cells,
+        )
     return _refine_candidate_with_ecc(
         result,
         rgb_feature,
@@ -2850,6 +2902,38 @@ def _alignment_candidate_is_strong_enough_to_stop(candidate):
     return not _auto_align_questionable_reasons(candidate)
 
 
+def _alignment_path_label(candidate, candidates=None):
+    if not candidate.get("accepted"):
+        return "CROP_ONLY_USED"
+    decision_source = candidate.get("alignment_decision_source", "")
+    if decision_source == "sequence_assisted_align":
+        return "SEQUENCE_ASSISTED_USED"
+    if decision_source == "dataset_median_transform":
+        return "DATASET_MEDIAN_USED"
+    if decision_source == "crop_only_last_resort":
+        return "CROP_ONLY_USED"
+
+    candidate_stage = candidate.get("candidate_stage", "sift_standard")
+    detector_type = candidate.get("detector_type", "sift")
+    if candidate_stage == "structure_search" or candidate.get("transform_type") == "rigid_search":
+        return "STRUCTURE_SEARCH_USED"
+    if detector_type == "akaze" or candidate_stage in {"sift_smoke_masked", "border_guided"}:
+        return "RECHECKED_BIASED_FEATURES"
+
+    candidate_count = len(candidates or [])
+    primary_candidate_count = max(1, len(FEATURE_ALIGNMENT_PRIMARY_PREPROCESSING_VARIANTS) * len(_alignment_model_order()))
+    if (
+        candidate_stage == "sift_standard"
+        and candidate.get("confidence_level") == "HIGH"
+        and not _auto_align_questionable_reasons(candidate)
+        and candidate_count <= primary_candidate_count
+    ):
+        return "FAST_ACCEPTED"
+    if candidate_stage == "sift_standard":
+        return "FAST_ACCEPTED_WITH_WARNING"
+    return "RECHECKED_BIASED_FEATURES"
+
+
 def _append_alignment_candidates(candidates, representation_pairs, output_size, detector_type=None, model_order=None):
     models = list(model_order or _alignment_model_order())
     for representation in representation_pairs:
@@ -2887,6 +2971,8 @@ def _finalize_alignment_selection(candidates):
         _summarize_alignment_candidate(candidate) for candidate in candidates
     ]
     selected["auto_align_questionable_reasons"] = _auto_align_questionable_reasons(selected)
+    selected["alignment_path_label"] = _alignment_path_label(selected, candidates)
+    selected["alignment_runtime_path"] = selected["alignment_path_label"]
     return selected
 
 
@@ -3676,6 +3762,8 @@ def _alignment_from_transform_matrix(
             "accepted": bool(accepted),
             "reasons": list(reasons or []),
             "alignment_decision_source": decision_source,
+            "alignment_path_label": "",
+            "alignment_runtime_path": "",
             "mean_reprojection_error_px": None,
             "max_reprojection_error_px": None,
             "inliers": 0,
@@ -3690,6 +3778,8 @@ def _alignment_from_transform_matrix(
         alignment["source_alignment_status"] = source_alignment.get("status", "")
     alignment.update(geometry)
     alignment.update(source_footprint)
+    alignment["alignment_path_label"] = _alignment_path_label(alignment)
+    alignment["alignment_runtime_path"] = alignment["alignment_path_label"]
     return alignment
 
 
@@ -3898,6 +3988,8 @@ def _set_final_alignment_decision(
     pair["alignment_review_status"] = "review_required" if review_required else ""
     pair["alignment_review_reasons"] = review_reasons
     pair["alignment_qa_action"] = qa_action
+    pair["alignment_path_label"] = final_alignment.get("alignment_path_label", "")
+    pair["alignment_runtime_path"] = final_alignment.get("alignment_runtime_path", pair["alignment_path_label"])
     if review_required:
         pair["review_required"] = True
 
@@ -3984,6 +4076,8 @@ def _run_alignment_dataset_qa(
             candidate_stage = final_alignment.get("candidate_stage", "sift_standard")
             detector_type = final_alignment.get("detector_type", "sift")
             final_alignment["alignment_decision_source"] = candidate_stage
+            final_alignment.setdefault("alignment_path_label", _alignment_path_label(final_alignment))
+            final_alignment.setdefault("alignment_runtime_path", final_alignment["alignment_path_label"])
             if detector_type == "akaze":
                 final_status = "aligned_akaze"
             elif candidate_stage == "sift_smoke_masked":
