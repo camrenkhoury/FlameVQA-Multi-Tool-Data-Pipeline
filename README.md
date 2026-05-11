@@ -60,10 +60,10 @@ Full Pipeline GUI.cmd
 The launcher:
 
 1. Enters the Raw File Sorting tool folder.
-2. Creates `.venv` with Python 3.11 if needed.
-3. Activates the virtual environment.
-4. Installs the known working dependencies on first run.
-5. Starts the **FLAME Full Pipeline GUI**.
+2. Creates `.venv` with Python 3.11 or 3.12 if needed.
+3. Installs Python 3.11 with `winget` if no compatible runtime is available.
+4. Installs the known working dependencies on first run, or if dependencies are missing.
+5. Starts the **FLAME Full Pipeline GUI** using the virtual environment Python.
 
 You can also run directly from:
 
@@ -150,10 +150,10 @@ max thermal TIFF temperature < threshold  -> No Fire
 
 The suggested threshold is `150 C`, matching the original labeling tool's temperature-threshold workflow.
 
-Temperature labeling happens after raw sorting because it uses the sorted thermal TIFF files. The output is written directly into the completed dataset structure under each `Images` folder:
+Temperature labeling happens after raw sorting because it uses the sorted thermal TIFF files. The labeled output is written at the dataset or burn-set root, next to the base `Images` folder:
 
 ```text
-Images/
+<Dataset_Name>/
 +-- Fire/
 |   +-- RGB/
 |   |   +-- Corrected FOV/
@@ -162,19 +162,22 @@ Images/
 |       +-- Celsius TIFF/
 |       +-- JPG/
 +-- No Fire/
+|   +-- RGB/
+|   |   +-- Corrected FOV/
+|   |   +-- Raw/
+|   +-- Thermal/
+|       +-- Celsius TIFF/
+|       +-- JPG/
++-- Images/
     +-- RGB/
-    |   +-- Corrected FOV/
-    |   +-- Raw/
     +-- Thermal/
-        +-- Celsius TIFF/
-        +-- JPG/
 ```
 
 Example completed paths:
 
 ```text
-Shoetank/Images/Fire/RGB/Raw/
-Shoetank/Images/No Fire/RGB/Raw/
+Shoetank/Fire/RGB/Raw/
+Shoetank/No Fire/RGB/Raw/
 ```
 
 ### 4. Manual Label Review
@@ -214,21 +217,21 @@ When temperature labeling is enabled, the completed labeled output is:
 ```text
 Output Folder/
 +-- <Dataset_Name>/
+    +-- Fire/
+    |   +-- RGB/
+    |   |   +-- Corrected FOV/
+    |   |   +-- Raw/
+    |   +-- Thermal/
+    |       +-- Celsius TIFF/
+    |       +-- JPG/
+    +-- No Fire/
+    |   +-- RGB/
+    |   |   +-- Corrected FOV/
+    |   |   +-- Raw/
+    |   +-- Thermal/
+    |       +-- Celsius TIFF/
+    |       +-- JPG/
     +-- Images/
-        +-- Fire/
-        |   +-- RGB/
-        |   |   +-- Corrected FOV/
-        |   |   +-- Raw/
-        |   +-- Thermal/
-        |       +-- Celsius TIFF/
-        |       +-- JPG/
-        +-- No Fire/
-        |   +-- RGB/
-        |   |   +-- Corrected FOV/
-        |   |   +-- Raw/
-        |   +-- Thermal/
-        |       +-- Celsius TIFF/
-        |       +-- JPG/
         +-- RGB/
         |   +-- Corrected FOV/
         |   +-- Raw/

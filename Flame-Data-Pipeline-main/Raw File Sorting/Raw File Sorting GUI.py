@@ -7,6 +7,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import tkinter as tk
 from pathlib import Path
@@ -1250,10 +1251,23 @@ class CalibrationProfileWindow:
 
 
 class PairPreviewWindow:
-    def __init__(self, parent, sorter_module, burn_set, initial_index=0):
+    def __init__(
+        self,
+        parent,
+        sorter_module,
+        burn_set,
+        initial_index=0,
+        burn_sets=None,
+        initial_burn_set_index=0,
+    ):
         self.sorter = sorter_module
-        self.burn_set = burn_set
-        self.all_pairs = burn_set["pairs"]
+        self.burn_sets = list(burn_sets or [burn_set])
+        self.current_burn_set_index = max(
+            0,
+            min(initial_burn_set_index, len(self.burn_sets) - 1),
+        )
+        self.burn_set = self.burn_sets[self.current_burn_set_index]
+        self.all_pairs = self.burn_set["pairs"]
         self.filtered_indices = list(range(len(self.all_pairs)))
         self.current_filtered_pos = 0
         self.images = {}
@@ -1264,7 +1278,7 @@ class PairPreviewWindow:
         self.metrics_var = tk.StringVar(value="AUTO_ALIGN metrics will appear after a pair is loaded.")
 
         self.window = tk.Toplevel(parent)
-        self.window.title(f"Output Viewer - {burn_set['name']}")
+        self.window.title(f"Output Viewer - {self._burn_set_label(self.burn_set)}")
         self.window.geometry("1680x920")
         self.window.bind("<Left>", self._show_previous_pair)
         self.window.bind("<Right>", self._show_next_pair)
@@ -1275,11 +1289,12 @@ class PairPreviewWindow:
         outer.columnconfigure(1, weight=4)
         outer.rowconfigure(2, weight=1)
 
-        ttk.Label(
+        self.title_label = ttk.Label(
             outer,
-            text=f"Output Viewer: {burn_set['name']}",
+            text=f"Output Viewer: {self._burn_set_label(self.burn_set)}",
             font=("Segoe UI", 13, "bold"),
-        ).grid(row=0, column=0, columnspan=2, sticky="w")
+        )
+        self.title_label.grid(row=0, column=0, columnspan=2, sticky="w")
 
         ttk.Label(
             outer,
@@ -1290,7 +1305,7 @@ class PairPreviewWindow:
         sidebar = ttk.Frame(outer)
         sidebar.grid(row=2, column=0, sticky="nsew", padx=(0, 10))
         sidebar.columnconfigure(0, weight=1)
-        sidebar.rowconfigure(2, weight=1)
+        sidebar.rowconfigure(4, weight=1)
 
         preview_area = ttk.Frame(outer)
         preview_area.grid(row=2, column=1, sticky="nsew")
@@ -1301,8 +1316,25 @@ class PairPreviewWindow:
 
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", self._apply_filter)
-        ttk.Label(sidebar, text="Search Matched Pairs", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
-        ttk.Entry(sidebar, textvariable=self.search_var).grid(row=1, column=0, sticky="ew", pady=(6, 10))
+        self.burn_set_var = tk.StringVar()
+        self.burn_set_options = [
+            self._burn_set_label(item)
+            for item in self.burn_sets
+        ]
+        ttk.Label(sidebar, text="Output Folder", font=("Segoe UI", 10, "bold")).grid(row=0, column=0, sticky="w")
+        self.burn_set_selector = ttk.Combobox(
+            sidebar,
+            textvariable=self.burn_set_var,
+            values=self.burn_set_options,
+            state="readonly",
+        )
+        self.burn_set_selector.grid(row=1, column=0, sticky="ew", pady=(6, 10))
+        self.burn_set_selector.bind("<<ComboboxSelected>>", self._handle_burn_set_change)
+        if self.burn_set_options:
+            self.burn_set_var.set(self.burn_set_options[self.current_burn_set_index])
+
+        ttk.Label(sidebar, text="Search Matched Pairs", font=("Segoe UI", 10, "bold")).grid(row=2, column=0, sticky="w")
+        ttk.Entry(sidebar, textvariable=self.search_var).grid(row=3, column=0, sticky="ew", pady=(6, 10))
 
         self.pair_tree = ttk.Treeview(
             sidebar,
@@ -1317,11 +1349,11 @@ class PairPreviewWindow:
         ]:
             self.pair_tree.heading(key, text=label)
             self.pair_tree.column(key, width=width, anchor="center")
-        self.pair_tree.grid(row=2, column=0, sticky="nsew")
+        self.pair_tree.grid(row=4, column=0, sticky="nsew")
         self.pair_tree.bind("<<TreeviewSelect>>", self._handle_pair_tree_selection)
 
         nav = ttk.Frame(sidebar)
-        nav.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        nav.grid(row=5, column=0, sticky="ew", pady=(10, 0))
         nav.columnconfigure(0, weight=1)
         nav.columnconfigure(1, weight=1)
         self.prev_button = ttk.Button(nav, text="Previous", command=self._show_previous_pair)
@@ -1330,7 +1362,7 @@ class PairPreviewWindow:
         self.next_button.grid(row=0, column=1, sticky="ew", padx=(6, 0))
 
         self.position_label = ttk.Label(sidebar, text="")
-        self.position_label.grid(row=4, column=0, sticky="w", pady=(8, 0))
+        self.position_label.grid(row=6, column=0, sticky="w", pady=(8, 0))
 
         self.corrected_canvas = tk.Canvas(preview_area, background="#1f1f1f", highlightthickness=0)
         self.corrected_canvas.grid(row=2, column=0, sticky="nsew", padx=(0, 8), pady=(10, 8))
@@ -1396,6 +1428,47 @@ class PairPreviewWindow:
             self.current_filtered_pos = initial_index
             self._select_current_pair_in_tree()
             self._show_current_pair()
+
+    def _burn_set_label(self, burn_set):
+        dataset_name = burn_set.get("dataset_name") or ""
+        burn_set_name = burn_set.get("name") or ""
+        pair_count = burn_set.get("pair_count", len(burn_set.get("pairs", [])))
+        if dataset_name and burn_set_name:
+            return f"{dataset_name} / {burn_set_name} ({pair_count} pairs)"
+        return f"{burn_set_name or dataset_name or 'Output'} ({pair_count} pairs)"
+
+    def _set_active_burn_set(self, burn_set_index, initial_index=0):
+        self.current_burn_set_index = max(0, min(burn_set_index, len(self.burn_sets) - 1))
+        self.burn_set = self.burn_sets[self.current_burn_set_index]
+        self.all_pairs = self.burn_set["pairs"]
+        self.filtered_indices = list(range(len(self.all_pairs)))
+        self.current_filtered_pos = max(0, min(initial_index, len(self.filtered_indices) - 1))
+        self.images.clear()
+        self.source_images.clear()
+        self.search_var.set("")
+        label = self._burn_set_label(self.burn_set)
+        self.window.title(f"Output Viewer - {label}")
+        self.title_label.configure(text=f"Output Viewer: {label}")
+        self._populate_pair_tree()
+        if self.filtered_indices:
+            self._select_current_pair_in_tree()
+            self._show_current_pair()
+        else:
+            self.position_label.configure(text="No matched pairs found for this output folder.")
+            self.metrics_var.set("No matched pairs found for this output folder.")
+            for canvas in (
+                self.corrected_canvas,
+                self.thermal_canvas,
+                self.raw_overlay_canvas,
+                self.compare_canvas,
+            ):
+                canvas.delete("all")
+
+    def _handle_burn_set_change(self, event=None):
+        selected_label = self.burn_set_var.get()
+        if selected_label not in self.burn_set_options:
+            return
+        self._set_active_burn_set(self.burn_set_options.index(selected_label))
 
     def _render_preview_image(self, pil_image, max_size):
         image = pil_image.copy()
@@ -1489,6 +1562,13 @@ class PairPreviewWindow:
         self.current_filtered_pos = int(selection[0])
         self._show_current_pair()
 
+    def _thermal_preview_source_path(self, pair):
+        thermal_jpg = pair.get("thermal_jpg")
+        if thermal_jpg and thermal_jpg.get("filepath") and Path(thermal_jpg["filepath"]).exists():
+            return thermal_jpg["filepath"]
+        thermal_source, _ = self.sorter._select_corrected_fov_thermal_source(pair)
+        return thermal_source
+
     def _show_current_pair(self):
         if not self.filtered_indices:
             return
@@ -1502,9 +1582,11 @@ class PairPreviewWindow:
 
         thermal_source, _ = self.sorter._select_corrected_fov_thermal_source(pair)
         self.current_thermal_source = thermal_source
+        thermal_preview_source = self._thermal_preview_source_path(pair)
+        self.current_thermal_preview_source = thermal_preview_source
         crop_only, crop_debug = self._load_corrected_with_mode(pair["rgb"]["filepath"], "CROP_ONLY")
         final_corrected, final_debug = self._load_final_corrected_fov(pair)
-        thermal = self._load_preview_image(thermal_source, mode="thermal")
+        thermal = self._load_preview_image(thermal_preview_source, mode="thermal")
         self.current_crop_only_image = crop_only
         self.current_final_corrected_image = final_corrected
         self.current_thermal_image = thermal
@@ -1588,7 +1670,7 @@ class PairPreviewWindow:
 
     def _build_thermal_overlay(self, rgb_image, thermal_image):
         opacity = max(0.0, min(self.overlay_opacity_var.get() / 100.0, 1.0))
-        thermal = ImageOps.autocontrast(thermal_image.convert("L")).convert("RGB").resize(rgb_image.size, Image.LANCZOS)
+        thermal = thermal_image.convert("RGB").resize(rgb_image.size, Image.LANCZOS)
         return Image.blend(rgb_image.convert("RGB"), thermal, opacity)
 
     def _refresh_validation_overlays(self):
@@ -1726,6 +1808,7 @@ class FullPipelineGui:
         self.gps_progress_label_var = tk.StringVar(value="2. GPS traces: idle")
         self.labeling_progress_var = tk.DoubleVar(value=0.0)
         self.labeling_progress_label_var = tk.StringVar(value="3. Temperature labeling: idle")
+        self.runtime_var = tk.StringVar(value="Runtime: idle")
         self.summary_var = tk.StringVar(value="No results loaded yet.")
         self.auto_check_results_var = tk.BooleanVar(value=True)
         self.auto_temperature_label_var = tk.BooleanVar(value=True)
@@ -1741,6 +1824,11 @@ class FullPipelineGui:
         self.preview_images = {}
         self.results_ready = False
         self.pending_post_sort_actions = False
+        self.run_started_at = None
+        self.run_finished_at = None
+        self.run_timer_after_id = None
+        self.run_timer_update_ms = 15000
+        self.pipeline_stage_pending = {}
 
         self._build_ui()
         self._sync_existing_results_state()
@@ -1950,6 +2038,10 @@ class FullPipelineGui:
         )
         self.labeling_progress_bar.grid(row=2, column=1, sticky="ew", pady=(6, 0))
 
+        ttk.Label(pipeline_progress, textvariable=self.runtime_var, width=52).grid(
+            row=3, column=0, columnspan=2, sticky="w", pady=(8, 0)
+        )
+
         self.run_sort_button = ttk.Button(
             bottom,
             text="Run Full Pipeline",
@@ -2132,6 +2224,7 @@ class FullPipelineGui:
         self.gps_progress_label_var.set("2. GPS traces: idle")
         self.labeling_progress_var.set(0)
         self.labeling_progress_label_var.set("3. Temperature labeling: idle")
+        self._reset_run_timer()
         self.summary_var.set("No results loaded yet.")
         self.analysis = []
         self.selected_burn_set = None
@@ -2142,6 +2235,77 @@ class FullPipelineGui:
         self.generate_gps_button.configure(state="disabled")
         self.open_labeling_button.configure(state="disabled")
         self.open_output_folder_button.configure(state="disabled")
+
+    def _format_elapsed_time(self, elapsed_seconds):
+        total_seconds = int(max(0, round(elapsed_seconds)))
+        hours, remainder = divmod(total_seconds, 3600)
+        minutes, seconds = divmod(remainder, 60)
+        if hours:
+            return f"{hours:d}:{minutes:02d}:{seconds:02d}"
+        return f"{minutes:d}:{seconds:02d}"
+
+    def _reset_run_timer(self):
+        if self.run_timer_after_id is not None:
+            try:
+                self.root.after_cancel(self.run_timer_after_id)
+            except tk.TclError:
+                pass
+        self.run_started_at = None
+        self.run_finished_at = None
+        self.run_timer_after_id = None
+        self.pipeline_stage_pending = {}
+        self.runtime_var.set("Runtime: idle")
+
+    def _start_run_timer(self):
+        if self.run_timer_after_id is not None:
+            try:
+                self.root.after_cancel(self.run_timer_after_id)
+            except tk.TclError:
+                pass
+        self.run_started_at = time.perf_counter()
+        self.run_finished_at = None
+        self.run_timer_after_id = None
+        self.runtime_var.set("Runtime: 0:00")
+        self._schedule_run_timer_update()
+
+    def _schedule_run_timer_update(self):
+        if self.run_started_at is None or self.run_finished_at is not None:
+            return
+        self.run_timer_after_id = self.root.after(
+            self.run_timer_update_ms,
+            self._update_run_timer,
+        )
+
+    def _update_run_timer(self):
+        self.run_timer_after_id = None
+        if self.run_started_at is None or self.run_finished_at is not None:
+            return
+        elapsed = time.perf_counter() - self.run_started_at
+        self.runtime_var.set(f"Runtime: {self._format_elapsed_time(elapsed)}")
+        self._schedule_run_timer_update()
+
+    def _finish_run_timer(self, status_label="complete"):
+        if self.run_started_at is None:
+            return
+        if self.run_timer_after_id is not None:
+            try:
+                self.root.after_cancel(self.run_timer_after_id)
+            except tk.TclError:
+                pass
+            self.run_timer_after_id = None
+        self.run_finished_at = time.perf_counter()
+        elapsed = self.run_finished_at - self.run_started_at
+        self.runtime_var.set(
+            f"Runtime: {self._format_elapsed_time(elapsed)} ({status_label})"
+        )
+
+    def _mark_pipeline_stage_complete(self, stage_name):
+        if not self.pipeline_stage_pending:
+            return
+        if stage_name in self.pipeline_stage_pending:
+            self.pipeline_stage_pending[stage_name] = False
+        if not any(self.pipeline_stage_pending.values()):
+            self._finish_run_timer("complete")
 
     def _append_log(self, message):
         cleaned = message.strip()
@@ -2190,6 +2354,7 @@ class FullPipelineGui:
                 elif kind == "raw_complete":
                     self.progress_var.set(100.0)
                     self.progress_label_var.set("1. Raw sorting/export: complete")
+                    self._mark_pipeline_stage_complete("raw")
                 elif kind == "results_ready":
                     self.results_ready = True
                     self.check_results_button.configure(state="normal")
@@ -2211,8 +2376,10 @@ class FullPipelineGui:
                         self.pending_post_sort_actions = False
                 elif kind == "gps_complete":
                     self.status_var.set(payload)
+                    self._mark_pipeline_stage_complete("gps")
                 elif kind == "temperature_label_complete":
                     self.status_var.set(payload["message"])
+                    self._mark_pipeline_stage_complete("labeling")
                     if payload.get("open_manual_labeler"):
                         burn_sets = self._all_loaded_burn_sets()
                         if burn_sets:
@@ -2220,6 +2387,7 @@ class FullPipelineGui:
                 elif kind == "labeling_launched":
                     self.status_var.set(payload)
                 elif kind == "error":
+                    self._finish_run_timer("error")
                     self.status_var.set("Error encountered. See log below.")
                     self._append_log(payload + "\n")
                     messagebox.showerror("FLAME Full Pipeline GUI", payload)
@@ -2319,6 +2487,15 @@ class FullPipelineGui:
 
         sorter.PROCESSING_MODE = self.mode_var.get()
         self._reset_results_state()
+        self.pipeline_stage_pending = {
+            "raw": True,
+            "gps": bool(self.auto_gps_var.get()),
+            "labeling": bool(
+                self.auto_temperature_label_var.get()
+                and self.current_temperature_threshold is not None
+            ),
+        }
+        self._start_run_timer()
         self.status_var.set("Running sort as the first full-pipeline step...")
         self.progress_var.set(0)
         self.progress_label_var.set("1. Raw sorting/export: preparing")
@@ -2465,7 +2642,7 @@ class FullPipelineGui:
         return images_root.parent if images_root.name.lower() == "images" else images_root
 
     def _temperature_label_output_root_for_burn_set(self, burn_set):
-        return Path(burn_set["source_root"])
+        return self._burn_output_root(burn_set)
 
     def _labeling_output_root_for_burn_set(self, burn_set, manual_review=False):
         if manual_review:
@@ -2480,6 +2657,8 @@ class FullPipelineGui:
             self.gps_progress_label_var.set("2. GPS traces: skipped, no burn sets detected")
             self.labeling_progress_var.set(100.0)
             self.labeling_progress_label_var.set("3. Temperature labeling: skipped, no burn sets detected")
+            self._mark_pipeline_stage_complete("gps")
+            self._mark_pipeline_stage_complete("labeling")
             return
 
         if self.auto_temperature_label_var.get() and self.current_temperature_threshold is not None:
@@ -2491,6 +2670,7 @@ class FullPipelineGui:
         else:
             self.labeling_progress_var.set(100.0)
             self.labeling_progress_label_var.set("3. Temperature labeling: skipped (disabled)")
+            self._mark_pipeline_stage_complete("labeling")
             if self.auto_labeling_var.get():
                 if len(burn_sets) > 1:
                     self.status_var.set(
@@ -2503,6 +2683,7 @@ class FullPipelineGui:
         else:
             self.gps_progress_var.set(100.0)
             self.gps_progress_label_var.set("2. GPS traces: skipped (disabled)")
+            self._mark_pipeline_stage_complete("gps")
 
     def _temperature_label_output_dirs(self, output_root):
         return {
@@ -2541,6 +2722,7 @@ class FullPipelineGui:
         if total == 0:
             self.labeling_progress_var.set(100.0)
             self.labeling_progress_label_var.set("3. Temperature labeling: skipped, no pairs found")
+            self._mark_pipeline_stage_complete("labeling")
             return
 
         self.status_var.set(f"Temperature labeling Fire/No Fire with threshold >= {threshold:g} C...")
@@ -2651,6 +2833,7 @@ class FullPipelineGui:
     def _generate_gps_traces(self, burn_sets):
         burn_sets = list(burn_sets)
         if not burn_sets:
+            self._mark_pipeline_stage_complete("gps")
             return
 
         self.status_var.set("Generating GPS trace CSV files from RGB/Raw images...")
@@ -2744,7 +2927,19 @@ class FullPipelineGui:
         selection = self.pair_tree.selection()
         if selection:
             initial_index = int(selection[0])
-        PairPreviewWindow(self.root, sorter, self.selected_burn_set, initial_index=initial_index)
+        burn_sets = self._all_loaded_burn_sets()
+        try:
+            initial_burn_set_index = burn_sets.index(self.selected_burn_set)
+        except ValueError:
+            initial_burn_set_index = 0
+        PairPreviewWindow(
+            self.root,
+            sorter,
+            self.selected_burn_set,
+            initial_index=initial_index,
+            burn_sets=burn_sets,
+            initial_burn_set_index=initial_burn_set_index,
+        )
 
     def _open_output_folder(self):
         if self.selected_burn_set is not None:
