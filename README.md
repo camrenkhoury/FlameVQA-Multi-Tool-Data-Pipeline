@@ -2,7 +2,7 @@
 
 FlameVQA Dataset Builder is a GUI-based wildfire dataset pipeline for converting raw or semi-structured RGB/thermal data into FLAME-compatible dataset folders.
 
-The current workflow is centered on the **FLAME Full Pipeline GUI**. Raw sorting still runs first, then optional temperature-based labeling, GPS tracing, and manual label review run from the same interface.
+The current workflow is centered on the **FLAME Full Pipeline GUI**. Manual transform review can run before full export, then raw sorting/export, optional temperature-based labeling, GPS tracing, and manual label review run from the same interface.
 
 **Tool Author and Primary Developer**  
 Camren J. Khoury
@@ -39,7 +39,6 @@ The active implementation files are:
 
 - `Flame-Data-Pipeline-main/Raw File Sorting/Full Pipeline GUI.py`
 - `Flame-Data-Pipeline-main/Raw File Sorting/Full Pipeline GUI.cmd`
-- `Flame-Data-Pipeline-main/Raw File Sorting/Raw File Sorting GUI.py`
 - `Flame-Data-Pipeline-main/Raw File Sorting/Raw File Sorting.py`
 
 The supporting tools remain available and are integrated into the GUI workflow:
@@ -89,8 +88,9 @@ Typical user workflow:
 4. Choose pipeline automation options.
 5. Click `Run Full Pipeline`.
 6. If temperature labeling is enabled, enter the Fire temperature threshold in Celsius.
-7. Let the pipeline complete the selected stages.
-8. Review the final dataset folders in `Output Folder`.
+7. If manual transform review is enabled, choose the best three sampled RGB/thermal alignment candidates for each burn set.
+8. Let the pipeline complete the selected stages.
+9. Review the final dataset folders in `Output Folder`.
 
 The normal user does not need to manually pre-sort files or choose a processing mode. The GUI auto-detects whether the input looks like DJI raw-style data or standard pre-sorted RGB/thermal data.
 
@@ -100,9 +100,25 @@ The normal user does not need to manually pre-sort files or choose a processing 
 
 The GUI displays separate progress meters for each stage.
 
+### 0. Manual Transform Evaluation
+
+If `Manual transform review before export` is enabled, the GUI first pairs the input records without writing the full dataset output. It then samples representative image pairs across each dataset or burn set.
+
+For each burn set:
+
+- Datasets with fewer than 20 pairs show every available pair.
+- Larger datasets show 20 candidates: the first 8 pairs as stable alignment anchors, then stratified-random pairs distributed across the rest of the sequence.
+- The GUI runs AUTO_ALIGN only on those sampled pairs.
+- Candidate transforms run a semantic fire-overlap check: when a clear thermal hot region and RGB fire-colored pixels are both present, the tool keeps the scale/rotation and applies only a bounded x/y refinement if that moves thermal fire onto visible RGB fire.
+- The user selects the best three accepted transforms.
+- The selected transforms are combined with a robust grid-median affine best fit, and all sampled candidate metrics are saved in `alignment_transform_profile.json`.
+- Full export then runs once using the fitted consensus transform for every image in that burn set, with the same bounded fire-overlap x/y refinement applied per image when the evidence is clear.
+
+If the first sample set does not contain good choices, use `Try Different Candidate Set`. Retry attempts use a different sample seed and alternate transform/source strategies before full export begins.
+
 ### 1. Raw Sorting / Export
 
-This stage reads the input dataset, detects file types, pairs RGB and thermal data, detects camera type, generates Corrected FOV RGB images, and writes the base FLAME-style `Images` folder.
+This stage reads the input dataset, detects file types, pairs RGB and thermal data, detects camera type, generates Corrected FOV RGB images, and writes the base FLAME-style `Images` folder. When manual transform review has already selected a consensus transform, full export applies that transform directly instead of running per-image SIFT across the full dataset.
 
 Supported input data includes:
 

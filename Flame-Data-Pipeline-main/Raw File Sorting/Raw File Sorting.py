@@ -24,6 +24,7 @@ import gc
 import json
 import os
 from pathlib import Path
+import random
 import re
 import shutil
 import sys
@@ -211,6 +212,30 @@ PARALLEL_CORRECTED_FOV_WORKERS = "AUTO"
 PARALLEL_CORRECTED_FOV_MAX_WORKERS = 4
 PARALLEL_CORRECTED_FOV_MIN_FREE_RAM_GB = 6.0
 PARALLEL_CORRECTED_FOV_ESTIMATED_RAM_PER_WORKER_GB = 2.0
+CONSENSUS_ALIGNMENT_PROFILE_FILENAME = "alignment_transform_profile.json"
+CONSENSUS_ALIGNMENT_SAMPLE_TARGET = 20
+CONSENSUS_ALIGNMENT_SAMPLE_PERCENT = 0.08
+CONSENSUS_ALIGNMENT_SAMPLE_MIN = 8
+CONSENSUS_ALIGNMENT_ANCHOR_COUNT = 8
+CONSENSUS_ALIGNMENT_FIT_GRID_SIZE = (5, 5)
+CONSENSUS_ALIGNMENT_MIN_SOURCE_COVERAGE = 0.99
+CONSENSUS_ALIGNMENT_MAX_SELECTED_RMSE_PX = 45.0
+FIRE_ALIGNMENT_SEMANTIC_CHECK_ENABLED = True
+FIRE_ALIGNMENT_THERMAL_MIN_AREA_FRACTION = 0.0002
+FIRE_ALIGNMENT_THERMAL_MAX_AREA_FRACTION = 0.35
+FIRE_ALIGNMENT_RGB_MIN_AREA_FRACTION = 0.00005
+FIRE_ALIGNMENT_RGB_MAX_AREA_FRACTION = 0.35
+FIRE_ALIGNMENT_THERMAL_MIN_CONTRAST = 8.0
+FIRE_ALIGNMENT_ABSOLUTE_TEMP_C = 80.0
+FIRE_ALIGNMENT_RGB_DILATE_PX = 10
+FIRE_ALIGNMENT_SEARCH_RADIUS_PX = 24
+FIRE_ALIGNMENT_SEARCH_STEP_PX = 4
+FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX = 160
+FIRE_ALIGNMENT_MIN_IMPROVEMENT = 0.18
+FIRE_ALIGNMENT_GOOD_OVERLAP = 0.35
+FIRE_ALIGNMENT_LOW_OVERLAP_REJECT = 0.15
+FIRE_ALIGNMENT_ADJUST_MAX_INITIAL_OVERLAP = 0.25
+FIRE_ALIGNMENT_MIN_SOURCE_COVERAGE = 0.99
 
 
 def configure_runtime():
@@ -1179,6 +1204,407 @@ def _warp_corrected_image(corrected_image, transform_matrix, output_size):
     return Image.fromarray(warped)
 
 
+def _default_fire_alignment_metrics(status="not_run"):
+    return {
+        "status": status,
+        "enabled": bool(FIRE_ALIGNMENT_SEMANTIC_CHECK_ENABLED),
+        "thermal_fire_available": False,
+        "rgb_fire_available": False,
+        "adjusted": False,
+        "shift_x": 0.0,
+        "shift_y": 0.0,
+        "thermal_fire_area_fraction": 0.0,
+        "rgb_fire_area_fraction": 0.0,
+        "overlap_before": None,
+        "overlap_after": None,
+        "jaccard_before": None,
+        "jaccard_after": None,
+        "source_coverage_before": None,
+        "source_coverage_after": None,
+        "border_rejected_candidates": 0,
+        "reasons": [],
+    }
+
+
+def _mask_area_fraction(mask):
+    if mask is None or mask.size == 0:
+        return 0.0
+    return float(np.count_nonzero(mask) / float(mask.size))
+
+
+def _clean_binary_mask(mask, close_size=5, open_size=3):
+    mask = np.asarray(mask, dtype=bool)
+    if cv2 is None or mask.size == 0:
+        return mask
+
+    cleaned = mask.astype(np.uint8) * 255
+    if open_size > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (open_size, open_size))
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
+    if close_size > 1:
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (close_size, close_size))
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+    return cleaned > 0
+
+
+def _resize_mask(mask, output_size):
+    mask = np.asarray(mask, dtype=np.uint8) * 255
+    width, height = output_size
+    if cv2 is not None:
+        return cv2.resize(mask, (int(width), int(height)), interpolation=cv2.INTER_NEAREST) > 0
+    return np.asarray(
+        Image.fromarray(mask).resize((int(width), int(height)), Image.NEAREST),
+        dtype=np.uint8,
+    ) > 0
+
+
+def _largest_component_mask(mask):
+    mask = np.asarray(mask, dtype=bool)
+    if cv2 is None or not np.any(mask):
+        return mask
+
+    component_count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask.astype(np.uint8),
+        connectivity=8,
+    )
+    if component_count <= 1:
+        return mask
+
+    largest_label = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    return labels == largest_label
+
+
+def _mask_centroid(mask):
+    mask = np.asarray(mask, dtype=bool)
+    if not np.any(mask):
+        return None
+    ys, xs = np.nonzero(mask)
+    return (float(xs.mean()), float(ys.mean()))
+
+
+def _thermal_fire_mask_from_path(thermal_source_path, output_size):
+    metrics = _default_fire_alignment_metrics("thermal_unavailable")
+    if not thermal_source_path or not os.path.exists(thermal_source_path):
+        metrics["reasons"] = ["thermal_source_missing"]
+        return None, metrics
+
+    try:
+        with Image.open(thermal_source_path) as thermal_img:
+            thermal_array = np.asarray(thermal_img)
+    except Exception as exc:
+        metrics["reasons"] = [f"thermal_load_failed:{exc}"]
+        return None, metrics
+
+    if thermal_array.size == 0:
+        metrics["reasons"] = ["thermal_empty"]
+        return None, metrics
+
+    if thermal_array.ndim == 3:
+        rgb = thermal_array[:, :, :3].astype(np.float32)
+        if cv2 is not None:
+            hsv = cv2.cvtColor(rgb.astype(np.uint8), cv2.COLOR_RGB2HSV)
+            score = hsv[:, :, 2].astype(np.float32) + (hsv[:, :, 1].astype(np.float32) * 0.20)
+        else:
+            score = rgb.mean(axis=2)
+    else:
+        score = thermal_array.astype(np.float32)
+
+    finite = np.isfinite(score)
+    if not np.any(finite):
+        metrics["reasons"] = ["thermal_not_finite"]
+        return None, metrics
+
+    values = score[finite].astype(np.float32)
+    p50, p95, p98, p99 = np.percentile(values, [50, 95, 98, 99])
+    max_value = float(np.max(values))
+    contrast = max_value - float(p50)
+    if contrast < FIRE_ALIGNMENT_THERMAL_MIN_CONTRAST:
+        metrics["status"] = "thermal_no_clear_hot_region"
+        metrics["reasons"] = ["thermal_hot_region_not_clear"]
+        return None, metrics
+
+    threshold = max(float(p98), float(p50) + (0.65 * (float(p99) - float(p50))))
+    if max_value >= FIRE_ALIGNMENT_ABSOLUTE_TEMP_C:
+        threshold = max(threshold, FIRE_ALIGNMENT_ABSOLUTE_TEMP_C)
+
+    mask = np.zeros(score.shape, dtype=bool)
+    mask[finite] = score[finite] >= threshold
+    mask = _clean_binary_mask(mask, close_size=5, open_size=3)
+    mask = _resize_mask(mask, output_size)
+    mask = _largest_component_mask(mask)
+
+    area_fraction = _mask_area_fraction(mask)
+    metrics["thermal_fire_area_fraction"] = area_fraction
+    if area_fraction < FIRE_ALIGNMENT_THERMAL_MIN_AREA_FRACTION:
+        metrics["status"] = "thermal_hot_region_too_small"
+        metrics["reasons"] = ["thermal_hot_region_too_small"]
+        return None, metrics
+    if area_fraction > FIRE_ALIGNMENT_THERMAL_MAX_AREA_FRACTION:
+        metrics["status"] = "thermal_hot_region_too_large"
+        metrics["reasons"] = ["thermal_hot_region_too_large"]
+        return None, metrics
+
+    metrics["status"] = "thermal_fire_available"
+    metrics["thermal_fire_available"] = True
+    return mask, metrics
+
+
+def _rgb_fire_mask_from_image(rgb_image):
+    metrics = _default_fire_alignment_metrics("rgb_fire_unavailable")
+    rgb = np.asarray(rgb_image.convert("RGB"), dtype=np.uint8)
+    if rgb.size == 0:
+        metrics["reasons"] = ["rgb_empty"]
+        return None, metrics
+
+    if cv2 is None:
+        r = rgb[:, :, 0].astype(np.float32)
+        g = rgb[:, :, 1].astype(np.float32)
+        b = rgb[:, :, 2].astype(np.float32)
+        mask = (r > 130) & (r > g * 0.90) & (g > b * 1.15) & ((r - b) > 35)
+    else:
+        hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+        h = hsv[:, :, 0]
+        s = hsv[:, :, 1]
+        v = hsv[:, :, 2]
+        r = rgb[:, :, 0].astype(np.float32)
+        g = rgb[:, :, 1].astype(np.float32)
+        b = rgb[:, :, 2].astype(np.float32)
+        red_orange = ((h <= 35) | (h >= 170)) & (s >= 45) & (v >= 85) & (r >= g * 0.85) & (r >= b * 1.10)
+        yellow_core = (h >= 12) & (h <= 45) & (s >= 35) & (v >= 130) & (r >= 130) & (g >= 80) & (b <= 170)
+        bright_core = (v >= 215) & (s >= 20) & (r >= 150) & (g >= 110) & (b <= 190) & (r >= b * 1.10)
+        mask = red_orange | yellow_core | bright_core
+
+    mask = _clean_binary_mask(mask, close_size=7, open_size=3)
+    area_fraction = _mask_area_fraction(mask)
+    metrics["rgb_fire_area_fraction"] = area_fraction
+    if area_fraction < FIRE_ALIGNMENT_RGB_MIN_AREA_FRACTION:
+        metrics["status"] = "rgb_no_fire_like_pixels"
+        metrics["reasons"] = ["rgb_fire_like_region_missing"]
+        return None, metrics
+    if area_fraction > FIRE_ALIGNMENT_RGB_MAX_AREA_FRACTION:
+        metrics["status"] = "rgb_fire_mask_too_large"
+        metrics["reasons"] = ["rgb_fire_mask_too_large"]
+        return None, metrics
+
+    metrics["status"] = "rgb_fire_available"
+    metrics["rgb_fire_available"] = True
+    return mask, metrics
+
+
+def _translation_adjusted_matrix(matrix, shift_x, shift_y):
+    translation = np.asarray(
+        [
+            [1.0, 0.0, float(shift_x)],
+            [0.0, 1.0, float(shift_y)],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+    return translation @ np.asarray(matrix, dtype=np.float32)
+
+
+def _warp_fire_mask(mask, matrix, output_size):
+    if cv2 is None:
+        return np.asarray(mask, dtype=bool)
+    width, height = output_size
+    warped = cv2.warpPerspective(
+        np.asarray(mask, dtype=np.uint8) * 255,
+        np.asarray(matrix, dtype=np.float32),
+        (int(width), int(height)),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return warped > 0
+
+
+def _transform_source_coverage_fraction(matrix, output_size):
+    if cv2 is None:
+        return 1.0
+    width, height = output_size
+    source_mask = np.ones((int(height), int(width)), dtype=np.uint8) * 255
+    covered = cv2.warpPerspective(
+        source_mask,
+        np.asarray(matrix, dtype=np.float32),
+        (int(width), int(height)),
+        flags=cv2.INTER_NEAREST,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return float(np.count_nonzero(covered) / float(max(covered.size, 1)))
+
+
+def _fire_overlap_scores(thermal_mask, rgb_mask):
+    thermal_mask = np.asarray(thermal_mask, dtype=bool)
+    rgb_mask = np.asarray(rgb_mask, dtype=bool)
+    if cv2 is not None and FIRE_ALIGNMENT_RGB_DILATE_PX > 0:
+        kernel_size = (FIRE_ALIGNMENT_RGB_DILATE_PX * 2) + 1
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        rgb_mask = cv2.dilate(rgb_mask.astype(np.uint8) * 255, kernel) > 0
+
+    intersection = int(np.count_nonzero(thermal_mask & rgb_mask))
+    thermal_area = int(np.count_nonzero(thermal_mask))
+    union = int(np.count_nonzero(thermal_mask | rgb_mask))
+    return {
+        "thermal_overlap": 0.0 if thermal_area == 0 else float(intersection / thermal_area),
+        "jaccard": 0.0 if union == 0 else float(intersection / union),
+    }
+
+
+FIRE_GATE_REJECTION_STATUSES = frozenset(
+    {
+        "fire_overlap_low_unresolved",
+        "thermal_fire_unmatched_in_rgb",
+    }
+)
+
+
+def _fire_gate_rejects(fire_metrics):
+    """Return True if fire-overlap metrics indicate the pair should NOT be saved
+    as a Corrected FOV image (i.e. thermal shows fire but RGB doesn't match).
+
+    Wraps the two failure statuses we treat as hard rejections so every callsite
+    stays consistent. fire_overlap_low_unresolved = thermal and RGB both have
+    fire-like regions but they don't overlap enough.
+    thermal_fire_unmatched_in_rgb = thermal has clear fire and RGB has no
+    fire-coloured pixels at all (the road-with-heatmap case).
+    """
+    if not fire_metrics:
+        return False
+    return str(fire_metrics.get("status", "")) in FIRE_GATE_REJECTION_STATUSES
+
+
+def _refine_transform_with_fire_overlap(corrected_crop_image, thermal_source_path, transform_matrix, output_size):
+    metrics = _default_fire_alignment_metrics("disabled")
+    if not FIRE_ALIGNMENT_SEMANTIC_CHECK_ENABLED:
+        return np.asarray(transform_matrix, dtype=np.float32), metrics
+    if cv2 is None:
+        metrics["status"] = "opencv_unavailable"
+        metrics["reasons"] = ["opencv_unavailable"]
+        return np.asarray(transform_matrix, dtype=np.float32), metrics
+
+    transform_matrix = np.asarray(transform_matrix, dtype=np.float32)
+    thermal_mask, thermal_metrics = _thermal_fire_mask_from_path(thermal_source_path, output_size)
+    metrics.update(
+        {
+            "status": thermal_metrics["status"],
+            "thermal_fire_available": thermal_metrics["thermal_fire_available"],
+            "thermal_fire_area_fraction": thermal_metrics["thermal_fire_area_fraction"],
+            "reasons": list(thermal_metrics.get("reasons", [])),
+        }
+    )
+    if thermal_mask is None:
+        return transform_matrix, metrics
+
+    rgb_mask, rgb_metrics = _rgb_fire_mask_from_image(corrected_crop_image)
+    metrics.update(
+        {
+            "rgb_fire_available": rgb_metrics["rgb_fire_available"],
+            "rgb_fire_area_fraction": rgb_metrics["rgb_fire_area_fraction"],
+        }
+    )
+    if rgb_mask is None:
+        # Thermal already passed (thermal_mask is not None) but the RGB has no
+        # fire-coloured pixels at all. This is the "thermal heat blob over a
+        # plain road / forest with no visible flame" case. Previously this
+        # silently propagated the RGB-side status (e.g. rgb_no_fire_like_pixels)
+        # and downstream checks for the literal string fire_overlap_low_unresolved
+        # would skip it. We now flag it explicitly so callers treat it the same
+        # as fire_overlap_low_unresolved.
+        metrics["status"] = "thermal_fire_unmatched_in_rgb"
+        metrics["reasons"] = _unique_reasons(
+            metrics["reasons"]
+            + rgb_metrics.get("reasons", [])
+            + ["thermal_fire_present_rgb_fire_absent"]
+        )
+        return transform_matrix, metrics
+
+    current_rgb_mask = _warp_fire_mask(rgb_mask, transform_matrix, output_size)
+    current_scores = _fire_overlap_scores(thermal_mask, current_rgb_mask)
+    current_coverage = _transform_source_coverage_fraction(transform_matrix, output_size)
+    metrics["overlap_before"] = current_scores["thermal_overlap"]
+    metrics["overlap_after"] = current_scores["thermal_overlap"]
+    metrics["jaccard_before"] = current_scores["jaccard"]
+    metrics["jaccard_after"] = current_scores["jaccard"]
+    metrics["source_coverage_before"] = current_coverage
+    metrics["source_coverage_after"] = current_coverage
+
+    thermal_centroid = _mask_centroid(thermal_mask)
+    rgb_centroid = _mask_centroid(current_rgb_mask)
+    if thermal_centroid is None or rgb_centroid is None:
+        metrics["status"] = "fire_centroid_unavailable"
+        metrics["reasons"] = _unique_reasons(metrics["reasons"] + ["fire_centroid_unavailable"])
+        return transform_matrix, metrics
+
+    proposed_dx = thermal_centroid[0] - rgb_centroid[0]
+    proposed_dy = thermal_centroid[1] - rgb_centroid[1]
+    proposed_dx = float(np.clip(proposed_dx, -FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX, FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX))
+    proposed_dy = float(np.clip(proposed_dy, -FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX, FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX))
+
+    best_matrix = transform_matrix
+    best_shift = (0.0, 0.0)
+    best_scores = current_scores
+    best_coverage = current_coverage
+    border_rejected_candidates = 0
+    search_radius = int(FIRE_ALIGNMENT_SEARCH_RADIUS_PX)
+    search_step = max(1, int(FIRE_ALIGNMENT_SEARCH_STEP_PX))
+    for dx_offset in range(-search_radius, search_radius + 1, search_step):
+        for dy_offset in range(-search_radius, search_radius + 1, search_step):
+            shift_x = float(np.clip(proposed_dx + dx_offset, -FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX, FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX))
+            shift_y = float(np.clip(proposed_dy + dy_offset, -FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX, FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX))
+            candidate_matrix = _translation_adjusted_matrix(transform_matrix, shift_x, shift_y)
+            candidate_coverage = _transform_source_coverage_fraction(candidate_matrix, output_size)
+            if candidate_coverage < FIRE_ALIGNMENT_MIN_SOURCE_COVERAGE:
+                border_rejected_candidates += 1
+                continue
+            candidate_mask = _warp_fire_mask(rgb_mask, candidate_matrix, output_size)
+            candidate_scores = _fire_overlap_scores(thermal_mask, candidate_mask)
+            if (
+                candidate_scores["thermal_overlap"] > best_scores["thermal_overlap"]
+                or (
+                    np.isclose(candidate_scores["thermal_overlap"], best_scores["thermal_overlap"])
+                    and candidate_scores["jaccard"] > best_scores["jaccard"]
+                )
+            ):
+                best_matrix = candidate_matrix
+                best_shift = (shift_x, shift_y)
+                best_scores = candidate_scores
+                best_coverage = candidate_coverage
+
+    improvement = best_scores["thermal_overlap"] - current_scores["thermal_overlap"]
+    metrics["overlap_after"] = best_scores["thermal_overlap"]
+    metrics["jaccard_after"] = best_scores["jaccard"]
+    metrics["source_coverage_after"] = best_coverage
+    metrics["border_rejected_candidates"] = int(border_rejected_candidates)
+    metrics["suggested_shift_x"] = float(best_shift[0])
+    metrics["suggested_shift_y"] = float(best_shift[1])
+
+    if (
+        current_scores["thermal_overlap"] <= FIRE_ALIGNMENT_ADJUST_MAX_INITIAL_OVERLAP
+        and improvement >= FIRE_ALIGNMENT_MIN_IMPROVEMENT
+        and best_scores["thermal_overlap"] >= FIRE_ALIGNMENT_GOOD_OVERLAP
+    ):
+        metrics["status"] = "fire_overlap_translation_refined"
+        metrics["adjusted"] = True
+        metrics["shift_x"] = float(best_shift[0])
+        metrics["shift_y"] = float(best_shift[1])
+        return best_matrix.astype(np.float32), metrics
+
+    metrics["shift_x"] = 0.0
+    metrics["shift_y"] = 0.0
+    metrics["overlap_after"] = current_scores["thermal_overlap"]
+    metrics["jaccard_after"] = current_scores["jaccard"]
+    metrics["source_coverage_after"] = current_coverage
+    if current_scores["thermal_overlap"] < FIRE_ALIGNMENT_LOW_OVERLAP_REJECT:
+        metrics["status"] = "fire_overlap_low_unresolved"
+        metrics["reasons"] = _unique_reasons(metrics["reasons"] + ["thermal_fire_rgb_overlap_low"])
+        if border_rejected_candidates:
+            metrics["reasons"] = _unique_reasons(metrics["reasons"] + ["fire_shift_would_expose_rgb_border"])
+    else:
+        metrics["status"] = "fire_overlap_ok"
+    return transform_matrix, metrics
+
+
 def _normalize_feature_array(image, variant="edge_blend", invert=False):
     array = np.asarray(image)
     if array.ndim == 3:
@@ -1851,6 +2277,50 @@ def _apply_sift_alignment_to_color(corrected_crop_image, thermal_source_path, ou
     if alignment_result["status"] != "ok":
         return corrected_crop_image.copy(), alignment_result
 
+    refined_matrix, fire_metrics = _refine_transform_with_fire_overlap(
+        corrected_crop_image,
+        thermal_source_path,
+        alignment_result["matrix"],
+        output_size,
+    )
+    alignment_result["fire_alignment"] = fire_metrics
+    alignment_result["fire_overlap_status"] = fire_metrics.get("status", "")
+    alignment_result["fire_overlap_before"] = fire_metrics.get("overlap_before")
+    alignment_result["fire_overlap_after"] = fire_metrics.get("overlap_after")
+    alignment_result["fire_alignment_shift_x"] = fire_metrics.get("shift_x", 0.0)
+    alignment_result["fire_alignment_shift_y"] = fire_metrics.get("shift_y", 0.0)
+    if fire_metrics.get("adjusted"):
+        alignment_result["matrix"] = _matrix_to_list(refined_matrix)
+        alignment_result["fire_alignment_adjusted"] = True
+        geometry = _transform_geometry_summary(refined_matrix, output_size)
+        alignment_result.update(
+            {
+                "scale_x": geometry["scale_x"],
+                "scale_y": geometry["scale_y"],
+                "scale_ratio": geometry["scale_ratio"],
+                "rotation_degrees": geometry["rotation_degrees"],
+                "skew_dot": geometry["skew_dot"],
+                "determinant": geometry["determinant"],
+                "translation_x": geometry["translation_x"],
+                "translation_y": geometry["translation_y"],
+            }
+        )
+    else:
+        alignment_result["fire_alignment_adjusted"] = False
+        if _fire_gate_rejects(fire_metrics):
+            alignment_result["accepted_before_fire_check"] = alignment_result.get("accepted")
+            alignment_result["accepted"] = False
+            alignment_result["status"] = "alignment_low_confidence"
+            alignment_result["confidence_level"] = "LOW"
+            # Preserve the specific fire-gate reason on the result so log rows
+            # and the manual picker can show "thermal_fire_unmatched_in_rgb"
+            # separately from the overlap-too-low case.
+            alignment_result["fire_gate_rejected"] = True
+            alignment_result["fire_gate_reason"] = fire_metrics.get("status", "")
+            alignment_result["reasons"] = _unique_reasons(
+                alignment_result.get("reasons", []) + fire_metrics.get("reasons", [])
+            )
+
     aligned = _warp_corrected_image(
         corrected_crop_image,
         alignment_result["matrix"],
@@ -2041,6 +2511,348 @@ def _save_corrected_rgb(corrected_rgb, output_path):
         corrected_rgb.save(output_path)
 
 
+def representative_transform_sample_indices(
+    pair_count,
+    target_count=None,
+    sample_percent=None,
+    min_count=None,
+    anchor_count=None,
+    seed=1337,
+):
+    if pair_count <= 0:
+        return []
+
+    target_count = CONSENSUS_ALIGNMENT_SAMPLE_TARGET if target_count is None else int(target_count)
+    sample_percent = CONSENSUS_ALIGNMENT_SAMPLE_PERCENT if sample_percent is None else float(sample_percent)
+    min_count = CONSENSUS_ALIGNMENT_SAMPLE_MIN if min_count is None else int(min_count)
+    anchor_count = CONSENSUS_ALIGNMENT_ANCHOR_COUNT if anchor_count is None else int(anchor_count)
+
+    if pair_count <= target_count:
+        return list(range(pair_count))
+
+    # Use approximately 20 review candidates without forcing hundreds of manual
+    # review tiles on very large datasets. Keep an early anchor block because
+    # M30T/M2EA burn sets commonly have stable early transforms, and the manual
+    # selector needs at least three good transforms to build a consensus. The
+    # remaining candidates are stratified-random across the rest of the sequence
+    # so weak middle/late frames are still visible to the user.
+    _ = sample_percent, min_count
+    sample_count = min(pair_count, target_count)
+    if sample_count >= pair_count:
+        return list(range(pair_count))
+
+    rng = random.Random(seed)
+    fixed_count = max(1, min(anchor_count, sample_count, pair_count))
+    fixed_indices = list(range(fixed_count))
+    random_count = max(0, sample_count - len(fixed_indices))
+    candidate_start_index = len(fixed_indices)
+    candidate_count = max(pair_count - candidate_start_index, 0)
+    indices = list(fixed_indices)
+    for position in range(random_count):
+        start = candidate_start_index + int(np.floor(position * candidate_count / max(random_count, 1)))
+        stop = candidate_start_index + int(np.floor((position + 1) * candidate_count / max(random_count, 1)))
+        if stop <= start:
+            stop = min(pair_count, start + 1)
+        if start < pair_count:
+            indices.append(rng.randrange(start, min(stop, pair_count)))
+
+    return sorted(set(indices))
+
+
+def _alignment_matrix_or_none(alignment):
+    if not alignment:
+        return None
+    matrix_values = alignment.get("matrix") or alignment.get("final_transform_matrix")
+    if matrix_values is None:
+        return None
+    try:
+        matrix = np.asarray(matrix_values, dtype=np.float32)
+    except (TypeError, ValueError):
+        return None
+    if matrix.shape != (3, 3) or not np.all(np.isfinite(matrix)):
+        return None
+    return matrix
+
+
+def alignment_has_selectable_transform(alignment):
+    matrix = _alignment_matrix_or_none(alignment)
+    if matrix is None:
+        return False
+    if np.allclose(matrix, _identity_transform_matrix(), atol=1e-5):
+        return False
+    status = str(alignment.get("status", ""))
+    if status in {"not_run", "opencv_unavailable", "thermal_unavailable", "descriptors_unavailable", "not_enough_good_matches", "transform_estimation_failed", "no_candidates"}:
+        return False
+    if int(alignment.get("good_matches", 0) or 0) <= 0 and int(alignment.get("inliers", 0) or 0) <= 0:
+        return False
+    # Drop candidates that the fire gate already rejected (e.g. thermal shows
+    # fire but RGB has no fire-coloured pixels under it). These would render
+    # in the picker as visually wrong overlays and confuse the user.
+    fire_metrics = alignment.get("fire_alignment") or {}
+    if _fire_gate_rejects(fire_metrics):
+        return False
+    if alignment.get("fire_gate_rejected"):
+        return False
+    return True
+
+
+def _consensus_source_grid(output_size=None, grid_size=None):
+    output_width, output_height = output_size or _get_output_size()
+    grid_cols, grid_rows = grid_size or CONSENSUS_ALIGNMENT_FIT_GRID_SIZE
+    xs = np.linspace(0.0, float(output_width), max(2, int(grid_cols)), dtype=np.float32)
+    ys = np.linspace(0.0, float(output_height), max(2, int(grid_rows)), dtype=np.float32)
+    points = [[float(x), float(y)] for y in ys for x in xs]
+    return np.asarray(points, dtype=np.float32)
+
+
+def _fit_affine_from_point_targets(source_points, target_points):
+    source_points = np.asarray(source_points, dtype=np.float32)
+    target_points = np.asarray(target_points, dtype=np.float32)
+    if len(source_points) < 3 or len(source_points) != len(target_points):
+        raise ValueError("Consensus transform fit requires at least three paired points.")
+
+    design = np.zeros((len(source_points) * 2, 6), dtype=np.float32)
+    values = np.zeros((len(source_points) * 2,), dtype=np.float32)
+    design[0::2, 0] = source_points[:, 0]
+    design[0::2, 1] = source_points[:, 1]
+    design[0::2, 2] = 1.0
+    values[0::2] = target_points[:, 0]
+    design[1::2, 3] = source_points[:, 0]
+    design[1::2, 4] = source_points[:, 1]
+    design[1::2, 5] = 1.0
+    values[1::2] = target_points[:, 1]
+    params, *_ = np.linalg.lstsq(design, values, rcond=None)
+    return np.asarray(
+        [
+            [params[0], params[1], params[2]],
+            [params[3], params[4], params[5]],
+            [0.0, 0.0, 1.0],
+        ],
+        dtype=np.float32,
+    )
+
+
+def _transform_grid_rmse(first_matrix, second_matrix, source_points):
+    first_points = _project_points_with_matrix(source_points, first_matrix)
+    second_points = _project_points_with_matrix(source_points, second_matrix)
+    errors = np.linalg.norm(first_points - second_points, axis=1)
+    return float(np.sqrt(np.mean(np.square(errors))))
+
+
+def consensus_transform_matrix_from_alignments(alignments):
+    matrices = []
+    for alignment in alignments:
+        matrix = _alignment_matrix_or_none(alignment)
+        if matrix is not None:
+            matrices.append(matrix)
+
+    if not matrices:
+        raise ValueError("No valid transform matrices were selected.")
+
+    source_points = _consensus_source_grid()
+    transformed_stack = np.stack(
+        [_project_points_with_matrix(source_points, matrix) for matrix in matrices],
+        axis=0,
+    )
+    median_targets = np.median(transformed_stack, axis=0).astype(np.float32)
+    consensus = _fit_affine_from_point_targets(source_points, median_targets)
+
+    selected_rmse = [
+        _transform_grid_rmse(consensus, matrix, source_points)
+        for matrix in matrices
+    ]
+    close_transform_count = sum(
+        1 for rmse in selected_rmse if rmse <= CONSENSUS_ALIGNMENT_MAX_SELECTED_RMSE_PX
+    )
+    if len(matrices) >= 3 and close_transform_count < 2:
+        raise ValueError(
+            "Selected transforms are not consistent enough to build a reliable consensus. "
+            "Choose three candidates with similar scale and placement."
+        )
+
+    sanity_reasons = _profile_transform_sanity_reasons(
+        consensus,
+        _get_output_size(),
+        model_name="affine",
+    )
+    source_coverage = _transform_source_coverage_fraction(consensus, _get_output_size())
+    if source_coverage < CONSENSUS_ALIGNMENT_MIN_SOURCE_COVERAGE:
+        sanity_reasons.append(f"consensus_source_coverage_low:{source_coverage:.4f}")
+    if sanity_reasons:
+        raise ValueError(
+            "Selected transforms produced an invalid consensus: "
+            + " | ".join(_unique_reasons(sanity_reasons))
+        )
+
+    return _matrix_to_list(consensus)
+
+
+def _corrected_fov_filename_for_pair(pair):
+    if pair.get("output_stem"):
+        return f"{pair['output_stem']}.JPG"
+    corrected_record = pair.get("corrected_rgb") or {}
+    corrected_filename = corrected_record.get("filename")
+    if corrected_filename:
+        return corrected_filename
+    return pair["rgb"]["filename"]
+
+
+def generate_corrected_fov_with_transform(
+    pair,
+    transform_matrix,
+    dataset_name=None,
+    burn_set_name=None,
+    calibration_profile=None,
+    camera_used=None,
+    baseline_mode="AUTO_ALIGN",
+    return_debug_info=False,
+):
+    thermal_source_path, thermal_source_name = _select_corrected_fov_thermal_source(pair)
+    debug_info = _get_crop_debug_info(
+        pair["rgb"]["filepath"],
+        thermal_source_path=thermal_source_path,
+        use_experimental_shift=False,
+        dataset_name=dataset_name if dataset_name is not None else pair.get("dataset_name"),
+        burn_set_name=burn_set_name if burn_set_name is not None else pair.get("burn_set_name"),
+        calibration_profile=calibration_profile,
+        camera_used=camera_used if camera_used is not None else pair.get("detected_camera"),
+        fov_correction_mode=baseline_mode,
+    )
+
+    transform_matrix = np.asarray(transform_matrix, dtype=np.float32)
+    if transform_matrix.shape != (3, 3) or not np.all(np.isfinite(transform_matrix)):
+        raise ValueError("Consensus transform matrix must be finite and 3x3.")
+
+    with Image.open(pair["rgb"]["filepath"]) as rgb_img:
+        exif_bytes = rgb_img.info.get("exif")
+        baseline_corrected = rgb_img.crop(debug_info["final_crop_box"]).resize(
+            debug_info["output_size"],
+            Image.LANCZOS,
+        )
+
+    transform_matrix, fire_metrics = _refine_transform_with_fire_overlap(
+        baseline_corrected,
+        thermal_source_path,
+        transform_matrix,
+        debug_info["output_size"],
+    )
+    final_image = _warp_corrected_image(
+        baseline_corrected,
+        transform_matrix,
+        debug_info["output_size"],
+    )
+    baseline_corrected.close()
+
+    if exif_bytes:
+        final_image.info["exif"] = exif_bytes
+
+    geometry = _transform_geometry_summary(transform_matrix, debug_info["output_size"])
+    fire_reasons = fire_metrics.get("reasons", [])
+    # Hard fire-gate: reject when thermal shows fire and either RGB has no
+    # fire-coloured pixels at all (thermal_fire_unmatched_in_rgb) or the masks
+    # don't overlap enough (fire_overlap_low_unresolved). _fire_gate_rejects
+    # keeps every callsite in sync.
+    accepted = not _fire_gate_rejects(fire_metrics)
+    debug_info["feature_alignment"] = {
+        "status": "ok" if accepted else "review_required",
+        "confidence_level": "CONSENSUS" if accepted else "REVIEW",
+        "fallback_used": "none",
+        "matrix": _matrix_to_list(transform_matrix),
+        "accepted": bool(accepted),
+        "transform_type": (
+            "consensus_best_fit_fire_refined"
+            if fire_metrics.get("adjusted")
+            else "consensus_best_fit"
+        ),
+        "representation": "user_selected_average",
+        "reasons": fire_reasons,
+        "fire_alignment": fire_metrics,
+        "fire_overlap_status": fire_metrics.get("status", ""),
+        "fire_overlap_before": fire_metrics.get("overlap_before"),
+        "fire_overlap_after": fire_metrics.get("overlap_after"),
+        "fire_alignment_adjusted": bool(fire_metrics.get("adjusted")),
+        "fire_alignment_shift_x": fire_metrics.get("shift_x", 0.0),
+        "fire_alignment_shift_y": fire_metrics.get("shift_y", 0.0),
+        **geometry,
+    }
+    debug_info["selected_model"] = debug_info["feature_alignment"]["transform_type"]
+    debug_info["final_transform_matrix"] = _matrix_to_list(transform_matrix)
+    debug_info["thermal_source_used"] = thermal_source_name
+    debug_info["thermal_source_path"] = thermal_source_path or ""
+    debug_info["fallback_occurred"] = False
+    debug_info["correction_mode_used"] = "CONSENSUS_ALIGNMENT_PROFILE"
+    debug_info["transform_matrix"] = debug_info["final_transform_matrix"]
+
+    if return_debug_info:
+        return final_image, debug_info
+    return final_image
+
+
+def apply_consensus_transform_to_pairs(
+    pairs,
+    transform_matrix,
+    rgb_corrected_output_dir,
+    dataset_name=None,
+    burn_set_name=None,
+    calibration_profile=None,
+    camera_used=None,
+    progress_callback=None,
+):
+    os.makedirs(rgb_corrected_output_dir, exist_ok=True)
+    total_pairs = len(pairs)
+    transform_matrix = np.asarray(transform_matrix, dtype=np.float32)
+
+    for pair_index, pair in enumerate(pairs, start=1):
+        corrected_rgb, correction_debug = generate_corrected_fov_with_transform(
+            pair,
+            transform_matrix,
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            calibration_profile=calibration_profile,
+            camera_used=camera_used,
+            return_debug_info=True,
+        )
+        output_name = _corrected_fov_filename_for_pair(pair)
+        output_path = os.path.join(rgb_corrected_output_dir, output_name)
+        try:
+            _save_corrected_rgb(corrected_rgb, output_path)
+        finally:
+            corrected_rgb.close()
+
+        pair["corrected_rgb"] = {
+            "filename": output_name,
+            "filepath": output_path,
+        }
+        pair["fov_correction_mode"] = "CONSENSUS_ALIGNMENT_PROFILE"
+        pair["feature_alignment"] = correction_debug["feature_alignment"]
+        pair["final_crop_box"] = correction_debug["final_crop_box"]
+        pair["crop_shrink"] = correction_debug["crop_shrink"]
+        pair["thermal_source_used"] = correction_debug["thermal_source_used"]
+        pair["thermal_source_path"] = correction_debug["thermal_source_path"]
+        pair["final_transform_matrix"] = correction_debug["final_transform_matrix"]
+        pair["fallback_occurred"] = False
+
+        if progress_callback:
+            progress_callback(
+                {
+                    "current": pair_index,
+                    "total": total_pairs,
+                    "message": f"Applying consensus transform: {pair_index}/{total_pairs}",
+                }
+            )
+
+    return total_pairs
+
+
+def save_consensus_alignment_profile(profile_path, profile_data):
+    os.makedirs(os.path.dirname(os.path.abspath(profile_path)), exist_ok=True)
+    payload = dict(profile_data)
+    payload["updated_at"] = datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+    with open(profile_path, "w", encoding="utf-8") as profile_file:
+        json.dump(payload, profile_file, indent=2)
+    return profile_path
+
+
 def _load_psutil_for_memory_checks():
     global psutil
     if psutil is not None:
@@ -2131,6 +2943,7 @@ def _export_presorted_pair_outputs(
     rgb_raw_output_dir,
     thermal_jpg_output_dir,
     thermal_tiff_output_dir,
+    consensus_transform_matrix=None,
 ):
     rgb_output_name = f"{pair['output_stem']}.JPG"
     thermal_jpg_output_name = f"{pair['output_stem']}.JPG"
@@ -2138,15 +2951,26 @@ def _export_presorted_pair_outputs(
 
     shutil.copy(pair["rgb"]["filepath"], os.path.join(rgb_raw_output_dir, rgb_output_name))
 
-    corrected_rgb, correction_debug = generate_corrected_fov(
-        pair,
-        mode="AUTO_ALIGN",
-        dataset_name=dataset_name,
-        burn_set_name=burn_set_name,
-        calibration_profile=active_profile,
-        camera_used=camera_name,
-        return_debug_info=True,
-    )
+    if consensus_transform_matrix is not None:
+        corrected_rgb, correction_debug = generate_corrected_fov_with_transform(
+            pair,
+            consensus_transform_matrix,
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            calibration_profile=active_profile,
+            camera_used=camera_name,
+            return_debug_info=True,
+        )
+    else:
+        corrected_rgb, correction_debug = generate_corrected_fov(
+            pair,
+            mode="AUTO_ALIGN",
+            dataset_name=dataset_name,
+            burn_set_name=burn_set_name,
+            calibration_profile=active_profile,
+            camera_used=camera_name,
+            return_debug_info=True,
+        )
     try:
         _save_corrected_rgb(
             corrected_rgb,
@@ -3177,6 +4001,126 @@ def detect_camera_from_rgb_records(rgb_records, fallback_camera=None, sample_siz
     }
 
 
+ALLOWED_PRODUCTION_CAMERAS = ("M30T", "M2EA")
+
+
+class DatasetCameraValidationError(RuntimeError):
+    """Raised when a dataset's RGB images don't all come from a single
+    supported camera (M30T or M2EA). Carries a summary dict so GUIs can
+    show counts to the user."""
+
+    def __init__(self, message, summary):
+        super().__init__(message)
+        self.summary = summary
+
+
+def validate_dataset_camera_singleton(rgb_records, allowed_cameras=None, sample_size=24):
+    """Scan EXIF/resolution on the input RGBs and confirm exactly one supported
+    camera is present. Returns a summary dict with the camera and per-file
+    breakdown when valid; raises DatasetCameraValidationError otherwise.
+
+    This is the production-export gate. It prevents the pipeline from silently
+    applying e.g. an M30T calibration to an M2EA shot just because CAMERA_USED
+    happened to be set to M30T.
+    """
+    allowed = tuple(allowed_cameras) if allowed_cameras else ALLOWED_PRODUCTION_CAMERAS
+
+    sampled_records = []
+    for record in rgb_records:
+        filepath = record.get("filepath") if isinstance(record, dict) else None
+        if filepath and os.path.exists(filepath):
+            sampled_records.append(record)
+        if len(sampled_records) >= sample_size:
+            break
+
+    summary = {
+        "status": "no_rgb_inputs",
+        "camera": None,
+        "camera_counts": {},
+        "unmapped_exif_texts": [],
+        "allowed_cameras": list(allowed),
+        "sample_count": 0,
+    }
+
+    if not sampled_records:
+        raise DatasetCameraValidationError(
+            "No RGB images found to validate camera model. Cannot run "
+            "production export without a confirmed camera.",
+            summary,
+        )
+
+    camera_counts = {}
+    unmapped_exif_texts = []
+    detections = []
+    for record in sampled_records:
+        # Pass fallback_camera=None so we don't accidentally count CAMERA_USED
+        # for files that didn't actually identify themselves.
+        detection = detect_camera_from_rgb_file(record["filepath"], fallback_camera=None)
+        detections.append(detection)
+        identified = None
+        reason = str(detection.get("reason", ""))
+        if detection.get("exif_guess"):
+            identified = detection["exif_guess"]
+        elif detection.get("resolution_guess"):
+            identified = detection["resolution_guess"]
+
+        if identified:
+            camera_counts[identified] = camera_counts.get(identified, 0) + 1
+        else:
+            camera_counts["__unidentified__"] = camera_counts.get("__unidentified__", 0) + 1
+            if "exif_unmapped:" in reason:
+                text = reason.split("exif_unmapped:", 1)[1].split(" |")[0]
+                if text and text not in unmapped_exif_texts:
+                    unmapped_exif_texts.append(text)
+
+    summary["camera_counts"] = camera_counts
+    summary["unmapped_exif_texts"] = unmapped_exif_texts
+    summary["sample_count"] = len(sampled_records)
+
+    identified_cameras = {name for name in camera_counts if name != "__unidentified__"}
+
+    if not identified_cameras:
+        summary["status"] = "unknown_camera"
+        raise DatasetCameraValidationError(
+            "Could not identify any supported camera model on the RGB images. "
+            f"Allowed models: {', '.join(allowed)}. "
+            + (
+                f"Unmapped EXIF strings seen: {', '.join(unmapped_exif_texts[:3])}."
+                if unmapped_exif_texts
+                else "No usable EXIF or resolution match found."
+            ),
+            summary,
+        )
+
+    if len(identified_cameras) > 1:
+        summary["status"] = "mixed_cameras"
+        summary["camera"] = None
+        breakdown = ", ".join(
+            f"{name}={camera_counts[name]}" for name in sorted(identified_cameras)
+        )
+        raise DatasetCameraValidationError(
+            "Multiple camera models detected in the same input dataset: "
+            f"{breakdown}. Production export requires one camera per dataset. "
+            "Split the inputs by camera and re-run.",
+            summary,
+        )
+
+    only_camera = next(iter(identified_cameras))
+    if only_camera not in allowed:
+        summary["status"] = "unsupported_camera"
+        summary["camera"] = only_camera
+        raise DatasetCameraValidationError(
+            f"Detected camera '{only_camera}' is not in the supported set "
+            f"({', '.join(allowed)}). Add a calibration profile for it before "
+            "running production export.",
+            summary,
+        )
+
+    summary["status"] = "ok"
+    summary["camera"] = only_camera
+    return summary
+
+
 def detect_camera_from_folder(folder_path, fallback_camera=None):
     rgb_candidates = []
     for entry in sorted(os.listdir(folder_path)):
@@ -3312,6 +4256,62 @@ def _discover_presorted_datasets(root_folder):
             datasets.append({"name": entry, "root": dataset_root, "burn_sets": burn_sets})
 
     return datasets
+
+
+def describe_presorted_input_folders(root_folder):
+    """Summarize which top-level input folders are valid presorted datasets."""
+    summary_root = os.path.abspath(root_folder)
+    summary = {
+        "root": summary_root,
+        "top_level_folder_count": 0,
+        "valid_dataset_count": 0,
+        "valid_burn_set_count": 0,
+        "skipped_folder_count": 0,
+        "top_level_folders": [],
+        "valid_datasets": [],
+        "skipped_folders": [],
+    }
+    if not os.path.isdir(summary_root):
+        return summary
+
+    top_level_folders = []
+    for entry in sorted(os.listdir(summary_root)):
+        entry_path = os.path.join(summary_root, entry)
+        if not os.path.isdir(entry_path):
+            continue
+        if entry.startswith("."):
+            continue
+        top_level_folders.append({"name": entry, "path": os.path.abspath(entry_path)})
+
+    datasets = _discover_presorted_datasets(summary_root)
+    valid_roots = {os.path.abspath(dataset["root"]): dataset for dataset in datasets}
+    valid_burn_set_count = sum(len(dataset.get("burn_sets", [])) for dataset in datasets)
+
+    summary["top_level_folders"] = top_level_folders
+    summary["top_level_folder_count"] = len(top_level_folders)
+    summary["valid_dataset_count"] = len(datasets)
+    summary["valid_burn_set_count"] = valid_burn_set_count
+    summary["valid_datasets"] = [
+        {
+            "name": dataset["name"],
+            "root": os.path.abspath(dataset["root"]),
+            "burn_set_count": len(dataset.get("burn_sets", [])),
+            "source_roots": [
+                os.path.abspath(burn_set.get("source_root", ""))
+                for burn_set in dataset.get("burn_sets", [])
+            ],
+        }
+        for dataset in datasets
+    ]
+
+    skipped_folders = [
+        folder
+        for folder in top_level_folders
+        if os.path.abspath(folder["path"]) not in valid_roots
+    ]
+    summary["skipped_folders"] = skipped_folders
+    summary["skipped_folder_count"] = len(skipped_folders)
+    return summary
 
 
 def _collect_media_records(folder):
@@ -3733,6 +4733,30 @@ def _pair_log_row(decision):
         "alignment_determinant": f"{alignment.get('determinant', 1.0):.6f}",
         "alignment_translation_x": f"{alignment.get('translation_x', 0.0):.4f}",
         "alignment_translation_y": f"{alignment.get('translation_y', 0.0):.4f}",
+        "fire_overlap_status": alignment.get("fire_overlap_status", ""),
+        "fire_overlap_before": (
+            ""
+            if alignment.get("fire_overlap_before") is None
+            else f"{alignment['fire_overlap_before']:.4f}"
+        ),
+        "fire_overlap_after": (
+            ""
+            if alignment.get("fire_overlap_after") is None
+            else f"{alignment['fire_overlap_after']:.4f}"
+        ),
+        "fire_alignment_adjusted": str(alignment.get("fire_alignment_adjusted", "")),
+        "fire_alignment_shift_x": f"{alignment.get('fire_alignment_shift_x', 0.0):.4f}",
+        "fire_alignment_shift_y": f"{alignment.get('fire_alignment_shift_y', 0.0):.4f}",
+        "fire_source_coverage_before": (
+            ""
+            if alignment.get("fire_alignment", {}).get("source_coverage_before") is None
+            else f"{alignment['fire_alignment']['source_coverage_before']:.4f}"
+        ),
+        "fire_source_coverage_after": (
+            ""
+            if alignment.get("fire_alignment", {}).get("source_coverage_after") is None
+            else f"{alignment['fire_alignment']['source_coverage_after']:.4f}"
+        ),
         "alignment_reasons": " | ".join(alignment.get("reasons", [])),
         "auto_align_questionable_reasons": " | ".join(
             alignment.get("auto_align_questionable_reasons", [])
@@ -3919,7 +4943,24 @@ def analyze_presorted_standard(input_folder=None):
                 rgb_records, thermal_jpg_records, thermal_tiff_records, cal_tiff_records
             )
             pairs = pairing_result["pairs"]
+            # Singleton-camera gate (analyze phase). Run BEFORE the user is
+            # asked to pick manual transforms - no point letting them work on a
+            # mixed-camera dataset that production will refuse.
+            try:
+                camera_validation = validate_dataset_camera_singleton(rgb_records)
+            except DatasetCameraValidationError as exc:
+                summary = exc.summary
+                print(
+                    f"  {burn_set_name}: CAMERA VALIDATION FAILED - "
+                    f"status={summary.get('status', '')} | "
+                    f"detected_counts={summary.get('camera_counts', {})} | "
+                    f"unmapped_exif={summary.get('unmapped_exif_texts', [])}"
+                )
+                raise
             camera_detection = detect_camera_from_rgb_records(rgb_records)
+            camera_detection["camera"] = camera_validation["camera"]
+            camera_detection["profile_camera"] = camera_validation["camera"]
+            camera_detection["camera_validation"] = camera_validation
             active_profile = load_calibration_profile(
                 camera_used=camera_detection["profile_camera"],
                 dataset_name=dataset["name"],
@@ -3995,7 +5036,13 @@ def detect_processing_mode(input_folder=None):
     return "DJI_RAW"
 
 
-def run_sort_pipeline(input_folder=None, output_folder=None, processing_mode=None, progress_callback=None):
+def run_sort_pipeline(
+    input_folder=None,
+    output_folder=None,
+    processing_mode=None,
+    progress_callback=None,
+    consensus_alignment_profiles=None,
+):
     global INPUT_FOLDER
     global OUTPUT_FOLDER
     global PROCESSING_MODE
@@ -4017,6 +5064,7 @@ def run_sort_pipeline(input_folder=None, output_folder=None, processing_mode=Non
             output_folder=effective_output_folder,
             dry_run_only=False,
             progress_callback=progress_callback,
+            consensus_alignment_profiles=consensus_alignment_profiles,
         )
 
     if not INPUT_FOLDER.endswith(os.sep):
@@ -4026,7 +5074,36 @@ def run_sort_pipeline(input_folder=None, output_folder=None, processing_mode=Non
     return raw_file_sorting()
 
 
-def process_presorted_standard(input_folder=None, output_folder=None, dry_run_only=None, progress_callback=None):
+def _consensus_alignment_profile_for_burn_set(consensus_alignment_profiles, dataset_name, burn_set_name):
+    if not consensus_alignment_profiles:
+        return None
+    profile = consensus_alignment_profiles.get((dataset_name, burn_set_name))
+    if profile is not None:
+        return profile
+    profile = consensus_alignment_profiles.get(f"{dataset_name}/{burn_set_name}")
+    if profile is not None:
+        return profile
+    dataset_profiles = consensus_alignment_profiles.get(dataset_name)
+    if isinstance(dataset_profiles, dict):
+        return dataset_profiles.get(burn_set_name)
+    return dataset_profiles
+
+
+def _consensus_transform_from_profile(profile):
+    if profile is None:
+        return None
+    if isinstance(profile, dict):
+        return profile.get("consensus_transform_matrix") or profile.get("transform_matrix")
+    return profile
+
+
+def process_presorted_standard(
+    input_folder=None,
+    output_folder=None,
+    dry_run_only=None,
+    progress_callback=None,
+    consensus_alignment_profiles=None,
+):
     print("Program start. PRESORTED_STANDARD mode enabled.")
 
     effective_input_folder = os.path.abspath(input_folder if input_folder else INPUT_FOLDER)
@@ -4075,24 +5152,61 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                 rgb_records, thermal_jpg_records, thermal_tiff_records, cal_tiff_records
             )
             pairs = pairing_result["pairs"]
+            # Hard camera-singleton gate: refuse to process a burn set that
+            # mixes camera models or uses an unsupported camera. Production
+            # correctness depends on knowing exactly which camera produced the
+            # RGBs so we can pick the right calibration profile.
+            try:
+                camera_validation = validate_dataset_camera_singleton(rgb_records)
+            except DatasetCameraValidationError as exc:
+                summary = exc.summary
+                print(
+                    f"  {burn_set_name}: CAMERA VALIDATION FAILED - "
+                    f"status={summary.get('status', '')} | "
+                    f"detected_counts={summary.get('camera_counts', {})} | "
+                    f"unmapped_exif={summary.get('unmapped_exif_texts', [])}"
+                )
+                # Re-raise so the GUI worker thread surfaces this as a clean
+                # error popup instead of producing a mis-calibrated dataset.
+                raise
             camera_detection = detect_camera_from_rgb_records(rgb_records)
+            # Override the detection-majority winner with the validated singleton
+            # so downstream calibration lookup uses the confirmed camera even if
+            # one sample happened to fall back to CAMERA_USED.
+            camera_detection["camera"] = camera_validation["camera"]
+            camera_detection["profile_camera"] = camera_validation["camera"]
+            camera_detection["camera_validation"] = camera_validation
             active_profile = load_calibration_profile(
                 camera_used=camera_detection["profile_camera"],
                 dataset_name=dataset["name"],
                 burn_set_name=burn_set_name,
             )
+            consensus_alignment_profile = _consensus_alignment_profile_for_burn_set(
+                consensus_alignment_profiles,
+                dataset["name"],
+                burn_set_name,
+            )
+            consensus_transform_matrix = _consensus_transform_from_profile(consensus_alignment_profile)
             camera_detection["profile_path"] = (
                 active_profile.get("profile_path", "") if active_profile is not None else ""
             )
             selected_correction_model = (
-                active_profile["selected_model"]
-                if active_profile and _get_fov_correction_mode() == "CALIBRATION_PROFILE"
-                else _get_fov_correction_mode().lower()
+                "consensus_alignment_profile"
+                if consensus_transform_matrix is not None
+                else (
+                    active_profile["selected_model"]
+                    if active_profile and _get_fov_correction_mode() == "CALIBRATION_PROFILE"
+                    else _get_fov_correction_mode().lower()
+                )
             )
             selected_correction_rmse = (
-                active_profile.get("selected_model_summary", {}).get("rmse")
-                if active_profile is not None and _get_fov_correction_mode() == "CALIBRATION_PROFILE"
-                else None
+                None
+                if consensus_transform_matrix is not None
+                else (
+                    active_profile.get("selected_model_summary", {}).get("rmse")
+                    if active_profile is not None and _get_fov_correction_mode() == "CALIBRATION_PROFILE"
+                    else None
+                )
             )
             print(
                 f"  {burn_set_name}: source={burn_set['source_root']} | "
@@ -4145,6 +5259,11 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
             os.makedirs(rgb_raw_output_dir, exist_ok=True)
             os.makedirs(thermal_jpg_output_dir, exist_ok=True)
             os.makedirs(thermal_tiff_output_dir, exist_ok=True)
+            if isinstance(consensus_alignment_profile, dict):
+                save_consensus_alignment_profile(
+                    os.path.join(burn_output_root, CONSENSUS_ALIGNMENT_PROFILE_FILENAME),
+                    consensus_alignment_profile,
+                )
             total_pairs = len(pairs)
             progress_step = max(1, total_pairs // 100) if total_pairs else 1
 
@@ -4198,6 +5317,7 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                             rgb_raw_output_dir,
                             thermal_jpg_output_dir,
                             thermal_tiff_output_dir,
+                            consensus_transform_matrix=consensus_transform_matrix,
                         )
                     )
                     completed_pairs += 1
@@ -4237,6 +5357,7 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                             rgb_raw_output_dir,
                             thermal_jpg_output_dir,
                             thermal_tiff_output_dir,
+                            consensus_transform_matrix,
                         )
                         future_to_pair_index[future] = pair_index
                         return True
@@ -4289,25 +5410,32 @@ def process_presorted_standard(input_folder=None, output_folder=None, dry_run_on
                             if not submit_next_pair():
                                 break
 
-            qa_fallback_count = _run_alignment_dataset_qa(
-                pairs,
-                dataset["name"],
-                burn_set_name,
-                active_profile,
-                camera_detection["camera"],
-                rgb_corrected_output_dir,
-            )
-            if qa_fallback_count:
-                print(
-                    f"    Alignment QA fell back {qa_fallback_count} Corrected FOV image(s) to crop-only."
+            if consensus_transform_matrix is None:
+                qa_fallback_count = _run_alignment_dataset_qa(
+                    pairs,
+                    dataset["name"],
+                    burn_set_name,
+                    active_profile,
+                    camera_detection["camera"],
+                    rgb_corrected_output_dir,
                 )
+                if qa_fallback_count:
+                    print(
+                        f"    Alignment QA fell back {qa_fallback_count} Corrected FOV image(s) to crop-only."
+                    )
+            else:
+                print("    Alignment QA skipped because a user-selected consensus transform was applied.")
 
             for decision in pairing_result["decisions"]:
                 decision["detected_camera"] = camera_detection["camera"]
                 decision["camera_dimension_summary"] = camera_detection.get("dimension_summary", "")
                 decision["camera_detection_reason"] = camera_detection["reason"]
                 decision["calibration_profile_path"] = camera_detection.get("profile_path", "")
-                decision["fov_correction_mode"] = _get_fov_correction_mode()
+                decision["fov_correction_mode"] = (
+                    "CONSENSUS_ALIGNMENT_PROFILE"
+                    if consensus_transform_matrix is not None
+                    else _get_fov_correction_mode()
+                )
             _write_pairing_logs(burn_output_root, pairing_result["decisions"])
             if EXPORT_ALIGNMENT_DEBUG_SAMPLES:
                 export_alignment_debug_samples(

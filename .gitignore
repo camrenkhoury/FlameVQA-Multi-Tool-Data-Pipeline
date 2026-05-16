@@ -17,6 +17,7 @@ Thumbs.db
 # Large dataset folders - keep folders, ignore contents
 Flame-Data-Pipeline-main/Raw File Sorting/Input Folder/*
 Flame-Data-Pipeline-main/Raw File Sorting/Output Folder/*
+Flame-Data-Pipeline-main/Raw File Sorting/tools/fov_compare_runs/
 
 # But keep placeholder files so folders exist
 !Flame-Data-Pipeline-main/Raw File Sorting/Input Folder/.gitkeep
