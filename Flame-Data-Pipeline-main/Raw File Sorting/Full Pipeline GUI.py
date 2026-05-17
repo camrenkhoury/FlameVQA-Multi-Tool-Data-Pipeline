@@ -3237,6 +3237,7 @@ class FullPipelineGui:
                     ))
                     return
 
+                folder_summary = sorter.describe_presorted_input_folders(input_folder)
                 analysis = sorter.analyze_presorted_standard(input_folder=input_folder)
                 burn_sets = [
                     burn_set
@@ -3252,6 +3253,7 @@ class FullPipelineGui:
                     {
                         "analysis": analysis,
                         "burn_sets": burn_sets,
+                        "folder_summary": folder_summary,
                     },
                 ))
             except sorter.DatasetCameraValidationError as exc:
@@ -3267,11 +3269,29 @@ class FullPipelineGui:
         self.pending_alignment_burn_sets = payload["burn_sets"]
         self.pending_alignment_index = 0
         self.consensus_alignment_profiles = {}
+        folder_summary = payload.get("folder_summary", {})
+        dataset_count = len(payload.get("analysis", []))
+        transform_scope_count = len(self.pending_alignment_burn_sets)
         self.alignment_progress_var.set(0)
         self.alignment_progress_label_var.set(
-            f"0. Manual transform evaluation: 0/{len(self.pending_alignment_burn_sets)} burn set(s) selected"
+            f"0. Manual transform evaluation: 0/{transform_scope_count} dataset/burn-set transform(s) selected"
         )
-        self.status_var.set("Manual transform evaluation is ready. Select the best three candidates for each burn set.")
+        skipped_count = int(folder_summary.get("skipped_folder_count", 0) or 0)
+        skipped_note = ""
+        if skipped_count:
+            skipped_names = ", ".join(
+                folder.get("name", "")
+                for folder in folder_summary.get("skipped_folders", [])[:5]
+            )
+            if skipped_count > 5:
+                skipped_names += ", ..."
+            skipped_note = f" Skipped {skipped_count} non-dataset folder(s): {skipped_names}."
+        self.status_var.set(
+            "Manual transform evaluation is ready. "
+            f"Found {dataset_count} valid dataset folder(s) and {transform_scope_count} "
+            "dataset/burn-set transform scope(s). Select the best three candidates for each scope."
+            + skipped_note
+        )
         self._open_next_manual_alignment_selector()
 
     def _open_next_manual_alignment_selector(self):
@@ -3286,7 +3306,7 @@ class FullPipelineGui:
         def progress_callback(progress):
             overall_message = (
                 f"{self.pending_alignment_index + 1}/{len(self.pending_alignment_burn_sets)} "
-                f"burn sets - {progress['message']}"
+                f"dataset/burn-set scopes - {progress['message']}"
             )
             self.output_queue.put((
                 "alignment_progress",
@@ -3315,7 +3335,7 @@ class FullPipelineGui:
         total = len(self.pending_alignment_burn_sets)
         self.alignment_progress_var.set((completed / max(total, 1)) * 100.0)
         self.alignment_progress_label_var.set(
-            f"0. Manual transform evaluation: {completed}/{total} burn set(s) selected"
+            f"0. Manual transform evaluation: {completed}/{total} dataset/burn-set transform(s) selected"
         )
         self._open_next_manual_alignment_selector()
 

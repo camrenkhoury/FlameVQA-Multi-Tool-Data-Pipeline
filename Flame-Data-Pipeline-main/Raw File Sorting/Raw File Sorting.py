@@ -5122,8 +5122,16 @@ def process_presorted_standard(
         print("Error: Output folder is not empty. Make sure old data is removed before use.")
         sys.exit(1)
 
+    folder_summary = describe_presorted_input_folders(effective_input_folder)
     datasets = _discover_presorted_datasets(effective_input_folder)
-    print(f"{len(datasets)} pre-sorted dataset folder(s) detected inside Input Folder.")
+    print(
+        f"{folder_summary['top_level_folder_count']} top-level folder(s) scanned; "
+        f"{folder_summary['valid_dataset_count']} valid pre-sorted dataset folder(s) "
+        f"and {folder_summary['valid_burn_set_count']} burn set(s) detected inside Input Folder."
+    )
+    if folder_summary["skipped_folders"]:
+        skipped_names = ", ".join(folder["name"] for folder in folder_summary["skipped_folders"])
+        print(f"Skipped non-dataset folder(s): {skipped_names}")
     if len(datasets) == 0:
         print(
             "No dataset folders were found inside Input Folder that contain pre-sorted "
