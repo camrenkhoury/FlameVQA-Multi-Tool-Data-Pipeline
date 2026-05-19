@@ -2578,7 +2578,11 @@ def alignment_has_selectable_transform(alignment):
     matrix = _alignment_matrix_or_none(alignment)
     if matrix is None:
         return False
-    if np.allclose(matrix, _identity_transform_matrix(), atol=1e-5):
+    # Manual crop-only candidates (e.g. fire_guided_crop fallback in the GUI)
+    # are explicitly allowed to use the identity transform because the user is
+    # visually validating them as crop-only baselines.
+    manual_crop_only_candidate = bool(alignment.get("manual_crop_only_candidate"))
+    if np.allclose(matrix, _identity_transform_matrix(), atol=1e-5) and not manual_crop_only_candidate:
         return False
     status = str(alignment.get("status", ""))
     if status in {"not_run", "opencv_unavailable", "thermal_unavailable", "descriptors_unavailable", "not_enough_good_matches", "transform_estimation_failed", "no_candidates"}:
@@ -2587,11 +2591,28 @@ def alignment_has_selectable_transform(alignment):
         return False
     # Drop candidates that the fire gate already rejected (e.g. thermal shows
     # fire but RGB has no fire-coloured pixels under it). These would render
-    # in the picker as visually wrong overlays and confuse the user.
+    # in the picker as visually wrong overlays and confuse the user. Manual
+    # fallback candidates can opt out of this gate with manual_fire_gate_override
+    # because they are crop-only baselines under direct user visual review.
     fire_metrics = alignment.get("fire_alignment") or {}
-    if _fire_gate_rejects(fire_metrics):
+    manual_fire_gate_override = bool(alignment.get("manual_fire_gate_override"))
+    if _fire_gate_rejects(fire_metrics) and not manual_fire_gate_override:
         return False
-    if alignment.get("fire_gate_rejected"):
+    if alignment.get("fire_gate_rejected") and not manual_fire_gate_override:
+        return False
+    # Pre-screen the candidate's geometry against the same sanity checks the
+    # consensus builder will apply at Apply time. This prevents the situation
+    # where the picker offered a candidate (e.g. unrealistic skew, very low
+    # source coverage) that the consensus build then rejected with an error.
+    sanity_reasons = _profile_transform_sanity_reasons(
+        matrix,
+        _get_output_size(),
+        model_name=alignment.get("transform_type"),
+    )
+    source_coverage = _transform_source_coverage_fraction(matrix, _get_output_size())
+    if source_coverage < CONSENSUS_ALIGNMENT_MIN_SOURCE_COVERAGE:
+        sanity_reasons.append(f"source_coverage_low:{source_coverage:.4f}")
+    if sanity_reasons:
         return False
     return True
 

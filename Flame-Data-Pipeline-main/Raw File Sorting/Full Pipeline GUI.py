@@ -1833,6 +1833,10 @@ class ConsensusTransformSelectionWindow:
         self.selection_vars = {}
         self.status_var = tk.StringVar(value="Preparing representative transform candidates...")
         self.window_visible_after_generation = False
+        # If the default SIFT sample produces fewer than 3 selectable candidates
+        # the worker auto-retries once with fire_guided_crop before showing the
+        # selector window. This flag prevents the retry from looping.
+        self.auto_fire_guided_fallback_attempted = False
 
         self.window = tk.Toplevel(parent)
         self.window.withdraw()
@@ -1950,7 +1954,12 @@ class ConsensusTransformSelectionWindow:
         return self._images_root() / "RGB" / "Corrected FOV"
 
     def _candidate_source_mode(self):
-        modes = ["default", "thermal_jpg_only", "thermal_tiff_only", "similarity_only", "affine_only"]
+        # fire_guided_crop is a non-SIFT fallback that anchors a crop-only
+        # baseline and then applies the existing fire-overlap refinement. It's
+        # the right fallback for sensors where SIFT struggles (e.g. Autel
+        # XT709 mis-detected as M2EA in plot_1/plot_2). It bypasses the fire
+        # gate by design so manual visual review can still select them.
+        modes = ["default", "fire_guided_crop", "thermal_jpg_only", "thermal_tiff_only", "similarity_only", "affine_only"]
         return modes[self.attempt_index % len(modes)]
 
     def _candidate_pair_for_mode(self, pair, source_mode):
@@ -1963,6 +1972,82 @@ class ConsensusTransformSelectionWindow:
         return candidate_pair
 
     def _generate_candidate_corrected_fov(self, candidate_pair, pair, source_mode):
+        if source_mode == "fire_guided_crop":
+            # Fallback path for cameras/scenes where SIFT can't find reliable
+            # matches (Autel data mis-detected as M2EA, dense smoke, low
+            # texture). Start from the camera baseline crop (identity in the
+            # cropped frame) and apply the existing fire-overlap refinement.
+            # This produces a stable, visually-reviewable candidate set even
+            # when default SIFT yields nothing.
+            corrected, debug_info = self.sorter.generate_corrected_fov(
+                candidate_pair,
+                mode="CROP_ONLY",
+                dataset_name=pair.get("dataset_name", self.dataset_name),
+                burn_set_name=pair.get("burn_set_name", self.burn_set_name),
+                camera_used=pair.get("detected_camera", self.detected_camera),
+                return_debug_info=True,
+            )
+            thermal_source_path, _ = self.sorter._select_corrected_fov_thermal_source(candidate_pair)
+            transform_matrix, fire_metrics = self.sorter._refine_transform_with_fire_overlap(
+                corrected,
+                thermal_source_path,
+                self.sorter._identity_transform_matrix(),
+                debug_info["output_size"],
+            )
+            if fire_metrics.get("adjusted"):
+                adjusted = self.sorter._warp_corrected_image(
+                    corrected,
+                    transform_matrix,
+                    debug_info["output_size"],
+                )
+                corrected.close()
+                corrected = adjusted
+
+            geometry = self.sorter._transform_geometry_summary(
+                transform_matrix,
+                debug_info["output_size"],
+            )
+            accepted = not self.sorter._fire_gate_rejects(fire_metrics)
+            alignment = {
+                "status": "ok" if accepted else "alignment_low_confidence",
+                "confidence_level": "MANUAL",
+                "fallback_used": "none",
+                "matrix": self.sorter._matrix_to_list(transform_matrix),
+                "keypoints_rgb": 0,
+                "keypoints_thermal": 0,
+                "good_matches": 1,
+                "inliers": 1,
+                "inlier_ratio": 1.0,
+                "match_grid_cells": 1,
+                "inlier_grid_cells": 1,
+                "mean_reprojection_error_px": None,
+                "max_reprojection_error_px": None,
+                "transform_type": "fire_guided_crop",
+                "representation": "crop_only_fire_overlap",
+                "accepted": bool(accepted),
+                # These two flags tell alignment_has_selectable_transform that
+                # this is a manual visual fallback - identity is OK and the
+                # fire gate is the user's call, not an automatic block.
+                "manual_crop_only_candidate": True,
+                "manual_fire_gate_override": True,
+                "fire_alignment": fire_metrics,
+                "fire_overlap_status": fire_metrics.get("status", ""),
+                "fire_overlap_before": fire_metrics.get("overlap_before"),
+                "fire_overlap_after": fire_metrics.get("overlap_after"),
+                "fire_alignment_adjusted": bool(fire_metrics.get("adjusted")),
+                "fire_alignment_shift_x": fire_metrics.get("shift_x", 0.0),
+                "fire_alignment_shift_y": fire_metrics.get("shift_y", 0.0),
+                "fire_gate_rejected": bool(self.sorter._fire_gate_rejects(fire_metrics)),
+                "fire_gate_reason": fire_metrics.get("status", ""),
+                "reasons": fire_metrics.get("reasons", []),
+                **geometry,
+            }
+            debug_info["feature_alignment"] = alignment
+            debug_info["alignment_candidates"] = []
+            debug_info["final_transform_matrix"] = alignment["matrix"]
+            debug_info["selected_model"] = alignment["transform_type"]
+            return corrected, debug_info
+
         original_model = getattr(self.sorter, "FEATURE_ALIGNMENT_MODEL", "auto")
         try:
             if source_mode == "similarity_only":
@@ -2154,6 +2239,31 @@ class ConsensusTransformSelectionWindow:
                         }
                     )
 
+            # If the default SIFT sample didn't produce enough usable
+            # candidates (the plot_1/plot_2 / Autel case), automatically
+            # advance attempt_index to retry with fire_guided_crop before
+            # showing the picker window. Only runs once per session so we
+            # don't loop on truly broken inputs.
+            required = min(3, len(self.pairs))
+            selectable_count = sum(1 for candidate in candidates if candidate.get("selectable"))
+            if (
+                source_mode == "default"
+                and selectable_count < required
+                and not self.auto_fire_guided_fallback_attempted
+            ):
+                self.auto_fire_guided_fallback_attempted = True
+                self.attempt_index += 1
+                self.window.after(
+                    0,
+                    self.status_var.set,
+                    (
+                        f"Default SIFT produced only {selectable_count}/{required} reliable "
+                        "candidate(s); trying fire-guided crop candidates..."
+                    ),
+                )
+                self.window.after(0, self._start_candidate_generation)
+                return
+
             self.window.after(0, self._populate_candidates, candidates, source_mode)
         except Exception:
             error_text = traceback.format_exc()
@@ -2185,8 +2295,8 @@ class ConsensusTransformSelectionWindow:
             status_text = (
                 f"Only {selectable_count} selectable candidate(s) available from "
                 f"this sample (using '{source_mode}'; {hidden_count} hidden as "
-                f"non-selectable). Pick up to {selectable_count}, or click "
-                f"'Try Different Candidate Set' to resample."
+                f"non-selectable). Need {required} to build a reliable consensus. "
+                f"Click 'Try Different Candidate Set' to resample."
             )
         else:
             status_text = (
@@ -2247,7 +2357,11 @@ class ConsensusTransformSelectionWindow:
             )
 
         self.retry_button.configure(state="normal")
-        self.apply_button.configure(state="normal" if selectable_count else "disabled")
+        # Require the full 'required' count of selectable candidates before
+        # allowing Apply. Building a consensus from 1 candidate produced the
+        # plot_1 'consensus_source_coverage_low' failure that motivated the
+        # rest of this session.
+        self.apply_button.configure(state="normal" if selectable_count >= required else "disabled")
         self._bind_mousewheel_recursive(self.rows_frame)
         self.window.after(350, self._show_window_after_generation)
 
@@ -2269,18 +2383,21 @@ class ConsensusTransformSelectionWindow:
         return selected
 
     def _apply_selected(self):
-        # If fewer than 3 selectable candidates were generated, degrade to the
-        # number available instead of blocking the user. The status banner
-        # already tells them to use Try Different Candidate Set if 0 are
-        # available, which is the only case we still hard-block.
+        # Apply requires the full 'required' count of selectable candidates
+        # (typically 3). The earlier degrade-to-N path allowed a single bad
+        # SIFT candidate to drive consensus and produced
+        # `consensus_source_coverage_low` failures on plot_1. The Try
+        # Different Candidate Set button is the user's escape hatch when
+        # the current sample can't reach 3.
         selectable_count = sum(1 for candidate in self.candidates if candidate["selectable"])
-        if selectable_count == 0:
+        required = min(3, len(self.pairs))
+        if selectable_count < required:
             messagebox.showinfo(
                 "Dataset Transform Selector",
-                "No selectable candidates are available. Try a different candidate set first.",
+                f"Only {selectable_count} selectable candidate(s) are available. "
+                f"Need {required} to build a reliable consensus. Try a different candidate set first.",
             )
             return
-        required = min(3, len(self.pairs), selectable_count)
 
         selected = self._selected_candidates()
         if len(selected) != required:
@@ -2363,6 +2480,18 @@ class ConsensusTransformSelectionWindow:
                 progress_callback=progress_callback,
             )
             self.window.after(0, self._apply_complete, count, str(profile_path))
+        except ValueError as exc:
+            # Consensus geometry checks (unrealistic skew, low source coverage)
+            # raise ValueError with a human-readable message. Show that
+            # directly instead of a Python traceback - it's a real reason the
+            # user can act on, not a crash.
+            error_text = (
+                "The selected candidates could not produce a valid consensus transform.\n\n"
+                f"{exc}\n\n"
+                "Choose three candidates with similar placement and scale, or click "
+                "'Try Different Candidate Set' to resample."
+            )
+            self.window.after(0, self._apply_failed, error_text)
         except Exception:
             error_text = traceback.format_exc()
             self.window.after(0, self._apply_failed, error_text)
