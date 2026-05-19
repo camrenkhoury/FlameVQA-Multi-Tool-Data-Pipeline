@@ -1474,7 +1474,30 @@ def _fire_gate_rejects(fire_metrics):
     return str(fire_metrics.get("status", "")) in FIRE_GATE_REJECTION_STATUSES
 
 
-def _refine_transform_with_fire_overlap(corrected_crop_image, thermal_source_path, transform_matrix, output_size):
+def _refine_transform_with_fire_overlap(
+    corrected_crop_image,
+    thermal_source_path,
+    transform_matrix,
+    output_size,
+    min_source_coverage=None,
+    max_translation_adjust_px=None,
+):
+    # Optional tunables let the GUI fire_guided_crop fallback relax the bounds
+    # that production export uses. Production callers pass nothing and get the
+    # strict defaults. The fallback path passes a lower coverage and a wider
+    # translation budget so we can accept a shift that brings thermal-fire and
+    # RGB-fire into rough alignment even if it costs some black border on the
+    # output (the user does visual review of the candidate).
+    effective_min_coverage = (
+        float(FIRE_ALIGNMENT_MIN_SOURCE_COVERAGE)
+        if min_source_coverage is None
+        else float(min_source_coverage)
+    )
+    effective_max_shift = (
+        int(FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX)
+        if max_translation_adjust_px is None
+        else int(max_translation_adjust_px)
+    )
     metrics = _default_fire_alignment_metrics("disabled")
     if not FIRE_ALIGNMENT_SEMANTIC_CHECK_ENABLED:
         return np.asarray(transform_matrix, dtype=np.float32), metrics
@@ -1538,8 +1561,8 @@ def _refine_transform_with_fire_overlap(corrected_crop_image, thermal_source_pat
 
     proposed_dx = thermal_centroid[0] - rgb_centroid[0]
     proposed_dy = thermal_centroid[1] - rgb_centroid[1]
-    proposed_dx = float(np.clip(proposed_dx, -FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX, FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX))
-    proposed_dy = float(np.clip(proposed_dy, -FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX, FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX))
+    proposed_dx = float(np.clip(proposed_dx, -effective_max_shift, effective_max_shift))
+    proposed_dy = float(np.clip(proposed_dy, -effective_max_shift, effective_max_shift))
 
     best_matrix = transform_matrix
     best_shift = (0.0, 0.0)
@@ -1550,11 +1573,11 @@ def _refine_transform_with_fire_overlap(corrected_crop_image, thermal_source_pat
     search_step = max(1, int(FIRE_ALIGNMENT_SEARCH_STEP_PX))
     for dx_offset in range(-search_radius, search_radius + 1, search_step):
         for dy_offset in range(-search_radius, search_radius + 1, search_step):
-            shift_x = float(np.clip(proposed_dx + dx_offset, -FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX, FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX))
-            shift_y = float(np.clip(proposed_dy + dy_offset, -FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX, FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX))
+            shift_x = float(np.clip(proposed_dx + dx_offset, -effective_max_shift, effective_max_shift))
+            shift_y = float(np.clip(proposed_dy + dy_offset, -effective_max_shift, effective_max_shift))
             candidate_matrix = _translation_adjusted_matrix(transform_matrix, shift_x, shift_y)
             candidate_coverage = _transform_source_coverage_fraction(candidate_matrix, output_size)
-            if candidate_coverage < FIRE_ALIGNMENT_MIN_SOURCE_COVERAGE:
+            if candidate_coverage < effective_min_coverage:
                 border_rejected_candidates += 1
                 continue
             candidate_mask = _warp_fire_mask(rgb_mask, candidate_matrix, output_size)

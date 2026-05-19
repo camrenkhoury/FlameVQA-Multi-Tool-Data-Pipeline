@@ -1815,6 +1815,7 @@ class ConsensusTransformSelectionWindow:
         on_cancel=None,
         progress_callback=None,
         apply_to_output=True,
+        auto_show=True,
     ):
         self.sorter = sorter_module
         self.burn_set = burn_set
@@ -1837,6 +1838,12 @@ class ConsensusTransformSelectionWindow:
         # the worker auto-retries once with fire_guided_crop before showing the
         # selector window. This flag prevents the retry from looping.
         self.auto_fire_guided_fallback_attempted = False
+        # auto_show=False lets the parent batch-create multiple pickers at
+        # once (parallel candidate generation across all pending burn sets)
+        # while keeping each picker window hidden until the parent calls
+        # show_window(). Default True preserves single-picker behaviour.
+        self.auto_show = bool(auto_show)
+        self._activation_requested = False
 
         self.window = tk.Toplevel(parent)
         self.window.withdraw()
@@ -1913,9 +1920,31 @@ class ConsensusTransformSelectionWindow:
         if self.window_visible_after_generation:
             return
         self.window_visible_after_generation = True
+        # Auto-hide: when this picker is part of a batch (auto_show=False),
+        # stay withdrawn until the parent calls show_window(). The
+        # candidates are already populated in memory; the window just
+        # waits its turn in the queue.
+        if not self.auto_show and not self._activation_requested:
+            return
         self.window.deiconify()
         self.window.lift()
         self.window.focus_force()
+
+    def show_window(self):
+        """Public: force this picker's window to show. Safe to call before
+        generation completes - the window will populate as gen runs. Used by
+        the batch flow to advance from one burn set's picker to the next."""
+        self._activation_requested = True
+        # If generation already finished and we bailed in
+        # _show_window_after_generation because auto_show was False, the
+        # window_visible_after_generation flag is True. Force the show now.
+        try:
+            self.window.deiconify()
+            self.window.lift()
+            self.window.focus_force()
+        except Exception:
+            # Window may have been destroyed already; safe to ignore.
+            pass
 
     def _resize_canvas_window(self, event=None):
         self.canvas.itemconfigure(self.canvas_window, width=max(event.width - 4, 200))
@@ -1994,6 +2023,42 @@ class ConsensusTransformSelectionWindow:
                 self.sorter._identity_transform_matrix(),
                 debug_info["output_size"],
             )
+            # Adaptive retry: the strict refiner above clips translation at
+            # FIRE_ALIGNMENT_MAX_TRANSLATION_ADJUST_PX and requires source
+            # coverage >= FIRE_ALIGNMENT_MIN_SOURCE_COVERAGE (0.99). When the
+            # camera baseline crop is off (e.g. Autel data, large parallax),
+            # the refiner identifies the right shift but rejects every
+            # candidate as "fire_shift_would_expose_rgb_border". Detect that
+            # exact pattern and retry with relaxed bounds. We accept some
+            # black border on the output as the price of correct alignment;
+            # the user does visual review and sees the border before picking.
+            border_rejected = int(fire_metrics.get("border_rejected_candidates", 0) or 0)
+            wanted_to_shift_but_couldnt = (
+                self.sorter._fire_gate_rejects(fire_metrics)
+                and border_rejected > 0
+            )
+            if wanted_to_shift_but_couldnt:
+                retry_matrix, retry_metrics = self.sorter._refine_transform_with_fire_overlap(
+                    corrected,
+                    thermal_source_path,
+                    self.sorter._identity_transform_matrix(),
+                    debug_info["output_size"],
+                    min_source_coverage=0.70,
+                    max_translation_adjust_px=400,
+                )
+                retry_accepted = bool(retry_metrics.get("adjusted")) and not self.sorter._fire_gate_rejects(retry_metrics)
+                before_overlap = float(fire_metrics.get("overlap_before") or 0.0)
+                after_overlap = float(retry_metrics.get("overlap_after") or 0.0)
+                # Only swap in the relaxed result if it actually improved the
+                # fire overlap. Otherwise the strict bail-out was correct and
+                # the candidate stays non-selectable.
+                if retry_accepted and after_overlap > before_overlap + 0.10:
+                    transform_matrix = retry_matrix
+                    fire_metrics = retry_metrics
+                    fire_metrics["relaxed_retry_accepted"] = True
+                else:
+                    fire_metrics["relaxed_retry_attempted"] = True
+                    fire_metrics["relaxed_retry_after_overlap"] = after_overlap
             if fire_metrics.get("adjusted"):
                 adjusted = self.sorter._warp_corrected_image(
                     corrected,
@@ -2039,6 +2104,8 @@ class ConsensusTransformSelectionWindow:
                 "fire_alignment_shift_y": fire_metrics.get("shift_y", 0.0),
                 "fire_gate_rejected": bool(self.sorter._fire_gate_rejects(fire_metrics)),
                 "fire_gate_reason": fire_metrics.get("status", ""),
+                "relaxed_retry_accepted": bool(fire_metrics.get("relaxed_retry_accepted")),
+                "relaxed_retry_attempted": bool(fire_metrics.get("relaxed_retry_attempted")),
                 "reasons": fire_metrics.get("reasons", []),
                 **geometry,
             }
@@ -2302,7 +2369,8 @@ class ConsensusTransformSelectionWindow:
             status_text = (
                 f"{selectable_count} selectable candidate(s) shown using "
                 f"'{source_mode}' ({hidden_count} hidden as non-selectable). "
-                f"Select {required}."
+                f"Select at least {required} - more is fine, picking more "
+                f"stabilises the consensus fit."
             )
         self.status_var.set(status_text)
         if self.progress_callback:
@@ -2357,10 +2425,10 @@ class ConsensusTransformSelectionWindow:
             )
 
         self.retry_button.configure(state="normal")
-        # Require the full 'required' count of selectable candidates before
-        # allowing Apply. Building a consensus from 1 candidate produced the
-        # plot_1 'consensus_source_coverage_low' failure that motivated the
-        # rest of this session.
+        # Apply enables when AT LEAST `required` selectable candidates exist
+        # (typically 3). The user can then pick 3, 4, 5+ of them - any count
+        # >= required is accepted in _apply_selected. The "more is fine"
+        # behaviour comes from removing the upper bound, not the lower bound.
         self.apply_button.configure(state="normal" if selectable_count >= required else "disabled")
         self._bind_mousewheel_recursive(self.rows_frame)
         self.window.after(350, self._show_window_after_generation)
@@ -2383,27 +2451,31 @@ class ConsensusTransformSelectionWindow:
         return selected
 
     def _apply_selected(self):
-        # Apply requires the full 'required' count of selectable candidates
-        # (typically 3). The earlier degrade-to-N path allowed a single bad
-        # SIFT candidate to drive consensus and produced
-        # `consensus_source_coverage_low` failures on plot_1. The Try
-        # Different Candidate Set button is the user's escape hatch when
-        # the current sample can't reach 3.
+        # Apply accepts AT LEAST `required` selected candidates (typically 3),
+        # no upper bound. Picking 3 is the minimum; 4, 5, 7+ all work and
+        # produce a more robust consensus fit (it's a grid-median average,
+        # more points = more stable).
+        # Validation failures here just show a messagebox and return; the
+        # picker window stays open so the user can adjust the selection
+        # without re-running the pipeline.
         selectable_count = sum(1 for candidate in self.candidates if candidate["selectable"])
         required = min(3, len(self.pairs))
         if selectable_count < required:
             messagebox.showinfo(
                 "Dataset Transform Selector",
                 f"Only {selectable_count} selectable candidate(s) are available. "
-                f"Need {required} to build a reliable consensus. Try a different candidate set first.",
+                f"Need at least {required} to build a reliable consensus. "
+                f"Try a different candidate set first.",
             )
             return
 
         selected = self._selected_candidates()
-        if len(selected) != required:
+        if len(selected) < required:
             messagebox.showinfo(
                 "Dataset Transform Selector",
-                f"Select exactly {required} candidate transform(s).",
+                f"Select at least {required} candidate transform(s). "
+                f"You have {len(selected)} checked. More than {required} is "
+                f"fine - the consensus fit gets more robust with more picks.",
             )
             return
 
@@ -2566,6 +2638,10 @@ class FullPipelineGui:
         self.pending_sort_output_folder = None
         self.pending_alignment_burn_sets = []
         self.pending_alignment_index = 0
+        # Pickers created up-front by _spawn_all_alignment_pickers so all
+        # candidate generations run in parallel; user reviews them in
+        # sequence via show_window().
+        self.alignment_pickers = []
         self.consensus_alignment_profiles = {}
 
         self._build_ui()
@@ -2995,6 +3071,10 @@ class FullPipelineGui:
         self.pending_sort_output_folder = None
         self.pending_alignment_burn_sets = []
         self.pending_alignment_index = 0
+        # Pickers created up-front by _spawn_all_alignment_pickers so all
+        # candidate generations run in parallel; user reviews them in
+        # sequence via show_window().
+        self.alignment_pickers = []
         self.consensus_alignment_profiles = {}
 
     def _format_elapsed_time(self, elapsed_seconds):
@@ -3418,10 +3498,57 @@ class FullPipelineGui:
         self.status_var.set(
             "Manual transform evaluation is ready. "
             f"Found {dataset_count} valid dataset folder(s) and {transform_scope_count} "
-            "dataset/burn-set transform scope(s). Select the best three candidates for each scope."
+            "dataset/burn-set transform scope(s). Generating candidates for all "
+            "scopes in parallel - you'll review them back-to-back once the first "
+            "set is ready."
             + skipped_note
         )
-        self._open_next_manual_alignment_selector()
+        self._spawn_all_alignment_pickers()
+
+    def _spawn_all_alignment_pickers(self):
+        """Batch-create one picker per pending burn set so candidate
+        generation happens in parallel across all scopes. The first picker
+        becomes visible as soon as ITS generation finishes; the others
+        stay hidden until the user advances to them. By the time the user
+        finishes reviewing scope N, scope N+1 is typically already
+        generated and shows instantly."""
+        self.alignment_pickers = []
+        total = len(self.pending_alignment_burn_sets)
+        for index, burn_set in enumerate(self.pending_alignment_burn_sets):
+            scope_index = index  # captured by progress callback closure
+
+            def progress_callback(progress, _scope=scope_index):
+                # All pickers fire progress callbacks while generating in
+                # parallel. The user-visible status bar shows whichever
+                # message arrives most recently; the active picker's own
+                # status_var inside its window is the authoritative
+                # progress display for that specific scope.
+                overall_message = (
+                    f"scope {_scope + 1}/{total} - {progress['message']}"
+                )
+                self.output_queue.put((
+                    "alignment_progress",
+                    {
+                        "current": progress["current"],
+                        "total": progress["total"],
+                        "message": overall_message,
+                    },
+                ))
+
+            picker = ConsensusTransformSelectionWindow(
+                self.root,
+                sorter,
+                burn_set,
+                on_profile_selected=self._manual_alignment_profile_selected,
+                on_cancel=self._manual_alignment_cancelled,
+                progress_callback=progress_callback,
+                apply_to_output=False,
+                # First picker shows itself the moment its gen finishes;
+                # the rest stay hidden until the parent shows them via
+                # show_window() in _open_next_manual_alignment_selector.
+                auto_show=(index == 0),
+            )
+            self.alignment_pickers.append(picker)
 
     def _open_next_manual_alignment_selector(self):
         if self.pending_alignment_index >= len(self.pending_alignment_burn_sets):
@@ -3431,30 +3558,12 @@ class FullPipelineGui:
         burn_set = self.pending_alignment_burn_sets[self.pending_alignment_index]
         burn_label = f"{burn_set.get('dataset_name', '')} / {burn_set.get('name', '')}".strip(" /")
         self.status_var.set(f"Manual transform evaluation: reviewing {burn_label}")
-
-        def progress_callback(progress):
-            overall_message = (
-                f"{self.pending_alignment_index + 1}/{len(self.pending_alignment_burn_sets)} "
-                f"dataset/burn-set scopes - {progress['message']}"
-            )
-            self.output_queue.put((
-                "alignment_progress",
-                {
-                    "current": progress["current"],
-                    "total": progress["total"],
-                    "message": overall_message,
-                },
-            ))
-
-        ConsensusTransformSelectionWindow(
-            self.root,
-            sorter,
-            burn_set,
-            on_profile_selected=self._manual_alignment_profile_selected,
-            on_cancel=self._manual_alignment_cancelled,
-            progress_callback=progress_callback,
-            apply_to_output=False,
-        )
+        # The picker for this index was created up-front in
+        # _spawn_all_alignment_pickers and is either fully generated
+        # (instant show) or still generating (shows its progress
+        # status). Either way, just bring it to the front.
+        picker = self.alignment_pickers[self.pending_alignment_index]
+        picker.show_window()
 
     def _manual_alignment_profile_selected(self, profile):
         key = (profile["dataset_name"], profile["burn_set_name"])
@@ -3469,6 +3578,16 @@ class FullPipelineGui:
         self._open_next_manual_alignment_selector()
 
     def _manual_alignment_cancelled(self):
+        # If the user cancels any one picker in the batch, tear down the
+        # rest too so we don't leak hidden Toplevel windows. The pipeline
+        # halts via the "error" payload below.
+        for picker in getattr(self, "alignment_pickers", []) or []:
+            try:
+                if picker.window.winfo_exists():
+                    picker.window.destroy()
+            except Exception:
+                pass
+        self.alignment_pickers = []
         self.output_queue.put(("error", "Manual transform evaluation was cancelled before export."))
 
     def _populate_analysis(self):
